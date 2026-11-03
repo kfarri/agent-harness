@@ -370,7 +370,7 @@ function newAgentForm(){
   $('#aedit').innerHTML='<div class="title"><h2>새 에이전트</h2></div>'
     +'<div class="g2"><label class="lb">이름<input type="text" id="nn" maxlength="30" placeholder="예: 번역가"></label>'
     +'<label class="lb">모델 (선택)<input type="text" id="nm" placeholder="기본값"></label></div>'
-    +'<label class="lb">역할 설명 (나중에 자유롭게 고칠 수 있습니다)<textarea id="nd" placeholder="예: 완성된 글을 영어로 번역한다."></textarea></label>'
+    +'<label class="lb">역할 설명 (나중에 자유롭게 고칠 수 있습니다. 비워 두면 기본 틀만 채워집니다)<textarea id="nd" placeholder="예: 전문 번역가다. 원문의 의미와 어조를 보존하며 자연스럽게 옮기고, 고유명사·숫자는 그대로 둔다. 직역으로 어색해지는 표현은 관용구로 바꾸되 내용을 더하거나 빼지 않는다."></textarea></label>'
     +permsHtml({web:false,bash:false})
     +'<label class="lb">이미 만들어 둔 폴더를 연결하려면 폴더 이름 입력 (선택)<input type="text" id="nw" placeholder="비워 두면 새 폴더를 자동으로 만듭니다"></label>'
     +'<div class="row"><button class="pri" id="ncreate">에이전트 만들기</button></div>';
