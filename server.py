@@ -859,11 +859,19 @@ def inputs_block(proj, stages, stage, jid):
     return "\n".join(lines)
 
 
+CLARIFY_RULE = (
+    "요청이 모호하거나, 범위·분량·대상·날짜처럼 결과를 크게 좌우할 정보가 빠져 있어 추측하면 엉뚱한 결과가 나올 수 있을 때만 "
+    "그렇게 한다: 멋대로 추측해서 진행하지 말고, 출력 파일 첫 줄에 정확히 `NEEDS_INPUT: <한 줄 질문>` 을 쓰고 "
+    "둘째 줄부터 왜 필요한지와 선택지를 짧게 적어 그대로 저장한다. 사소하게 빠진 정보는 합리적으로 판단해 평소대로 작업을 "
+    "끝까지 완료한다. NEEDS_INPUT은 정말 진행할 수 없을 때만 쓰는 예외다.\n"
+)
+
+
 def prompt_work(proj, stages, stage, jid, fb):
-    return ("STEP: %s\n작업ID: %s\n%s\n%s지시: %s\n출력 파일: %s\n%s%s"
+    return ("STEP: %s\n작업ID: %s\n%s\n%s지시: %s\n출력 파일: %s\n%s%s%s"
             % (stage["id"], jid, inputs_block(proj, stages, stage, jid), sources_block(proj),
                stage["instruction"] or "요청을 수행한다.",
-               rel(proj, stage["id"], jid), feedback_block(fb), CONCISE))
+               rel(proj, stage["id"], jid), feedback_block(fb), CLARIFY_RULE, CONCISE))
 
 
 def prompt_review(proj, stages, stage, jid):
@@ -879,6 +887,12 @@ def prompt_review(proj, stages, stage, jid):
         p += ("VERDICT가 APPROVE일 때만 오탈자와 문장을 다듬은 최종본을 %s 에 저장하고 맨 아래에 '검수 메모'로 "
               "고친 내용을 짧게 적는다. REVISE이면 최종본은 만들지 않는다.\n" % rel(proj, "final", jid))
     return p + "검토 대상 외 다른 파일은 수정하지 않는다. " + CONCISE
+
+
+def read_question(proj, stage, jid):
+    t = read_text(fpath(proj, stage["id"], jid), 4000) or ""
+    m = re.match(r"^\s*NEEDS_INPUT:\s*(.+)", t, re.S)
+    return m.group(1).strip() if m else None
 
 
 def verdict(proj, stage, jid):
@@ -902,6 +916,12 @@ def pipeline(job, start):
             who = agent_name(proj, st["agent"])
             if st["kind"] == "work":
                 run_step(job, proj, st, prompt_work(proj, stages, st, jid, pending.pop(st["id"], "")))
+                q = read_question(proj, st, jid)
+                if q:
+                    set_state(job, status="awaiting_user", step=st["id"], needs_input=True, question=q)
+                    event(job, who, "%s: 질문 - %s" % (st["name"], q.splitlines()[0][:200]), "warn")
+                    notify_job(job, "question")
+                    return
                 i += 1
                 continue
             run_step(job, proj, st, prompt_review(proj, stages, st, jid),
@@ -1146,7 +1166,7 @@ def project_detail(proj):
 
 def job_summary(j):
     return {k: j[k] for k in ("id", "title", "status", "step", "created", "updated")} | \
-        {"tokens": new_tokens(j.get("usage") or {})}
+        {"tokens": new_tokens(j.get("usage") or {}), "needs_input": bool(j.get("needs_input"))}
 
 
 def job_detail(proj, j):
@@ -1186,7 +1206,8 @@ def create_job(proj, text, source="gui", auto_approve=False, chat=None, title=No
     job = {"id": jid, "pid": proj["id"], "title": (title or text.splitlines()[0])[:60], "status": "queued",
            "step": ("" if auto else active_stages(proj)[0]["id"]), "created": now(), "updated": now(),
            "feedback": "", "error": "", "cancel": False, "usage": {}, "events": [], "source": source,
-           "auto_approve": bool(auto_approve), "chat": str(chat) if chat else ""}
+           "auto_approve": bool(auto_approve), "chat": str(chat) if chat else "",
+           "needs_input": False, "question": ""}
     JOBS[(proj["id"], jid)] = job
     jsave(job)
     event(job, "system", "작업 등록" + {"telegram": " (텔레그램)", "schedule": " (예약 실행)"}.get(source, ""))
@@ -1203,7 +1224,8 @@ def job_restart(proj, j, b):
         raise ApiError(400, "시작 단계가 올바르지 않습니다")
     fb = (b.get("feedback") or "").strip()[:5000]
     first = act[0]["id"] if act else ""
-    set_state(j, status="queued", step=first if start == "first" else start, feedback=fb, error="", cancel=False)
+    set_state(j, status="queued", step=first if start == "first" else start, feedback=fb, error="", cancel=False,
+              needs_input=False, question="")
     label = "처음" if start == "first" else next(s["name"] for s in act if s["id"] == start)
     event(j, "user", "수정 요청으로 %s 단계부터 다시 시작%s" % (label, (": " + fb[:120]) if fb else ""))
     QUEUE.put((proj["id"], j["id"], start))
@@ -1213,6 +1235,8 @@ def job_restart(proj, j, b):
 def job_approve(proj, j):
     if j["status"] != "awaiting_user":
         raise ApiError(409, "승인 대기 상태가 아닙니다")
+    if j.get("needs_input"):
+        raise ApiError(409, "에이전트의 질문에 먼저 답해주세요")
     src = fpath(proj, "final", j["id"])
     if not src.exists():
         works = [s for s in job_stage_src(proj, j) if s["kind"] == "work"]
@@ -1441,6 +1465,9 @@ def notify_job(job, kind):
                [[("다시 시도", "rt:" + ref)]], chat)
     elif kind == "approved":
         notify("[%s] %s · 완료 (새 토큰 %s)\n\n%s" % (pname, job["title"], tok, body), None, chat)
+    elif kind == "question":
+        notify("[%s] %s\n에이전트가 질문이 있습니다:\n\n%s" % (pname, job["title"], str(job.get("question"))[:1500]),
+               [[("답변하기", "aw:" + ref)]], chat)
 
 
 def tg_projects(chat):
@@ -1538,6 +1565,10 @@ def tg_button(chat, data):
             st = cheap_start(proj, job)
             name = next((s["name"] for s in job_stage_src(proj, job) if s["id"] == st), "처음")
             return notify("수정 요청 내용을 메시지로 보내주세요. '%s' 단계부터 다시 합니다. (취소: /cancel)" % name, None, chat)
+        if act == "aw":
+            TG_WAIT[str(chat)] = (pid, jid)
+            return notify("질문에 대한 답변을 메시지로 보내주세요. (취소: /cancel)\n\n%s" % str(job.get("question"))[:1000],
+                          None, chat)
         try:
             if act == "ap":
                 job_approve(proj, job)
@@ -1558,8 +1589,10 @@ def tg_message(chat, text):
             try:
                 proj = proj_of(pid)
                 job = job_of(proj, jid)
-                job_restart(proj, job, {"start": cheap_start(proj, job), "feedback": text})
-                return notify("수정 요청을 반영해 다시 작업합니다.", None, chat)
+                answering = bool(job.get("needs_input"))
+                start = job["step"] if answering else cheap_start(proj, job)
+                job_restart(proj, job, {"start": start, "feedback": text})
+                return notify("답변을 반영해 이어서 진행합니다." if answering else "수정 요청을 반영해 다시 작업합니다.", None, chat)
             except ApiError as e:
                 return notify(e.msg, None, chat)
         cmd = text.split()[0].lower() if text.startswith("/") else ""
@@ -2301,6 +2334,8 @@ def recover():
                 continue
             j["pid"] = proj["id"]
             j.setdefault("usage", {})
+            j.setdefault("needs_input", False)
+            j.setdefault("question", "")
             if j.get("status") in ("queued", "running"):
                 j["status"] = "failed"
                 j["error"] = "서버가 재시작되어 중단됨"
@@ -2590,7 +2625,7 @@ document.querySelectorAll('#subnav .nv').forEach(b=>b.onclick=()=>setView(b.data
 async function loadList(){
   if(!cur)return;
   const d=await api(base()+'/jobs');
-  const h=d.jobs.map(j=>'<div class="job'+(j.id===sel?' sel':'')+'" data-id="'+esc(j.id)+'"><div class="t">'+esc(j.title)+'</div><div class="m"><span class="chip '+j.status+'">'+STATUS[j.status]+'</span><span>'+esc(j.created.slice(5,16))+'</span>'+(j.tokens?'<span>토큰 '+fmtN(j.tokens)+'</span>':'')+'</div></div>').join('');
+  const h=d.jobs.map(j=>'<div class="job'+(j.id===sel?' sel':'')+'" data-id="'+esc(j.id)+'"><div class="t">'+esc(j.title)+'</div><div class="m"><span class="chip '+j.status+'">'+(j.needs_input?'질문 대기':STATUS[j.status])+'</span><span>'+esc(j.created.slice(5,16))+'</span>'+(j.tokens?'<span>토큰 '+fmtN(j.tokens)+'</span>':'')+'</div></div>').join('');
   if(h!==last.list){last.list=h;$('#jobs').innerHTML=h||'<div class="empty" style="padding:20px">아직 작업이 없습니다</div>'}
 }
 async function loadDetail(force){
@@ -2601,12 +2636,12 @@ async function loadDetail(force){
   const keys=steps.map(s=>s[0]);
   if(!tabPinned){const w=d.stages.slice().reverse().find(s=>s.kind==='work'&&f[s.id]!=null);tab=f.final?'final':(w?w.id:'request')}
   const nS=stg.length;
-  const ci=j.status==='awaiting_user'?nS:j.status==='approved'?nS+1:Math.max(0,keys.indexOf(j.step));
+  const ci=j.needs_input?Math.max(0,keys.indexOf(j.step)):j.status==='awaiting_user'?nS:j.status==='approved'?nS+1:Math.max(0,keys.indexOf(j.step));
   const st=i=>i<ci?'done':i===ci?((j.status==='failed'||j.status==='cancelled')?'err':(j.status==='running'||j.status==='awaiting_user')?'active':'wait'):'wait';
   const u=j.usage||{};
   const bys=Object.entries(u.by_stage||{}).map(([k,v])=>{const s=d.stages.find(x=>x.id===k);return esc(s?s.name:(k==='plan'?'자동 구성':k))+' '+fmtN(newTok(v))}).join(' · ');
   const srcL={telegram:'텔레그램',schedule:'예약 실행'}[j.source];
-  const head='<div class="title"><h2>'+esc(j.title)+'</h2><span class="chip '+j.status+'">'+STATUS[j.status]+'</span>'+(srcL?'<span class="chip">'+srcL+'</span>':'')+(j.auto_approve?'<span class="chip">자동 승인</span>':'')+(d.auto_planned?'<span class="chip approved">자동 구성</span>':'')+'</div>'
+  const head='<div class="title"><h2>'+esc(j.title)+'</h2><span class="chip '+j.status+'">'+(j.needs_input?'질문 대기':STATUS[j.status])+'</span>'+(srcL?'<span class="chip">'+srcL+'</span>':'')+(j.auto_approve?'<span class="chip">자동 승인</span>':'')+(d.auto_planned?'<span class="chip approved">자동 구성</span>':'')+'</div>'
     +'<div class="usage">'+esc(usageLine(u))+(d.limit?' · 작업 한도 '+fmtN(d.limit)+' 중 새 토큰 '+fmtN(newTok(u)):'')+'</div>'
     +(bys?'<div class="usage">단계별 새 토큰: '+bys+'</div>':'')
     +'<div class="steps">'+steps.map((s,i)=>'<div class="step '+st(i)+'"><b>'+esc(s[1])+'</b><span>'+esc(s[2])+'</span></div>').join('')+'</div>'
@@ -2618,7 +2653,12 @@ async function loadDetail(force){
     const works=stg.filter(s=>s.kind==='work');
     const opts='<option value="first">처음부터</option>'+works.map((s,i)=>'<option value="'+esc(s.id)+'"'+(i===works.length-1&&works.length>1?' selected':'')+'>'+esc(s.name)+'부터</option>').join('');
     let act='';
-    if(j.status==='awaiting_user'){
+    if(j.status==='awaiting_user'&&j.needs_input){
+      act='<div class="card approve"><h3>에이전트가 질문이 있습니다</h3>'
+        +'<div class="sub" style="white-space:pre-wrap">'+esc(j.question||'')+'</div>'
+        +'<textarea id="qa" placeholder="답변을 적어주세요"></textarea>'
+        +'<div class="row" style="margin-top:8px"><button class="pri" id="qago">답변 보내기</button></div></div>';
+    }else if(j.status==='awaiting_user'){
       const lastRev=stg.slice().reverse().find(s=>s.kind==='review'&&f[s.id]!=null);
       const rv=lastRev?verdictOf(f[lastRev.id]):'APPROVE';
       act='<div class="card approve"><h3>최종 승인이 필요합니다</h3><div class="sub">'+(rv==='APPROVE'?'검토를 통과한 결과물입니다.':'검토 단계의 수정요청이 남은 상태입니다. 해당 탭에서 내용을 확인하세요.')+' 승인하면 outbox에 approved 파일로 저장됩니다.</div>'
@@ -2655,6 +2695,7 @@ function bindJob(j){
   if(q('#rj'))q('#rj').onclick=()=>{const fb=q('#fb').value.trim();if(!fb){toast('수정 요청 내용을 적어주세요');return}run(()=>post(url+'/restart',{feedback:fb,start:q('#st').value}),'다시 작업을 시작합니다')};
   if(q('#rt'))q('#rt').onclick=()=>run(()=>post(url+'/restart',{start:q('#st').value}),'다시 시작합니다');
   if(q('#cn'))q('#cn').onclick=()=>{if(confirm('작업을 중단할까요?'))run(()=>post(url+'/cancel'),'중단 요청')};
+  if(q('#qago'))q('#qago').onclick=()=>{const a=q('#qa').value.trim();if(!a){toast('답변을 적어주세요');return}run(()=>post(url+'/restart',{feedback:a,start:j.step}),'답변을 반영해 이어서 진행합니다')};
 }
 function selectJob(id){
   sel=id;tab=null;tabPinned=false;last={list:last.list};

@@ -244,7 +244,7 @@ document.querySelectorAll('#subnav .nv').forEach(b=>b.onclick=()=>setView(b.data
 async function loadList(){
   if(!cur)return;
   const d=await api(base()+'/jobs');
-  const h=d.jobs.map(j=>'<div class="job'+(j.id===sel?' sel':'')+'" data-id="'+esc(j.id)+'"><div class="t">'+esc(j.title)+'</div><div class="m"><span class="chip '+j.status+'">'+STATUS[j.status]+'</span><span>'+esc(j.created.slice(5,16))+'</span>'+(j.tokens?'<span>토큰 '+fmtN(j.tokens)+'</span>':'')+'</div></div>').join('');
+  const h=d.jobs.map(j=>'<div class="job'+(j.id===sel?' sel':'')+'" data-id="'+esc(j.id)+'"><div class="t">'+esc(j.title)+'</div><div class="m"><span class="chip '+j.status+'">'+(j.needs_input?'질문 대기':STATUS[j.status])+'</span><span>'+esc(j.created.slice(5,16))+'</span>'+(j.tokens?'<span>토큰 '+fmtN(j.tokens)+'</span>':'')+'</div></div>').join('');
   if(h!==last.list){last.list=h;$('#jobs').innerHTML=h||'<div class="empty" style="padding:20px">아직 작업이 없습니다</div>'}
 }
 async function loadDetail(force){
@@ -255,12 +255,12 @@ async function loadDetail(force){
   const keys=steps.map(s=>s[0]);
   if(!tabPinned){const w=d.stages.slice().reverse().find(s=>s.kind==='work'&&f[s.id]!=null);tab=f.final?'final':(w?w.id:'request')}
   const nS=stg.length;
-  const ci=j.status==='awaiting_user'?nS:j.status==='approved'?nS+1:Math.max(0,keys.indexOf(j.step));
+  const ci=j.needs_input?Math.max(0,keys.indexOf(j.step)):j.status==='awaiting_user'?nS:j.status==='approved'?nS+1:Math.max(0,keys.indexOf(j.step));
   const st=i=>i<ci?'done':i===ci?((j.status==='failed'||j.status==='cancelled')?'err':(j.status==='running'||j.status==='awaiting_user')?'active':'wait'):'wait';
   const u=j.usage||{};
   const bys=Object.entries(u.by_stage||{}).map(([k,v])=>{const s=d.stages.find(x=>x.id===k);return esc(s?s.name:(k==='plan'?'자동 구성':k))+' '+fmtN(newTok(v))}).join(' · ');
   const srcL={telegram:'텔레그램',schedule:'예약 실행'}[j.source];
-  const head='<div class="title"><h2>'+esc(j.title)+'</h2><span class="chip '+j.status+'">'+STATUS[j.status]+'</span>'+(srcL?'<span class="chip">'+srcL+'</span>':'')+(j.auto_approve?'<span class="chip">자동 승인</span>':'')+(d.auto_planned?'<span class="chip approved">자동 구성</span>':'')+'</div>'
+  const head='<div class="title"><h2>'+esc(j.title)+'</h2><span class="chip '+j.status+'">'+(j.needs_input?'질문 대기':STATUS[j.status])+'</span>'+(srcL?'<span class="chip">'+srcL+'</span>':'')+(j.auto_approve?'<span class="chip">자동 승인</span>':'')+(d.auto_planned?'<span class="chip approved">자동 구성</span>':'')+'</div>'
     +'<div class="usage">'+esc(usageLine(u))+(d.limit?' · 작업 한도 '+fmtN(d.limit)+' 중 새 토큰 '+fmtN(newTok(u)):'')+'</div>'
     +(bys?'<div class="usage">단계별 새 토큰: '+bys+'</div>':'')
     +'<div class="steps">'+steps.map((s,i)=>'<div class="step '+st(i)+'"><b>'+esc(s[1])+'</b><span>'+esc(s[2])+'</span></div>').join('')+'</div>'
@@ -272,7 +272,12 @@ async function loadDetail(force){
     const works=stg.filter(s=>s.kind==='work');
     const opts='<option value="first">처음부터</option>'+works.map((s,i)=>'<option value="'+esc(s.id)+'"'+(i===works.length-1&&works.length>1?' selected':'')+'>'+esc(s.name)+'부터</option>').join('');
     let act='';
-    if(j.status==='awaiting_user'){
+    if(j.status==='awaiting_user'&&j.needs_input){
+      act='<div class="card approve"><h3>에이전트가 질문이 있습니다</h3>'
+        +'<div class="sub" style="white-space:pre-wrap">'+esc(j.question||'')+'</div>'
+        +'<textarea id="qa" placeholder="답변을 적어주세요"></textarea>'
+        +'<div class="row" style="margin-top:8px"><button class="pri" id="qago">답변 보내기</button></div></div>';
+    }else if(j.status==='awaiting_user'){
       const lastRev=stg.slice().reverse().find(s=>s.kind==='review'&&f[s.id]!=null);
       const rv=lastRev?verdictOf(f[lastRev.id]):'APPROVE';
       act='<div class="card approve"><h3>최종 승인이 필요합니다</h3><div class="sub">'+(rv==='APPROVE'?'검토를 통과한 결과물입니다.':'검토 단계의 수정요청이 남은 상태입니다. 해당 탭에서 내용을 확인하세요.')+' 승인하면 outbox에 approved 파일로 저장됩니다.</div>'
@@ -309,6 +314,7 @@ function bindJob(j){
   if(q('#rj'))q('#rj').onclick=()=>{const fb=q('#fb').value.trim();if(!fb){toast('수정 요청 내용을 적어주세요');return}run(()=>post(url+'/restart',{feedback:fb,start:q('#st').value}),'다시 작업을 시작합니다')};
   if(q('#rt'))q('#rt').onclick=()=>run(()=>post(url+'/restart',{start:q('#st').value}),'다시 시작합니다');
   if(q('#cn'))q('#cn').onclick=()=>{if(confirm('작업을 중단할까요?'))run(()=>post(url+'/cancel'),'중단 요청')};
+  if(q('#qago'))q('#qago').onclick=()=>{const a=q('#qa').value.trim();if(!a){toast('답변을 적어주세요');return}run(()=>post(url+'/restart',{feedback:a,start:j.step}),'답변을 반영해 이어서 진행합니다')};
 }
 function selectJob(id){
   sel=id;tab=null;tabPinned=false;last={list:last.list};
