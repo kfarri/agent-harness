@@ -1,0 +1,3110 @@
+#!/usr/bin/env python3
+"""에이전트 하네스 GUI 서버 v3 (파이썬 표준 라이브러리만 사용)
+
+구조: 프로젝트 > (에이전트, 단계 파이프라인, 작업)
+- 프로젝트마다 폴더가 분리된다. 'default' 프로젝트는 기존 ~/agents 폴더를 그대로 쓴다(자동 이전).
+- 단계는 '작업'(결과 파일 생성)과 '검토'(VERDICT: APPROVE/REVISE)로 구성되고,
+  검토가 REVISE이면 대상 단계로 돌아가 다시 수행한다(프로젝트별 최대 반복 횟수).
+- 마지막에는 항상 사용자의 최종 승인을 받는다.
+"""
+import base64
+import copy
+import http.cookies
+import ipaddress
+import hmac
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import queue
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
+
+BASE = Path(os.environ.get("AGENTS_DIR", "~/agents")).expanduser().resolve()
+
+
+def load_env(path):
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+load_env(BASE / ".env")
+
+HOST = os.environ.get("GUI_HOST", "127.0.0.1")
+PORT = int(os.environ.get("GUI_PORT", "8080"))
+USER = os.environ.get("GUI_USER", "admin")
+PASSWORD = os.environ.get("GUI_PASSWORD", "")
+AGENT_CMD = os.environ.get("AGENT_CMD", "claude")
+STEP_TIMEOUT = int(os.environ.get("STEP_TIMEOUT", "900"))
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TG_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
+TG_POLL = int(os.environ.get("TELEGRAM_POLL", "25"))
+PAIR_CODE = secrets.token_hex(3)
+TRUST_PROXY = os.environ.get("TRUST_PROXY", "") not in ("", "0", "false", "no")
+PUBLIC_HTTPS = os.environ.get("PUBLIC_HTTPS", "") not in ("", "0", "false", "no")
+PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "")
+SESS_TTL = max(1, int(os.environ.get("SESSION_DAYS", "7"))) * 86400
+MAX_FAILS = max(3, int(os.environ.get("MAX_LOGIN_FAILS", "5")))
+
+CONFIG_FILE = BASE / "projects.json"
+LEGACY_FILE = BASE / "agents.json"
+CLAUDE_JSON = Path.home() / ".claude.json"
+
+ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+MODEL_RE = re.compile(r"^[A-Za-z0-9._:\-\[\]]{0,60}$")
+RESERVED_STAGE = {"request", "final", "approved"}
+RESERVED_DIR = {"shared", "logs", "scripts", "projects"}
+DEFAULT_SETTINGS = {"parallel": 1, "job_token_limit": 0, "planner_model": "sonnet",
+                    "telegram": {"chats": [], "notify": True, "cur": {}}}
+TG_HELP = ("사용법\n"
+           "/projects  프로젝트 목록 (버튼으로 바로 전환)\n"
+           "/use 번호  작업할 프로젝트 고르기\n"
+           "/newproject 이름  새 프로젝트 만들기\n"
+           "/jobs  최근 작업 5건 보기\n"
+           "/status  지금 실행 중인 작업\n"
+           "/sched  예약 목록\n"
+           "/cancel  입력 대기 취소\n\n"
+           "명령 없이 그냥 메시지를 보내면 고른 프로젝트에 새 작업으로 요청됩니다.\n"
+           "작업이 끝나면 승인/반려 버튼이 도착합니다.")
+DEFAULT_TURNS = {"work": 15, "review": 8}
+KIND_LABEL = {"work": "작업", "review": "검토"}
+
+LOCK = threading.RLock()
+NOTIFY = queue.Queue()
+TG_WAIT = {}
+SESSIONS = {}     # 토큰 -> {ip, exp}
+FAILS = {}        # IP -> {n, until}
+LOGINS = []       # 최근 로그인 기록
+COND = threading.Condition(LOCK)
+PROCS = {}
+JOBS = {}
+QUEUE = queue.Queue()
+RUNNING = 0
+CFG = {}
+FLAGS = {}
+PENDING_TRUST = set()
+PLAN_LOCK = threading.Lock()
+OPT_FLAGS = ("--tools", "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence")
+
+
+class ApiError(Exception):
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code, self.msg = code, msg
+
+
+class Cancelled(Exception):
+    pass
+
+
+def now():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def read_text(path, limit=200_000):
+    try:
+        return path.read_text(errors="replace")[:limit]
+    except (FileNotFoundError, IsADirectoryError):
+        return None
+
+
+def write_json(path, obj):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+    tmp.replace(path)
+
+
+# ---------------------------------------------------------------- 기본값 · 프리셋
+
+def A(key, name, role, web=False, model=""):
+    return {"key": key, "name": name, "role": role, "web": web, "model": model}
+
+
+def S(name, agent, kind, instruction, inputs=(), target="", polish=False):
+    return {"name": name, "agent": agent, "kind": kind, "instruction": instruction,
+            "inputs": list(inputs), "target": target, "polish": polish}
+
+
+_RESEARCH = "요청 주제를 조사한다. 사실만 정리하고 출처를 함께 적으며, 자료가 엇갈리면 불일치로 표시한다. 글 작성은 하지 않는다."
+_CHECK = "요청과 조사 결과를 읽고, 이 조사 결과만으로 요청에 맞는 글을 쓸 수 있는지 판단한다. 기준: 요청 충족 / 근거·출처 / 모순·누락."
+_DRAFT = "조사 결과에 있는 내용만 사용해 읽기 쉬운 한국어 글(제목, 소제목 포함)로 작성한다. 없는 사실은 지어내지 않고 불일치 표시는 그대로 밝힌다."
+_REVIEW = "초안을 조사 결과와 대조해 검수한다 (없는 사실, 오탈자, 어색한 문장, 요청 누락)."
+
+PRESETS_RAW = [
+    {"key": "content_lite", "label": "콘텐츠 제작 · 절약형 (조사 → 작성 → 검수)",
+     "desc": "단계가 가장 적어 토큰을 아낍니다. 처음 시작할 때 권장합니다.",
+     "agents": [A("researcher", "리서처", "자료 조사 전문 에이전트다. 사실만 정리하고 출처를 적는다.", web=True),
+                A("writer", "작성자", "글 작성 전문 에이전트다. 조사 결과에 있는 내용만 사용해 글을 쓴다."),
+                A("reviewer", "리뷰어", "검수 전문 에이전트다. 없는 사실, 오탈자, 어색한 문장을 고친다.", model="haiku")],
+     "stages": [S("리서치", "researcher", "work", _RESEARCH),
+                S("초안 작성", "writer", "work", _DRAFT, ["리서치"]),
+                S("검수", "reviewer", "review", _REVIEW, ["리서치"], "초안 작성", True)]},
+    {"key": "content_full", "label": "콘텐츠 제작 · 교차검토 포함 (조사 → 검토 → 작성 → 검수)",
+     "desc": "조사 결과를 먼저 검토해 품질을 높입니다. 호출이 1회 더 늘어납니다.",
+     "agents": [A("researcher", "리서처", "자료 조사 전문 에이전트다. 사실만 정리하고 출처를 적는다.", web=True),
+                A("writer", "작성자", "글 작성 전문 에이전트다. 조사 결과에 있는 내용만 사용해 글을 쓴다."),
+                A("reviewer", "리뷰어", "검수 전문 에이전트다. 없는 사실, 오탈자, 어색한 문장을 고친다.", model="haiku")],
+     "stages": [S("리서치", "researcher", "work", _RESEARCH),
+                S("교차검토", "reviewer", "review", _CHECK, [], "리서치"),
+                S("초안 작성", "writer", "work", _DRAFT, ["리서치"]),
+                S("검수", "reviewer", "review", _REVIEW, ["리서치"], "초안 작성", True)]},
+    {"key": "blog", "label": "블로그·SNS 글 (기획 → 초안 → 편집)",
+     "desc": "주제 기획부터 편집까지. 웹 자료가 필요 없으면 가장 가볍습니다.",
+     "agents": [A("planner", "기획자", "독자와 목적을 분석해 글의 구조(제목 후보, 목차, 핵심 메시지)를 설계한다.", web=True),
+                A("writer", "작성자", "기획안에 따라 매력적인 한국어 글을 쓴다."),
+                A("editor", "편집자", "문장을 다듬고 톤을 통일하며 사실 오류를 점검한다.", model="haiku")],
+     "stages": [S("기획", "planner", "work", "요청을 분석해 독자, 목적, 제목 후보 3개, 목차, 핵심 메시지를 간결하게 정리한다."),
+                S("초안 작성", "writer", "work", "기획안에 따라 글을 작성한다. 분량은 요청에 맞춘다.", ["기획"]),
+                S("편집", "editor", "review", "초안을 기획안과 대조해 구조, 문장, 톤을 점검한다.", ["기획"], "초안 작성", True)]},
+    {"key": "code", "label": "코드 개발 (설계 → 구현 → 코드리뷰)",
+     "desc": "결과는 마크다운 코드 블록으로 저장됩니다. 실제 파일 생성·실행은 하지 않습니다.",
+     "agents": [A("architect", "설계자", "요구사항을 분석해 구조와 인터페이스를 설계한다."),
+                A("developer", "개발자", "설계에 따라 읽기 쉽고 단순한 코드를 작성한다."),
+                A("codereviewer", "코드리뷰어", "버그, 보안, 가독성 문제를 찾아 지적한다.", model="haiku")],
+     "stages": [S("설계", "architect", "work", "요구사항을 분석해 구조, 주요 함수·클래스, 예외 처리 방침을 간결하게 설계한다."),
+                S("구현", "developer", "work", "설계에 따라 코드를 작성해 마크다운 코드 블록으로 출력한다.", ["설계"]),
+                S("코드리뷰", "codereviewer", "review", "코드를 설계와 대조해 버그, 보안, 가독성을 점검한다.", ["설계"], "구현", True)]},
+    {"key": "translate", "label": "번역·현지화 (번역 → 감수)",
+     "desc": "두 단계뿐이라 토큰이 적게 듭니다.",
+     "agents": [A("translator", "번역가", "원문의 의미와 어조를 유지해 자연스럽게 번역한다."),
+                A("proofreader", "감수자", "번역의 오역, 누락, 어색한 표현을 점검한다.", model="haiku")],
+     "stages": [S("번역", "translator", "work", "요청에 적힌 원문을 지정된 언어로 번역한다. 의미를 더하거나 빼지 않는다."),
+                S("감수", "proofreader", "review", "원문과 번역을 대조해 오역, 누락, 어색한 표현을 점검한다.", [], "번역", True)]},
+    {"key": "report", "label": "데이터·보고서 (분석 → 보고서 → 검수)",
+     "desc": "자료를 분석하고 보고서로 정리합니다.",
+     "agents": [A("analyst", "분석가", "자료를 분석해 핵심 수치와 시사점을 정리한다.", web=True),
+                A("writer", "작성자", "분석 결과로 읽기 쉬운 보고서를 쓴다."),
+                A("reviewer", "리뷰어", "수치와 주장이 분석 결과와 일치하는지 검수한다.", model="haiku")],
+     "stages": [S("분석", "analyst", "work", "요청 주제의 자료를 조사·분석해 핵심 수치, 근거, 시사점을 표와 목록으로 정리한다."),
+                S("보고서 작성", "writer", "work", "분석 결과만 사용해 요약, 본문, 결론 순서의 보고서를 쓴다.", ["분석"]),
+                S("검수", "reviewer", "review", "보고서의 수치와 주장을 분석 결과와 대조해 오류를 점검한다.", ["분석"], "보고서 작성", True)]},
+]
+
+DEFAULT_ROLE_TEXT = {
+    "researcher": "자료 조사 전문 에이전트다. 사실만 정리하고 출처를 함께 적는다. 자료가 서로 엇갈리면 불일치로 표시한다. 최종 글 작성은 하지 않는다.",
+    "writer": "글 작성 전문 에이전트다. 조사 결과에 있는 내용만 사용해 읽기 쉬운 한국어 글로 작성하고, 없는 사실은 지어내지 않는다.",
+    "reviewer": "검수 전문 에이전트다. 초안을 조사 결과와 대조해 없는 사실, 오탈자, 어색한 문장을 찾아 고치고, 고친 내용은 검수 메모로 남긴다.",
+}
+
+
+def norm_plan(p, max_stages=8, max_agents=6):
+    """AI 또는 프리셋이 만든 구성안을 검증·정규화한다. (서버는 클라이언트가 보낸 구성안을 믿지 않는다)"""
+    if not isinstance(p, dict):
+        raise ValueError("구성안 형식이 올바르지 않습니다")
+    agents, keys = [], set()
+    for a in (p.get("agents") or [])[:max(1, min(6, max_agents))]:
+        if not isinstance(a, dict):
+            continue
+        key = re.sub(r"[^a-z0-9_]", "", str(a.get("key") or "").lower())[:20] or "a%d" % (len(agents) + 1)
+        while key in keys:
+            key += "x"
+        model = str(a.get("model") or "").strip()
+        agents.append({"key": key, "name": (str(a.get("name") or key).strip()[:30] or key),
+                       "role": str(a.get("role") or "").strip()[:1500], "web": bool(a.get("web")),
+                       "model": model if MODEL_RE.match(model) else ""})
+        keys.add(key)
+    if not agents:
+        raise ValueError("에이전트가 없습니다")
+    stages, ref = [], {}
+    raw, lim = (p.get("stages") or []), max(1, min(8, max_stages))
+    if len(raw) > lim:   # 앞쪽을 줄이고 마지막(보통 최종 검토) 단계는 남긴다
+        raw = raw[:1] if lim == 1 else raw[:lim - 1] + raw[-1:]
+    for i, s in enumerate(raw):
+        if not isinstance(s, dict):
+            continue
+        name = (str(s.get("name") or "").strip()[:30]) or "단계%d" % (i + 1)
+        kind = "review" if (s.get("kind") == "review" and stages) else "work"
+        agent = s.get("agent") if s.get("agent") in keys else agents[0]["key"]
+        sid = "s%d" % (len(stages) + 1)
+        target = ""
+        if kind == "review":
+            target = ref.get(str(s.get("target") or ""), "")
+            if not target:
+                works = [x for x in stages if x["kind"] == "work"]
+                if works:
+                    target = works[-1]["id"]
+                else:
+                    kind = "work"
+        inputs = []
+        for x in (s.get("inputs") or []):
+            r = ref.get(str(x))
+            if r and r not in inputs and r != target:
+                inputs.append(r)
+        stages.append({"id": sid, "name": name, "kind": kind, "agent": agent, "target": target, "inputs": inputs,
+                       "instruction": str(s.get("instruction") or "").strip()[:3000], "enabled": True,
+                       "max_turns": 0, "polish": bool(s.get("polish")) and kind == "review"})
+        ref[name] = sid
+        ref[sid] = sid
+    if not any(s["kind"] == "work" for s in stages):
+        raise ValueError("'작업' 단계가 하나 이상 필요합니다")
+    if stages[-1]["kind"] == "review" and not any(s["polish"] for s in stages):
+        stages[-1]["polish"] = True
+    return {"agents": agents, "stages": stages}
+
+
+PRESETS = []
+for _p in PRESETS_RAW:
+    _n = norm_plan(_p)
+    PRESETS.append({"key": _p["key"], "label": _p["label"], "desc": _p["desc"], "plan": _n})
+
+
+# ---------------------------------------------------------------- 설정 저장 · 프로젝트 조회
+
+def S_():
+    return CFG["settings"]
+
+
+def save_cfg():
+    write_json(CONFIG_FILE, CFG)
+
+
+def proj_dirs(proj):
+    root = BASE if proj["root"] == "." else (BASE / proj["root"]).resolve()
+    sh = root / "shared"
+    return {"root": root, "shared": sh, "inbox": sh / "inbox", "handoff": sh / "handoff", "outbox": sh / "outbox",
+            "jobs": sh / "jobs", "hist": sh / "history", "sources": sh / "sources",
+            "logs": BASE / "logs" / proj["id"]}
+
+
+def ensure_dirs(proj):
+    for k in ("inbox", "handoff", "outbox", "jobs", "hist", "sources", "logs"):
+        proj_dirs(proj)[k].mkdir(parents=True, exist_ok=True)
+
+
+def proj_of(pid):
+    if not ID_RE.match(pid or ""):
+        raise ApiError(400, "잘못된 프로젝트 ID")
+    p = next((x for x in CFG["projects"] if x["id"] == pid), None)
+    if not p:
+        raise ApiError(404, "프로젝트를 찾을 수 없음")
+    return p
+
+
+def agent_of(proj, aid):
+    a = next((x for x in proj["agents"] if x["id"] == aid), None)
+    if not a:
+        raise ApiError(404, "에이전트를 찾을 수 없음")
+    return a
+
+
+def agent_name(proj, aid):
+    a = next((x for x in proj["agents"] if x["id"] == aid), None)
+    return a["name"] if a else "(없음)"
+
+
+def active_stages(proj):
+    return [s for s in proj["stages"] if s.get("enabled", True)]
+
+
+def migrate():
+    """기존(v2) agents.json 이 있으면 그 에이전트와 단계 담당을 default 프로젝트로 이전한다."""
+    agents = [{"id": "researcher", "name": "리서처", "workspace": "workspace_1", "model": ""},
+              {"id": "writer", "name": "작성자", "workspace": "workspace_2", "model": ""},
+              {"id": "reviewer", "name": "리뷰어", "workspace": "workspace_3", "model": ""}]
+    who = {"research": "researcher", "check_research": "writer", "draft": "writer", "review": "reviewer"}
+    try:
+        old = json.loads(LEGACY_FILE.read_text())
+        if old.get("agents"):
+            agents = old["agents"]
+            who.update(old.get("stages") or {})
+    except (OSError, ValueError):
+        pass
+
+    def st(i, name, kind, agent, instr, inputs=(), target="", polish=False):
+        return {"id": i, "name": name, "kind": kind, "agent": agent, "target": target, "inputs": list(inputs),
+                "instruction": instr, "enabled": True, "max_turns": 0, "polish": polish}
+    stages = [st("research", "리서치", "work", who["research"], _RESEARCH),
+              st("check_research", "교차검토", "review", who["check_research"], _CHECK, [], "research"),
+              st("draft", "초안 작성", "work", who["draft"], _DRAFT, ["research"]),
+              st("review", "리뷰", "review", who["review"], _REVIEW, ["research"], "draft", True)]
+    return {"settings": copy.deepcopy(DEFAULT_SETTINGS),
+            "projects": [{"id": "default", "name": "기본 프로젝트", "description": "기존에 쓰던 작업 공간", "root": ".",
+                          "agents": agents, "stages": stages, "max_rounds": 2, "schedules": [],
+                          "stage_mode": "fixed", "created": now()}]}
+
+
+def load_cfg():
+    global CFG
+    try:
+        CFG = json.loads(CONFIG_FILE.read_text())
+    except FileNotFoundError:
+        CFG = migrate()
+    except ValueError:
+        sys.exit("projects.json 형식이 깨져 있습니다: %s" % CONFIG_FILE)
+    CFG.setdefault("settings", {})
+    for k, v in DEFAULT_SETTINGS.items():
+        CFG["settings"].setdefault(k, copy.deepcopy(v))
+    for k, v in DEFAULT_SETTINGS["telegram"].items():
+        CFG["settings"]["telegram"].setdefault(k, copy.deepcopy(v))
+    for p in CFG["projects"]:
+        p.setdefault("max_rounds", 1)
+        p.setdefault("description", "")
+        p.setdefault("schedules", [])
+        p.setdefault("stage_mode", "fixed")
+        p.setdefault("use_sources", "prefer")
+    save_cfg()
+
+
+# ---------------------------------------------------------------- 에이전트 설정 파일 · 신뢰 등록
+
+def build_settings(proj, perms):
+    allow = ["Read", "Write", "Edit"]
+    src = proj_dirs(proj)["sources"]
+    deny = ["Bash(sudo:*)", "Bash(rm:*)", "Read(/%s)" % (BASE / ".env"),
+            "Write(/%s/**)" % src, "Edit(/%s/**)" % src]   # 참고 자료는 읽기만 허용
+    if perms.get("web"):
+        allow += ["WebSearch", "WebFetch"]
+    else:
+        deny += ["WebSearch", "WebFetch"]
+    if perms.get("bash"):
+        allow.append("Bash")
+    return {"permissions": {"additionalDirectories": [str(proj_dirs(proj)["shared"])], "allow": allow, "deny": deny}}
+
+
+def read_allow(path):
+    try:
+        return json.loads(path.read_text()).get("permissions", {}).get("allow", [])
+    except (OSError, ValueError):
+        return None
+
+
+def parse_perms(path):
+    allow = read_allow(path) or []
+    return {"web": "WebSearch" in allow or "WebFetch" in allow, "bash": "Bash" in allow}
+
+
+def agent_tools(ws):
+    """에이전트가 쓸 수 있는 기본 도구만 모델에 노출한다(도구 정의가 줄어 토큰이 절약된다)."""
+    allow = read_allow(ws / ".claude" / "settings.json")
+    tools = [t for t in (allow or []) if re.match(r"^[A-Za-z]+$", t)]
+    for need in ("Read", "Write", "Edit"):
+        if need not in tools:
+            tools.append(need)
+    return tools
+
+
+def md_template(name, desc):
+    body = (desc or "").strip() or "(여기에 이 에이전트가 맡을 역할을 적어주세요)"
+    return ("# 역할: %s\n%s\n\n## 공통 규칙\n- 작업 지시에 적힌 입력 파일만 읽고, 지정된 출력 파일에만 저장한다\n"
+            "- 저장을 마치면 한 줄로 결과를 보고하고 종료한다\n" % (name, body))
+
+
+def is_trusted(ws):
+    try:
+        d = json.loads(CLAUDE_JSON.read_text())
+        return bool(d.get("projects", {}).get(str(ws.resolve()), {}).get("hasTrustDialogAccepted"))
+    except (OSError, ValueError):
+        return False
+
+
+def flush_trust():
+    """claude 설정 파일(~/.claude.json)은 에이전트가 실행 중일 때 건드리면 충돌할 수 있어, 유휴 시에만 쓴다."""
+    with LOCK:
+        if PROCS or not PENDING_TRUST:
+            return
+        try:
+            d = json.loads(CLAUDE_JSON.read_text())
+        except FileNotFoundError:
+            d = {}
+        except ValueError:
+            return
+        for p in PENDING_TRUST:
+            d.setdefault("projects", {}).setdefault(p, {})["hasTrustDialogAccepted"] = True
+        tmp = CLAUDE_JSON.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, indent=2))
+        os.chmod(tmp, 0o600)
+        tmp.replace(CLAUDE_JSON)
+        PENDING_TRUST.clear()
+
+
+def trust(ws):
+    if is_trusted(ws):
+        return True
+    PENDING_TRUST.add(str(ws.resolve()))
+    flush_trust()
+    return is_trusted(ws)
+
+
+def agent_problems(proj, a):
+    ws = proj_dirs(proj)["root"] / a["workspace"]
+    if not ws.is_dir():
+        return ["워크스페이스 폴더가 없습니다: %s" % a["workspace"]]
+    out = []
+    if not (ws / ".claude" / "settings.json").exists():
+        out.append("권한 설정(settings.json)이 없어 공유 폴더에 결과를 쓰지 못합니다")
+    if not (ws / "CLAUDE.md").exists():
+        out.append("역할 설명(CLAUDE.md)이 없습니다")
+    if not is_trusted(ws):
+        out.append("폴더 신뢰 등록이 안 되어 권한 설정이 무시됩니다")
+    return out
+
+
+def backup_file(proj, path):
+    if path.exists():
+        d = proj_dirs(proj)["hist"] / "_agents" / path.parent.name
+        d.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, d / ("%s.%s" % (path.name, time.strftime("%Y%m%d-%H%M%S"))))
+
+
+def agent_info(proj, a, full=False):
+    ws = proj_dirs(proj)["root"] / a["workspace"]
+    info = {"id": a["id"], "name": a["name"], "workspace": a["workspace"], "model": a.get("model", ""),
+            "problems": agent_problems(proj, a),
+            "stages": [s["name"] for s in proj["stages"] if s["agent"] == a["id"]]}
+    if full:
+        md = read_text(ws / "CLAUDE.md")
+        info["claude_md"] = md if md is not None else md_template(a["name"], DEFAULT_ROLE_TEXT.get(a["id"], ""))
+        info["has_md"] = md is not None
+        sp = ws / ".claude" / "settings.json"
+        info["perms"] = parse_perms(sp) if sp.exists() else {"web": a["id"] == "researcher", "bash": False}
+    return info
+
+
+def ws_slug(name):
+    """에이전트 이름을 폴더 이름으로 쓸 수 있게 다듬는다. 한글은 그대로 두고(리눅스는 UTF-8 파일명을 지원한다),
+    경로에 문제가 될 문자만 없앤다."""
+    s = re.sub(r"[^\w가-힣 ()\-]", "", name or "").strip()
+    s = re.sub(r"\s+", " ", s)[:40]
+    return s
+
+
+def free_ws_name(root, base, used, keep=""):
+    name, i = base, 1
+    while name in used or name in RESERVED_DIR or (name != keep and (root / name).exists()):
+        i += 1
+        name = "%s %d" % (base, i)
+    return name
+
+
+def create_agent_in(proj, name, desc, perms, model="", existing=""):
+    root = proj_dirs(proj)["root"]
+    used = {a["workspace"] for a in proj["agents"]}
+    if existing:
+        if not ID_RE.match(existing) or existing in RESERVED_DIR:
+            raise ApiError(400, "폴더 이름이 올바르지 않습니다")
+        if existing in used:
+            raise ApiError(409, "이미 등록된 폴더입니다")
+        if not (root / existing).is_dir():
+            raise ApiError(404, "그 이름의 폴더가 없습니다: %s" % existing)
+        ws_name = existing
+    else:
+        ws_name = free_ws_name(root, ws_slug(name) or "agent", used)
+    ws = root / ws_name
+    (ws / ".claude").mkdir(parents=True, exist_ok=True)
+    if not (ws / "CLAUDE.md").exists():
+        (ws / "CLAUDE.md").write_text(md_template(name, desc))
+    sp = ws / ".claude" / "settings.json"
+    if not sp.exists():
+        sp.write_text(json.dumps(build_settings(proj, perms), ensure_ascii=False, indent=2))
+    nums = [int(re.sub(r"\D", "", a["id"]) or 0) for a in proj["agents"]]
+    a = {"id": "agent%d" % (max(nums + [0]) + 1), "name": name, "workspace": ws_name, "model": model}
+    proj["agents"].append(a)
+    trust(ws)
+    return a
+
+
+def validate_stages(proj, raw):
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 10:
+        raise ApiError(400, "단계는 1~10개여야 합니다")
+    out, ids = [], []
+    for s in raw:
+        if not isinstance(s, dict):
+            raise ApiError(400, "단계 형식 오류")
+        sid = str(s.get("id") or "").strip()
+        if not ID_RE.match(sid) or sid in RESERVED_STAGE or sid in ids:
+            raise ApiError(400, "단계 ID가 올바르지 않거나 중복입니다: %s" % sid)
+        name = str(s.get("name") or "").strip()[:30]
+        if not name:
+            raise ApiError(400, "단계 이름을 입력하세요")
+        kind = "review" if s.get("kind") == "review" else "work"
+        agent = str(s.get("agent") or "")
+        if not any(a["id"] == agent for a in proj["agents"]):
+            raise ApiError(400, "'%s' 단계의 담당 에이전트가 올바르지 않습니다" % name)
+        target = ""
+        if kind == "review":
+            target = str(s.get("target") or "")
+            if target not in ids:
+                if not ids:
+                    raise ApiError(400, "첫 단계는 '검토'가 될 수 없습니다")
+                target = ids[-1]
+        try:
+            mt = max(0, min(60, int(s.get("max_turns") or 0)))
+        except (TypeError, ValueError):
+            mt = 0
+        out.append({"id": sid, "name": name, "kind": kind, "agent": agent, "target": target,
+                    "inputs": [x for x in (s.get("inputs") or []) if x in ids and x != target],
+                    "instruction": str(s.get("instruction") or "").strip()[:3000],
+                    "enabled": bool(s.get("enabled", True)), "max_turns": mt,
+                    "polish": bool(s.get("polish")) and kind == "review"})
+        ids.append(sid)
+    en = [s for s in out if s["enabled"]]
+    if not en or en[0]["kind"] != "work":
+        raise ApiError(400, "사용 중인 첫 단계는 '작업'이어야 합니다")
+    return out
+
+
+def apply_plan(proj, plan):
+    """구성안을 프로젝트에 적용: 에이전트를 새로 만들고 단계를 교체한다. 기존 에이전트는 그대로 둔다."""
+    kmap = {}
+    for a in plan["agents"]:
+        ag = create_agent_in(proj, a["name"], a["role"], {"web": a["web"], "bash": False}, a["model"])
+        kmap[a["key"]] = ag["id"]
+    proj["stages"] = [dict(s, agent=kmap[s["agent"]]) for s in plan["stages"]]
+
+
+# ---------------------------------------------------------------- 파일 경로 · 작업 상태
+
+def fpath(proj, kind, jid):
+    d = proj_dirs(proj)
+    if kind == "request":
+        return d["inbox"] / ("%s.md" % jid)
+    if kind == "final":
+        return d["outbox"] / ("final_%s.md" % jid)
+    if kind == "approved":
+        return d["outbox"] / ("approved_%s.md" % jid)
+    return d["handoff"] / ("%s_%s.md" % (kind, jid))
+
+
+def rel(proj, kind, jid):
+    p = fpath(proj, kind, jid)
+    return "../shared/%s/%s" % (p.parent.name, p.name)
+
+
+def jsave(job):
+    write_json(proj_dirs(proj_of(job["pid"]))["jobs"] / ("%s.json" % job["id"]), job)
+
+
+def event(job, agent, msg, kind="info"):
+    with LOCK:
+        job["events"].append({"ts": now(), "agent": agent, "msg": msg, "kind": kind})
+        job["updated"] = now()
+        jsave(job)
+
+
+def set_state(job, **kw):
+    with LOCK:
+        job.update(kw)
+        job["updated"] = now()
+        jsave(job)
+
+
+def archive(proj, jid, path):
+    if path.exists():
+        d = proj_dirs(proj)["hist"] / jid
+        d.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, d / ("%s.%s" % (path.name, time.strftime("%H%M%S"))))
+
+
+def new_tokens(u):
+    return int(u.get("input", 0)) + int(u.get("output", 0)) + int(u.get("cache_write", 0))
+
+
+def _acc(t, inp, out, cw, cr, cost):
+    t["input"] = t.get("input", 0) + inp
+    t["output"] = t.get("output", 0) + out
+    t["cache_write"] = t.get("cache_write", 0) + cw
+    t["cache_read"] = t.get("cache_read", 0) + cr
+    t["cost"] = round(t.get("cost", 0.0) + cost, 6)
+    t["calls"] = t.get("calls", 0) + 1
+
+
+def add_usage(job, stage_id, data):
+    u = data.get("usage") or {}
+    vals = [int(u.get(k) or 0) for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")]
+    try:
+        cost = float(data.get("total_cost_usd") or 0)
+    except (TypeError, ValueError):
+        cost = 0.0
+    with LOCK:
+        tot = job.setdefault("usage", {})
+        _acc(tot, *vals, cost)
+        _acc(tot.setdefault("by_stage", {}).setdefault(stage_id, {}), *vals, cost)
+        jsave(job)
+
+
+# ---------------------------------------------------------------- 에이전트 실행
+
+def child_env():
+    e = dict(os.environ)
+    e.pop("GUI_PASSWORD", None)  # 에이전트가 GUI 비밀번호를 읽지 못하게 한다
+    e.setdefault("DISABLE_AUTOUPDATER", "1")
+    e.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+    return e
+
+
+def probe_flags():
+    """설치된 claude가 지원하는 토큰 절감 옵션만 쓰도록 --help 로 확인한다."""
+    global FLAGS
+    mode = os.environ.get("AGENT_FLAGS", "auto")
+    if mode == "none":
+        FLAGS = {f: False for f in OPT_FLAGS}
+        return
+    if mode == "all":
+        FLAGS = {f: True for f in OPT_FLAGS}
+        return
+    try:
+        out = subprocess.run(shlex.split(AGENT_CMD) + ["--help"], capture_output=True, text=True,
+                             timeout=60, env=child_env()).stdout
+    except Exception:  # noqa: BLE001
+        out = ""
+    FLAGS = {f: (f in out) for f in OPT_FLAGS}
+
+
+def build_cmd(prompt, model="", turns=10, tools=None):
+    cmd = shlex.split(AGENT_CMD) + ["-p", prompt, "--output-format", "json", "--max-turns", str(turns),
+                                    "--permission-mode", "acceptEdits"]
+    if model:
+        cmd += ["--model", model]
+    if tools is not None and FLAGS.get("--tools"):
+        cmd += ["--tools", ",".join(tools)]
+    for f in ("--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"):
+        if FLAGS.get(f):
+            cmd.append(f)
+    return cmd
+
+
+def parse_result(text):
+    t = (text or "").strip()
+    cands = [t]
+    if "\n{" in t:
+        cands.append(t[t.rfind("\n{"):].strip())
+    for c in cands:
+        try:
+            d = json.loads(c)
+        except ValueError:
+            continue
+        if isinstance(d, list):
+            d = next((x for x in reversed(d) if isinstance(x, dict) and x.get("type") == "result"), None)
+        if isinstance(d, dict):
+            return d
+    return None
+
+
+def kill_proc(p):
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+        time.sleep(1)
+        os.killpg(p.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def run_agent(job, proj, agent, stage, prompt):
+    d = proj_dirs(proj)
+    ws = d["root"] / agent["workspace"]
+    if not ws.is_dir():
+        raise RuntimeError("워크스페이스가 없음: %s" % ws)
+    d["logs"].mkdir(parents=True, exist_ok=True)
+    log = d["logs"] / ("%s_%s_%s.log" % (job["id"], stage["id"], time.strftime("%H%M%S")))
+    turns = stage.get("max_turns") or DEFAULT_TURNS[stage["kind"]]
+    cmd = build_cmd(prompt, agent.get("model", ""), turns, agent_tools(ws))
+    key = (proj["id"], job["id"])
+    with open(log, "wb") as lf:
+        p = subprocess.Popen(cmd, cwd=ws, env=child_env(), stdout=lf, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+        PROCS[key] = p
+        try:
+            rc = p.wait(timeout=STEP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            kill_proc(p)
+            raise RuntimeError("시간 초과(%d초)" % STEP_TIMEOUT)
+        finally:
+            PROCS.pop(key, None)
+    text = read_text(log) or ""
+    data = parse_result(text)
+    if data:
+        add_usage(job, stage["id"], data)
+    if job.get("cancel"):
+        raise Cancelled()
+    if data:
+        sub = str(data.get("subtype") or "")
+        if data.get("is_error") or sub.startswith("error"):
+            hint = "최대 턴(%d)을 초과했습니다. 단계의 '최대 턴'을 늘려보세요. " % turns if "max_turns" in sub else ""
+            raise RuntimeError("에이전트 오류(%s): %s%s" % (sub or "error", hint, str(data.get("result") or "")[:300]))
+        reply = str(data.get("result") or "")
+    elif rc != 0:
+        raise RuntimeError("에이전트 종료 코드 %s: %s" % (rc, text[-300:].strip()))
+    else:
+        reply = text
+    check_budget(job)
+    return reply
+
+
+def check_budget(job):
+    limit = int(S_().get("job_token_limit") or 0)
+    if limit and new_tokens(job.get("usage") or {}) > limit:
+        raise RuntimeError("작업 토큰 한도(%s) 초과: 현재 %s. 설정에서 한도를 조정하세요" %
+                           (limit, new_tokens(job["usage"])))
+
+
+def run_step(job, proj, stage, prompt, remove_kinds=()):
+    jid = job["id"]
+    if job.get("cancel"):
+        raise Cancelled()
+    agent = next((a for a in proj["agents"] if a["id"] == stage["agent"]), None)
+    if not agent:
+        raise RuntimeError("'%s' 단계의 담당 에이전트가 없습니다 (단계 탭에서 지정하세요)" % stage["name"])
+    who = agent["name"]
+    set_state(job, step=stage["id"])
+    event(job, who, "%s 시작" % stage["name"])
+    for pr in agent_problems(proj, agent):
+        event(job, who, "설정 확인 필요: %s" % pr, "warn")
+    for k in remove_kinds:
+        archive(proj, jid, fpath(proj, k, jid))
+        fpath(proj, k, jid).unlink(missing_ok=True)
+    out = fpath(proj, stage["id"], jid)
+    archive(proj, jid, out)
+    reply = ""
+    for attempt in range(2):
+        if job.get("cancel"):
+            raise Cancelled()
+        started = time.time() - 1
+        reply = run_agent(job, proj, agent, stage, prompt if attempt == 0 else prompt + RETRY_SUFFIX)
+        if out.exists() and out.stat().st_mtime >= started:
+            event(job, who, "%s 완료" % stage["name"], "ok")
+            return
+        if attempt == 0:
+            event(job, who, "%s: 파일 저장이 확인되지 않아 한 번 더 지시합니다" % stage["name"], "warn")
+    raise RuntimeError("%s 결과 파일이 두 번 시도에도 저장되지 않음 (담당: %s, 폴더: %s)\n에이전트 응답: %s"
+                       % (stage["name"], who, agent["workspace"], reply.strip()[-500:] or "(응답 없음)"))
+
+
+# ---------------------------------------------------------------- 파이프라인
+
+CONCISE = ("위에 적힌 입력 파일과 참고 자료 외에는 폴더를 탐색하지 않는다. 그런 다음 반드시 Write 도구로 출력 파일 경로에 결과를 저장한다. "
+           "파일로 저장하기 전에는 작업이 끝난 것이 아니며, 채팅으로 결과를 답하는 것만으로는 완료되지 않는다. "
+           "설명이나 요약을 덧붙이지 말고, 저장을 마친 뒤 한 줄로만 보고하고 종료한다.")
+RETRY_SUFFIX = ("\n\n[중요] 방금 전 시도에서 지정된 출력 파일이 저장되지 않았습니다. 이유를 설명하지 말고, "
+                "다른 어떤 도구도 쓰지 말고, 지금 바로 Write 도구로 위에 적힌 출력 파일 경로에 저장하세요. "
+                "저장하지 않으면 이 작업은 실패로 처리됩니다.")
+
+
+SRC_NAME = re.compile(r"^[\w가-힣 .()\-]{1,60}$")
+SRC_MAX = 50
+
+
+def src_dir(proj):
+    d = proj_dirs(proj)["sources"]
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def src_path(proj, name):
+    name = str(name or "").strip()
+    if not SRC_NAME.match(name) or "/" in name or ".." in name:
+        raise ApiError(400, "파일 이름에 쓸 수 없는 문자가 있습니다")
+    if not name.lower().endswith((".md", ".txt")):
+        name += ".md"
+    return src_dir(proj) / name
+
+
+def src_list(proj):
+    out = []
+    d = proj_dirs(proj)["sources"]
+    if d.is_dir():
+        for p in sorted(d.iterdir()):
+            if p.is_file() and p.suffix.lower() in (".md", ".txt"):
+                out.append({"name": p.name, "size": p.stat().st_size,
+                            "preview": (read_text(p, 300) or "").strip()[:200]})
+    return out
+
+
+def sources_block(proj):
+    """사용자가 직접 넣어둔 자료를 에이전트가 근거로 쓰도록 프롬프트에 붙인다."""
+    mode = proj.get("use_sources", "prefer")
+    if mode == "off":
+        return ""
+    items = src_list(proj)
+    if not items:
+        return ""
+    lines = ["[참고 자료] 사용자가 직접 제공한 자료다. 관련 있는 파일을 읽어 근거로 삼는다."]
+    lines += ["- ../shared/sources/%s" % s["name"] for s in items[:SRC_MAX]]
+    if mode == "only":
+        lines.append("답변은 이 자료에 있는 내용만 근거로 작성한다. 자료에 없는 것은 '제공된 자료에 없음'이라고 밝히고 추측하지 않는다.")
+    else:
+        lines.append("이 자료를 우선 근거로 삼고, 부족한 부분만 다른 방법으로 보완한다.")
+    return "\n".join(lines) + "\n"
+
+
+def feedback_block(fb):
+    fb = (fb or "").strip()[:2000]
+    if not fb:
+        return ""
+    return ("\n[수정 요청 - 반드시 반영할 것]\n%s\n기존 결과 파일이 있으면 먼저 읽고, 같은 경로에 덮어써서 수정본을 저장한다.\n" % fb)
+
+
+def inputs_block(proj, stages, stage, jid):
+    lines = ["요청 파일: %s" % rel(proj, "request", jid)]
+    by_id = {s["id"]: s for s in stages}
+    for i in stage.get("inputs", []):
+        if i in by_id:
+            lines.append("%s: %s" % (by_id[i]["name"], rel(proj, i, jid)))
+    return "\n".join(lines)
+
+
+def prompt_work(proj, stages, stage, jid, fb):
+    return ("STEP: %s\n작업ID: %s\n%s\n%s지시: %s\n출력 파일: %s\n%s%s"
+            % (stage["id"], jid, inputs_block(proj, stages, stage, jid), sources_block(proj),
+               stage["instruction"] or "요청을 수행한다.",
+               rel(proj, stage["id"], jid), feedback_block(fb), CONCISE))
+
+
+def prompt_review(proj, stages, stage, jid):
+    by_id = {s["id"]: s for s in stages}
+    tgt = by_id[stage["target"]]
+    p = ("STEP: %s\n작업ID: %s\n%s\n%s검토 대상(%s): %s\n지시: %s\n검수 결과 파일: %s\n"
+         "형식: 첫 줄은 정확히 `VERDICT: APPROVE` 또는 `VERDICT: REVISE` 한 줄만 쓴다. 둘째 줄부터 이유를 적고, "
+         "REVISE이면 대상 단계에 줄 구체적인 수정 요청을 적는다.\n"
+         % (stage["id"], jid, inputs_block(proj, stages, stage, jid), sources_block(proj),
+            tgt["name"], rel(proj, tgt["id"], jid),
+            stage["instruction"] or "검토 대상이 요청에 맞는지 판단한다.", rel(proj, stage["id"], jid)))
+    if stage.get("polish"):
+        p += ("VERDICT가 APPROVE일 때만 오탈자와 문장을 다듬은 최종본을 %s 에 저장하고 맨 아래에 '검수 메모'로 "
+              "고친 내용을 짧게 적는다. REVISE이면 최종본은 만들지 않는다.\n" % rel(proj, "final", jid))
+    return p + "검토 대상 외 다른 파일은 수정하지 않는다. " + CONCISE
+
+
+def verdict(proj, stage, jid):
+    text = read_text(fpath(proj, stage["id"], jid)) or ""
+    m = re.search(r"VERDICT:\s*(APPROVE|REVISE)", text[:600], re.I)
+    return (m.group(1).upper() if m else "REVISE"), text
+
+
+def pipeline(job, start):
+    proj = proj_of(job["pid"])
+    jid = job["id"]
+    stages = [dict(s) for s in job_stage_src(proj, job)]
+    max_rounds = int(proj.get("max_rounds", 1))
+    idx = next((i for i, s in enumerate(stages) if s["id"] == start and s["kind"] == "work"), 0)
+    pending = {stages[idx]["id"]: job.get("feedback") or ""}
+    rounds = {}
+    try:
+        i = idx
+        while i < len(stages):
+            st = stages[i]
+            who = agent_name(proj, st["agent"])
+            if st["kind"] == "work":
+                run_step(job, proj, st, prompt_work(proj, stages, st, jid, pending.pop(st["id"], "")))
+                i += 1
+                continue
+            run_step(job, proj, st, prompt_review(proj, stages, st, jid),
+                     remove_kinds=("final",) if st.get("polish") else ())
+            v, text = verdict(proj, st, jid)
+            if v == "APPROVE":
+                event(job, who, "%s: 승인" % st["name"], "ok")
+                i += 1
+                continue
+            r = rounds.get(st["id"], 0)
+            tpos = next((k for k, s in enumerate(stages) if s["id"] == st["target"]), None)
+            if r >= max_rounds or tpos is None or tpos >= i:
+                event(job, who, "%s: 수정요청이 남았지만 반복 한도(%d회)라 다음으로 진행" % (st["name"], max_rounds), "warn")
+                i += 1
+                continue
+            rounds[st["id"]] = r + 1
+            pending[stages[tpos]["id"]] = text
+            event(job, who, "%s: 수정요청 (%d/%d회) - %s 단계로 돌려보냄" % (st["name"], r + 1, max_rounds,
+                                                                      stages[tpos]["name"]), "warn")
+            i = tpos
+        set_state(job, status="awaiting_user")
+        if job.get("auto_approve"):
+            event(job, "system", "자동 승인 설정에 따라 바로 승인합니다", "ok")
+            with LOCK:
+                try:
+                    job_approve(proj, job)
+                except ApiError as e:
+                    set_state(job, status="failed", error=e.msg)
+                    event(job, "system", "자동 승인 실패: %s" % e.msg, "err")
+        else:
+            event(job, "system", "사용자 최종 승인을 기다리는 중", "ok")
+            notify_job(job, "awaiting")
+    except Cancelled:
+        set_state(job, status="cancelled")
+        event(job, "system", "중단됨", "warn")
+    except Exception as e:  # noqa: BLE001
+        set_state(job, status="failed", error=str(e))
+        event(job, "system", "실패: %s" % e, "err")
+        notify_job(job, "failed")
+
+
+def worker():
+    global RUNNING
+    while True:
+        pid, jid, start = QUEUE.get()
+        job = JOBS.get((pid, jid))
+        if not job:
+            continue
+        with COND:
+            while RUNNING >= int(S_()["parallel"]):
+                COND.wait(2)
+            RUNNING += 1
+        try:
+            if job.get("cancel"):
+                set_state(job, status="cancelled")
+                event(job, "system", "대기 중 중단됨", "warn")
+            else:
+                set_state(job, status="running", error="")
+                proj = next((p for p in CFG["projects"] if p["id"] == pid), None)
+                if proj and start == "first" and not job.get("stages") and proj.get("stage_mode") == "auto":
+                    plan_job(proj, job)
+                pipeline(job, start)
+        except Exception as e:  # noqa: BLE001
+            set_state(job, status="failed", error=str(e))
+            event(job, "system", "실패: %s" % e, "err")
+            notify_job(job, "failed")
+        finally:
+            with COND:
+                RUNNING -= 1
+                COND.notify_all()
+            try:
+                flush_trust()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+# ---------------------------------------------------------------- AI 단계 추천
+
+def ai_plan(name, desc, want_stages=0, want_agents=0):
+    ns = "에이전트 %d개" % want_agents if want_agents else "에이전트 2~4개"
+    st = ("단계는 정확히 %d개로 만든다." % want_stages) if want_stages else "단계 2~5개로 꼭 필요한 것만 둔다."
+    prompt = (
+        "STEP: plan\n너는 멀티 에이전트 파이프라인 설계자다. 아래 프로젝트에 맞는 에이전트와 단계를 설계해 JSON 하나만 출력한다. "
+        "설명, 코드블록, 머리말은 쓰지 않는다.\n프로젝트: %s\n설명: %s\n\n규칙:\n"
+        "- 토큰을 아끼려면 단계가 적어야 한다. %s. %s\n"
+        "- agents:[{\"key\":\"영문소문자\",\"name\":\"한글 이름\",\"role\":\"역할 설명 1~2문장\",\"web\":true|false,\"model\":\"haiku|sonnet|\"}]\n"
+        "- stages: [{\"name\":\"한글 단계 이름\",\"agent\":\"agents의 key\",\"kind\":\"work|review\",\"target\":\"review일 때 검토할 앞 단계의 name\","
+        "\"instruction\":\"이 단계 지시 1~2문장\",\"inputs\":[\"참고할 앞 단계의 name\"],\"polish\":false}]\n"
+        "- 첫 단계는 work. review 단계는 앞의 work 단계를 target으로 하며, 마지막 단계는 review로 두고 polish를 true로 한다.\n"
+        "- 점검·검수 같은 단순 단계의 에이전트는 model을 haiku로, 글쓰기·추론은 빈 문자열(기본)로 한다. web은 인터넷 자료가 필요한 에이전트만 true.\n"
+        "출력 형식: {\"agents\":[...],\"stages\":[...]}") % (name, desc, ns, st)
+    if not PLAN_LOCK.acquire(blocking=False):
+        raise ApiError(409, "이미 추천을 생성하는 중입니다. 잠시 후 다시 시도하세요")
+    try:
+        cwd = BASE / ".planner"
+        cwd.mkdir(exist_ok=True)
+        model = S_().get("planner_model") or ""
+        try:
+            r = subprocess.run(build_cmd(prompt, model, 3, []), cwd=cwd, env=child_env(), capture_output=True,
+                               text=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            raise ApiError(504, "추천 생성이 시간 초과되었습니다")
+        data = parse_result(r.stdout)
+        if not data or data.get("is_error"):
+            raise ApiError(502, "추천 생성에 실패했습니다: %s" % ((data or {}).get("result") or r.stderr or r.stdout)[:200])
+        txt = str(data.get("result") or "")
+        a, b = txt.find("{"), txt.rfind("}")
+        try:
+            plan = norm_plan(json.loads(txt[a:b + 1]), want_stages or 8, want_agents or 6)
+        except (ValueError, TypeError) as e:
+            raise ApiError(502, "추천 결과를 해석하지 못했습니다(%s). 프리셋을 사용하거나 다시 시도하세요" % e)
+        u = data.get("usage") or {}
+        return {"plan": plan, "usage": {"input": u.get("input_tokens", 0), "output": u.get("output_tokens", 0),
+                                        "cache_write": u.get("cache_creation_input_tokens", 0),
+                                        "cache_read": u.get("cache_read_input_tokens", 0),
+                                        "cost": data.get("total_cost_usd", 0)}}
+    finally:
+        PLAN_LOCK.release()
+
+
+def role_text(md):
+    """CLAUDE.md 에서 역할 설명만 남긴다 (제목 줄과 '## 공통 규칙' 이후는 뺀다)."""
+    t = re.sub(r"^#[^\n]*\n", "", md or "", count=1)
+    return re.split(r"\n##\s", t)[0].strip()
+
+
+def agent_brief(proj, a):
+    ws = proj_dirs(proj)["root"] / a["workspace"]
+    role = role_text(read_text(ws / "CLAUDE.md", 1500)).replace("\n", " ")[:200]
+    web = parse_perms(ws / ".claude" / "settings.json").get("web")
+    return "%s (key=%s)%s: %s" % (a["name"], a["id"], " [웹 가능]" if web else "", role or "(설명 없음)")
+
+
+def norm_job_stages(proj, raw):
+    """요청 1건에 맞춘 단계 설계안을 검증한다. 기존 에이전트만 참조할 수 있고, 모르는 에이전트가 있으면 None(전체 무효)을 돌려준다."""
+    if not isinstance(raw, list) or not raw:
+        return None
+    by_id = {a["id"] for a in proj["agents"]}
+    name_to_id = {a["name"]: a["id"] for a in proj["agents"]}
+    out, ref = [], {}
+    for i, s in enumerate(raw[:5]):
+        if not isinstance(s, dict):
+            continue
+        name = str(s.get("name") or "").strip()[:30] or ("단계%d" % (i + 1))
+        kind = "review" if (s.get("kind") == "review" and out) else "work"
+        key = str(s.get("agent") or "")
+        agent_id = key if key in by_id else name_to_id.get(key)
+        if not agent_id:
+            return None
+        sid = "j%d" % (len(out) + 1)
+        target = ""
+        if kind == "review":
+            target = ref.get(str(s.get("target") or ""), "")
+            if not target:
+                works = [x for x in out if x["kind"] == "work"]
+                target = works[-1]["id"] if works else ""
+                if not target:
+                    kind = "work"
+        inputs = [ref[x] for x in (s.get("inputs") or []) if ref.get(x) and ref[x] != target]
+        out.append({"id": sid, "name": name, "kind": kind, "agent": agent_id, "target": target, "inputs": inputs,
+                    "instruction": str(s.get("instruction") or "").strip()[:3000], "enabled": True,
+                    "max_turns": 0, "polish": bool(s.get("polish")) and kind == "review"})
+        ref[name] = sid
+    if not out or out[0]["kind"] != "work":
+        return None
+    return out
+
+
+def ai_job_plan(proj, request_text):
+    """요청 1건을 보고 그 작업에만 쓸 단계를 설계한다. 실패하면 (None, 사용량)을 돌려줘 호출자가 고정 파이프라인으로 대체하게 한다."""
+    if not proj["agents"]:
+        return None, None
+    brief = "\n".join("- " + agent_brief(proj, a) for a in proj["agents"])
+    prompt = (
+        "STEP: jobplan\n이 요청 하나를 처리할 단계를 설계한다. 아래 '사용 가능한 에이전트' 중에서만 골라야 하며 "
+        "새 에이전트를 만들 수 없다.\n\n요청:\n%s\n\n사용 가능한 에이전트:\n%s\n\n규칙:\n"
+        "- 토큰을 아끼는 것이 최우선이다. 요청이 간단하면 work 단계 1개만 써도 된다. review 단계는 꼭 필요할 때만 추가한다.\n"
+        "- 단계는 최대 5개로 제한한다. 첫 단계는 반드시 kind가 work여야 한다.\n"
+        "- stages: [{\"name\":\"한글 단계 이름\",\"agent\":\"위 목록의 key\",\"kind\":\"work|review\","
+        "\"target\":\"review일 때 검토할 앞 단계의 name\",\"instruction\":\"이 단계 지시 1~2문장\","
+        "\"inputs\":[\"참고할 앞 단계의 name\"],\"polish\":false}]\n"
+        "출력 형식: {\"stages\":[...]}  다른 설명 없이 이 JSON만 출력한다." % (request_text[:3000], brief))
+    with PLAN_LOCK:
+        cwd = BASE / ".planner"
+        cwd.mkdir(exist_ok=True)
+        try:
+            r = subprocess.run(build_cmd(prompt, S_().get("planner_model") or "", 3, []), cwd=cwd, env=child_env(),
+                               capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            return None, None
+    data = parse_result(r.stdout)
+    if not data or data.get("is_error"):
+        return None, data
+    txt = str(data.get("result") or "")
+    a, b = txt.find("{"), txt.rfind("}")
+    try:
+        raw = json.loads(txt[a:b + 1])
+    except (ValueError, TypeError):
+        return None, data
+    return norm_job_stages(proj, raw.get("stages")), data
+
+
+def job_stage_src(proj, job):
+    return job.get("stages") or active_stages(proj)
+
+
+def plan_job(proj, job):
+    stages, data = ai_job_plan(proj, read_text(fpath(proj, "request", job["id"])) or job["title"])
+    if data:
+        add_usage(job, "plan", data)
+    if stages:
+        job["stages"] = stages
+        set_state(job, step=stages[0]["id"])
+        event(job, "system", "자동 구성: %d단계 (%s)" % (len(stages), " → ".join(s["name"] for s in stages)), "ok")
+    else:
+        event(job, "system", "자동 구성 실패 - 기본 파이프라인으로 진행", "warn")
+    check_budget(job)
+
+
+# ---------------------------------------------------------------- API 로직
+
+def psummary(p):
+    js = [j for (pid, _), j in JOBS.items() if pid == p["id"]]
+    return {"id": p["id"], "name": p["name"], "description": p.get("description", ""),
+            "active": sum(1 for j in js if j["status"] in ("queued", "running")),
+            "awaiting": sum(1 for j in js if j["status"] == "awaiting_user"),
+            "jobs": len(js), "tokens": sum(new_tokens(j.get("usage") or {}) for j in js),
+            "cost": round(sum((j.get("usage") or {}).get("cost", 0) for j in js), 4),
+            "agents": len(p["agents"]), "stages": len(active_stages(p)),
+            "schedules": sum(1 for s in p.get("schedules", []) if s.get("enabled", True))}
+
+
+def project_detail(proj):
+    flush_trust()
+    return {"id": proj["id"], "name": proj["name"], "description": proj.get("description", ""),
+            "max_rounds": proj.get("max_rounds", 1), "root": proj["root"],
+            "stage_mode": proj.get("stage_mode", "fixed"), "use_sources": proj.get("use_sources", "prefer"),
+            "sources": len(src_list(proj)),
+            "agents": [agent_info(proj, a) for a in proj["agents"]], "stages": proj["stages"],
+            "schedules": proj.get("schedules", []), "summary": psummary(proj)}
+
+
+def job_summary(j):
+    return {k: j[k] for k in ("id", "title", "status", "step", "created", "updated")} | \
+        {"tokens": new_tokens(j.get("usage") or {})}
+
+
+def job_detail(proj, j):
+    src = j.get("stages") or proj["stages"]
+    files = {"request": read_text(fpath(proj, "request", j["id"])),
+             "final": read_text(fpath(proj, "final", j["id"])),
+             "approved": read_text(fpath(proj, "approved", j["id"]))}
+    for s in src:
+        files[s["id"]] = read_text(fpath(proj, s["id"], j["id"]))
+    return {"job": j, "files": files, "limit": S_().get("job_token_limit", 0), "max_rounds": proj.get("max_rounds", 1),
+            "auto_planned": bool(j.get("stages")),
+            "stages": [{"id": s["id"], "name": s["name"], "kind": s["kind"], "enabled": s.get("enabled", True),
+                        "agent": agent_name(proj, s["agent"])} for s in src]}
+
+
+def job_of(proj, jid):
+    if not ID_RE.match(jid or ""):
+        raise ApiError(400, "잘못된 작업 ID")
+    j = JOBS.get((proj["id"], jid))
+    if not j:
+        raise ApiError(404, "작업을 찾을 수 없음")
+    return j
+
+
+def create_job(proj, text, source="gui", auto_approve=False, chat=None, title=None):
+    text = (text or "").strip()
+    if not text:
+        raise ApiError(400, "요청 내용을 입력하세요")
+    if len(text) > 20000:
+        raise ApiError(400, "요청이 너무 깁니다")
+    if not active_stages(proj):
+        raise ApiError(400, "사용 중인 단계가 없습니다")
+    ensure_dirs(proj)
+    jid = time.strftime("%m%d-%H%M%S") + "-" + secrets.token_hex(1)
+    fpath(proj, "request", jid).write_text(text + "\n")
+    auto = proj.get("stage_mode") == "auto"
+    job = {"id": jid, "pid": proj["id"], "title": (title or text.splitlines()[0])[:60], "status": "queued",
+           "step": ("" if auto else active_stages(proj)[0]["id"]), "created": now(), "updated": now(),
+           "feedback": "", "error": "", "cancel": False, "usage": {}, "events": [], "source": source,
+           "auto_approve": bool(auto_approve), "chat": str(chat) if chat else ""}
+    JOBS[(proj["id"], jid)] = job
+    jsave(job)
+    event(job, "system", "작업 등록" + {"telegram": " (텔레그램)", "schedule": " (예약 실행)"}.get(source, ""))
+    QUEUE.put((proj["id"], jid, "first"))
+    return job
+
+
+def job_restart(proj, j, b):
+    if j["status"] not in ("awaiting_user", "failed", "cancelled"):
+        raise ApiError(409, "지금은 다시 시작할 수 없는 상태입니다")
+    start = str(b.get("start") or "first")
+    act = job_stage_src(proj, j)
+    if start != "first" and not any(s["id"] == start and s["kind"] == "work" for s in act):
+        raise ApiError(400, "시작 단계가 올바르지 않습니다")
+    fb = (b.get("feedback") or "").strip()[:5000]
+    first = act[0]["id"] if act else ""
+    set_state(j, status="queued", step=first if start == "first" else start, feedback=fb, error="", cancel=False)
+    label = "처음" if start == "first" else next(s["name"] for s in act if s["id"] == start)
+    event(j, "user", "수정 요청으로 %s 단계부터 다시 시작%s" % (label, (": " + fb[:120]) if fb else ""))
+    QUEUE.put((proj["id"], j["id"], start))
+    return job_summary(j)
+
+
+def job_approve(proj, j):
+    if j["status"] != "awaiting_user":
+        raise ApiError(409, "승인 대기 상태가 아닙니다")
+    src = fpath(proj, "final", j["id"])
+    if not src.exists():
+        works = [s for s in job_stage_src(proj, j) if s["kind"] == "work"]
+        src = fpath(proj, works[-1]["id"], j["id"]) if works else src
+    if not src.exists():
+        raise ApiError(409, "승인할 결과 파일이 없습니다")
+    proj_dirs(proj)["outbox"].mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, fpath(proj, "approved", j["id"]))
+    set_state(j, status="approved")
+    event(j, "user", "최종 승인 -> outbox/approved_%s.md" % j["id"], "ok")
+    notify_job(j, "approved")
+    return job_summary(j)
+
+
+def job_cancel(proj, j):
+    if j["status"] not in ("queued", "running"):
+        raise ApiError(409, "진행 중인 작업이 아닙니다")
+    set_state(j, cancel=True)
+    p = PROCS.get((proj["id"], j["id"]))
+    if p:
+        kill_proc(p)
+    return job_summary(j)
+
+
+def project_create(b):
+    name = str(b.get("name") or "").strip()[:40]
+    if not name:
+        raise ApiError(400, "프로젝트 이름을 입력하세요")
+    try:
+        plan = norm_plan(b["plan"], 10, 8) if b.get("plan") else copy.deepcopy(PRESETS[0]["plan"])
+    except ValueError as e:
+        raise ApiError(400, str(e))
+    nums = [int(re.sub(r"\D", "", p["id"]) or 0) for p in CFG["projects"]]
+    pid = "p%d" % (max(nums + [0]) + 1)
+    sm = "auto" if b.get("stage_mode") == "auto" else "fixed"
+    proj = {"id": pid, "name": name, "description": str(b.get("description") or "").strip()[:2000],
+            "root": "projects/%s" % pid, "agents": [], "stages": [], "max_rounds": 1, "schedules": [],
+            "stage_mode": sm, "use_sources": "prefer", "created": now()}
+    (BASE / proj["root"]).mkdir(parents=True, exist_ok=True)
+    ensure_dirs(proj)
+    apply_plan(proj, plan)
+    CFG["projects"].append(proj)
+    save_cfg()
+    return project_detail(proj)
+
+
+def project_update(proj, b):
+    name = str(b.get("name") or proj["name"]).strip()[:40]
+    if not name:
+        raise ApiError(400, "이름을 입력하세요")
+    try:
+        mr = max(0, min(3, int(b.get("max_rounds", proj.get("max_rounds", 1)))))
+    except (TypeError, ValueError):
+        raise ApiError(400, "반복 횟수가 올바르지 않습니다")
+    proj["name"], proj["max_rounds"] = name, mr
+    proj["description"] = str(b.get("description") or "").strip()[:2000]
+    if "stage_mode" in b:
+        proj["stage_mode"] = "auto" if b["stage_mode"] == "auto" else "fixed"
+    save_cfg()
+    return project_detail(proj)
+
+
+def project_delete(proj):
+    if len(CFG["projects"]) <= 1:
+        raise ApiError(409, "마지막 프로젝트는 제거할 수 없습니다")
+    if any(j["status"] in ("queued", "running") for (pid, _), j in JOBS.items() if pid == proj["id"]):
+        raise ApiError(409, "진행 중인 작업이 있어 제거할 수 없습니다")
+    CFG["projects"].remove(proj)
+    save_cfg()
+    return {"ok": True, "note": "목록에서만 제거했고 폴더와 파일은 그대로 남아 있습니다"}
+
+
+def agent_create(proj, b):
+    name = str(b.get("name") or "").strip()[:30]
+    if not name:
+        raise ApiError(400, "이름을 입력하세요")
+    model = str(b.get("model") or "").strip()
+    if not MODEL_RE.match(model):
+        raise ApiError(400, "모델 이름이 올바르지 않습니다")
+    a = create_agent_in(proj, name, str(b.get("description") or "").strip()[:5000], b.get("perms") or {}, model,
+                        str(b.get("workspace") or "").strip())
+    save_cfg()
+    return {"agent": agent_info(proj, a), "warning": None if is_trusted(proj_dirs(proj)["root"] / a["workspace"]) else
+            "폴더 신뢰 등록이 보류되었습니다(작업 실행 중). 작업이 끝나면 자동으로 등록됩니다."}
+
+
+def agent_save(proj, a, b):
+    name = str(b.get("name") or a["name"]).strip()[:30]
+    if not name:
+        raise ApiError(400, "이름을 입력하세요")
+    model = str(b.get("model") or "").strip()
+    if not MODEL_RE.match(model):
+        raise ApiError(400, "모델 이름이 올바르지 않습니다")
+    md = b.get("claude_md")
+    if md is not None and (not isinstance(md, str) or len(md) > 50000):
+        raise ApiError(400, "역할 설명(CLAUDE.md)이 너무 깁니다")
+    ws = proj_dirs(proj)["root"] / a["workspace"]
+    if not ws.is_dir():
+        raise ApiError(404, "워크스페이스 폴더가 없습니다")
+    (ws / ".claude").mkdir(parents=True, exist_ok=True)
+    if md is not None:
+        backup_file(proj, ws / "CLAUDE.md")
+        (ws / "CLAUDE.md").write_text(md.rstrip() + "\n")
+    sp = ws / ".claude" / "settings.json"
+    backup_file(proj, sp)
+    sp.write_text(json.dumps(build_settings(proj, b.get("perms") or {}), ensure_ascii=False, indent=2))
+    a["name"], a["model"] = name, model
+    save_cfg()
+    ok = trust(ws)
+    return {"agent": agent_info(proj, a, True), "warning": None if ok else
+            "폴더 신뢰 등록이 보류되었습니다(작업 실행 중). 작업이 끝나면 자동으로 등록됩니다."}
+
+
+def rename_agent_folder(proj, a):
+    if PROCS:
+        raise ApiError(409, "작업이 실행 중일 때는 폴더 이름을 정리할 수 없습니다. 잠시 후 다시 시도하세요")
+    root = proj_dirs(proj)["root"]
+    old_ws = root / a["workspace"]
+    if not old_ws.is_dir():
+        raise ApiError(404, "워크스페이스 폴더가 없습니다")
+    used = {x["workspace"] for x in proj["agents"] if x["id"] != a["id"]}
+    new_name = free_ws_name(root, ws_slug(a["name"]) or "agent", used, keep=a["workspace"])
+    if new_name == a["workspace"]:
+        return {"changed": False, "workspace": a["workspace"]}
+    new_ws = root / new_name
+    old_ws.rename(new_ws)
+    a["workspace"] = new_name
+    save_cfg()
+    trust(new_ws)
+    return {"changed": True, "workspace": new_name}
+
+
+def agent_remove(proj, a):
+    used = [s["name"] for s in proj["stages"] if s["agent"] == a["id"]]
+    if used:
+        raise ApiError(409, "단계 담당으로 지정되어 있어 제거할 수 없습니다: %s" % ", ".join(used))
+    proj["agents"].remove(a)
+    save_cfg()
+    return {"ok": True, "note": "목록에서만 제거했고 폴더와 파일은 그대로 남아 있습니다"}
+
+
+def settings_update(b):
+    s = S_()
+    try:
+        if "parallel" in b:
+            s["parallel"] = max(1, min(3, int(b["parallel"])))
+        if "job_token_limit" in b:
+            s["job_token_limit"] = max(0, int(b["job_token_limit"]))
+    except (TypeError, ValueError):
+        raise ApiError(400, "숫자 형식이 올바르지 않습니다")
+    if "planner_model" in b:
+        m = str(b["planner_model"] or "").strip()
+        if not MODEL_RE.match(m):
+            raise ApiError(400, "모델 이름이 올바르지 않습니다")
+        s["planner_model"] = m
+    save_cfg()
+    with COND:
+        COND.notify_all()
+    return s
+
+
+# ---------------------------------------------------------------- 텔레그램
+
+def tg_cfg():
+    return CFG["settings"]["telegram"]
+
+
+def tg_call(method, payload=None, timeout=35):
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN 이 설정되지 않았습니다")
+    req = urllib.request.Request("%s/bot%s/%s" % (TG_BASE, BOT_TOKEN, method),
+                                 data=json.dumps(payload or {}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = json.loads(r.read().decode())
+    if not d.get("ok"):
+        raise RuntimeError(str(d.get("description") or d)[:200])
+    return d.get("result")
+
+
+def tg_send(chat, text, buttons=None):
+    body = {"chat_id": int(chat), "text": text[:3900], "disable_web_page_preview": True}
+    if buttons:
+        body["reply_markup"] = {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row]
+                                                    for row in buttons]}
+    return tg_call("sendMessage", body, 25)
+
+
+def tg_allowed(chat):
+    return str(chat) in tg_cfg()["chats"]
+
+
+def notify(text, buttons=None, chat=None):
+    """네트워크 호출은 전송 스레드에 맡긴다(파이프라인을 막지 않기 위해)."""
+    if not BOT_TOKEN:
+        return
+    with LOCK:
+        if chat and tg_allowed(chat):
+            targets = [str(chat)]
+        elif chat:
+            targets = []
+        else:
+            targets = list(tg_cfg()["chats"]) if tg_cfg().get("notify", True) else []
+    for t in targets:
+        NOTIFY.put((t, text, buttons))
+
+
+def notify_job(job, kind):
+    if not BOT_TOKEN:
+        return
+    with LOCK:
+        proj = next((p for p in CFG["projects"] if p["id"] == job["pid"]), None)
+        if not proj:
+            return
+        pname, tok = proj["name"], new_tokens(job.get("usage") or {})
+        chat = job.get("chat") or None
+        ref = "%s:%s" % (job["pid"], job["id"])
+        if kind == "approved":
+            src = fpath(proj, "approved", job["id"])
+            body = read_text(src, 3000) or "(결과 파일을 읽지 못했습니다)"
+    if kind == "awaiting":
+        notify("[%s] %s\n검토가 끝나 승인을 기다립니다. (새 토큰 %s)" % (pname, job["title"], tok),
+               [[("승인", "ap:" + ref), ("반려", "rj:" + ref)], [("결과 보기", "rs:" + ref)]], chat)
+    elif kind == "failed":
+        notify("[%s] %s\n실패: %s" % (pname, job["title"], str(job.get("error"))[:300]),
+               [[("다시 시도", "rt:" + ref)]], chat)
+    elif kind == "approved":
+        notify("[%s] %s · 완료 (새 토큰 %s)\n\n%s" % (pname, job["title"], tok, body), None, chat)
+
+
+def tg_projects(chat):
+    cur = tg_cur(chat)
+    lines, btns = ["프로젝트 목록"], []
+    for i, p in enumerate(CFG["projects"], 1):
+        now_using = cur and p["id"] == cur["id"]
+        mode = "자동 구성" if p.get("stage_mode") == "auto" else "%d단계" % len(active_stages(p))
+        lines.append("%d. %s (%s, 에이전트 %d, 작업 %d)%s"
+                     % (i, p["name"], mode, len(p["agents"]), psummary(p)["jobs"],
+                        " ← 지금 사용 중" if now_using else ""))
+        btns.append([(("✓ " if now_using else "") + p["name"][:28], "pu:%s:0" % p["id"])])
+    lines.append("\n버튼을 누르면 바로 전환됩니다. 새로 만들려면 /newproject 이름")
+    return "\n".join(lines), btns
+
+
+def tg_project_card(proj):
+    ags = ", ".join(a["name"] for a in proj["agents"]) or "없음"
+    mode = "요청마다 자동 구성" if proj.get("stage_mode") == "auto" else "고정 %d단계" % len(active_stages(proj))
+    src = len(src_list(proj))
+    return ("'%s' 프로젝트를 사용합니다.\n에이전트: %s\n처리 방식: %s%s\n\n이제 그냥 메시지를 보내면 이 프로젝트로 작업이 등록됩니다."
+            % (proj["name"], ags, mode, ("\n참고 자료: %d개" % src) if src else ""))
+
+
+def tg_cur(chat):
+    cur = tg_cfg()["cur"].get(str(chat))
+    p = next((x for x in CFG["projects"] if x["id"] == cur), None)
+    return p or (CFG["projects"][0] if CFG["projects"] else None)
+
+
+def tg_jobs_text(proj):
+    js = sorted((j for (pid, _), j in JOBS.items() if pid == proj["id"]), key=lambda j: j["created"], reverse=True)[:5]
+    if not js:
+        return "아직 작업이 없습니다.", None
+    st = {"queued": "대기", "running": "진행 중", "awaiting_user": "승인 대기", "approved": "완료",
+          "failed": "실패", "cancelled": "중단"}
+    lines, btns = ["[%s] 최근 작업" % proj["name"]], []
+    for j in js:
+        lines.append("· %s — %s (%s)" % (j["title"][:40], st.get(j["status"], j["status"]), j["created"][5:16]))
+        btns.append([("결과: " + j["title"][:18], "rs:%s:%s" % (j["pid"], j["id"]))])
+    return "\n".join(lines), btns
+
+
+def tg_result(proj, job):
+    for kind in ("approved", "final"):
+        t = read_text(fpath(proj, kind, job["id"]), 3000)
+        if t:
+            return t
+    works = [x for x in job_stage_src(proj, job) if x["kind"] == "work"]
+    for st in reversed(works):
+        t = read_text(fpath(proj, st["id"], job["id"]), 3000)
+        if t:
+            return t
+    return "아직 결과가 없습니다."
+
+
+def cheap_start(proj, job):
+    """토큰을 아끼려고, 처음이 아니라 다시 할 필요가 있는 가장 뒤쪽 '작업' 단계부터 시작한다."""
+    act = job_stage_src(proj, job)
+    works = [s["id"] for s in act if s["kind"] == "work"]
+    if not works:
+        return "first"
+    if job.get("status") == "failed":
+        cur = next((s for s in act if s["id"] == job.get("step")), None)
+        if cur:
+            sid = cur["id"] if cur["kind"] == "work" else cur.get("target")
+            if sid in works:
+                return sid
+        return "first"
+    return works[-1]
+
+
+def tg_button(chat, data):
+    try:
+        act, pid, jid = data.split(":", 2)
+    except ValueError:
+        return
+    with LOCK:
+        try:
+            proj = proj_of(pid)
+        except ApiError as e:
+            return notify(e.msg, None, chat)
+        if act == "pu":
+            tg_cfg()["cur"][str(chat)] = proj["id"]
+            save_cfg()
+            return notify(tg_project_card(proj), None, chat)
+        try:
+            job = job_of(proj, jid)
+        except ApiError as e:
+            return notify(e.msg, None, chat)
+        if act == "rs":
+            return notify("[%s] %s\n\n%s" % (proj["name"], job["title"], tg_result(proj, job)), None, chat)
+        if act == "rj":
+            TG_WAIT[str(chat)] = (pid, jid)
+            st = cheap_start(proj, job)
+            name = next((s["name"] for s in job_stage_src(proj, job) if s["id"] == st), "처음")
+            return notify("수정 요청 내용을 메시지로 보내주세요. '%s' 단계부터 다시 합니다. (취소: /cancel)" % name, None, chat)
+        try:
+            if act == "ap":
+                job_approve(proj, job)
+                notify("승인했습니다: %s" % job["title"], None, chat)
+            elif act == "rt":
+                job_restart(proj, job, {"start": cheap_start(proj, job)})
+                notify("다시 시작합니다: %s" % job["title"], None, chat)
+        except ApiError as e:
+            notify(e.msg, None, chat)
+
+
+def tg_message(chat, text):
+    with LOCK:
+        if str(chat) in TG_WAIT:
+            pid, jid = TG_WAIT.pop(str(chat))
+            if text.strip() == "/cancel":
+                return notify("취소했습니다.", None, chat)
+            try:
+                proj = proj_of(pid)
+                job = job_of(proj, jid)
+                job_restart(proj, job, {"start": cheap_start(proj, job), "feedback": text})
+                return notify("수정 요청을 반영해 다시 작업합니다.", None, chat)
+            except ApiError as e:
+                return notify(e.msg, None, chat)
+        cmd = text.split()[0].lower() if text.startswith("/") else ""
+        arg = text[len(cmd):].strip()
+        proj = tg_cur(chat)
+        if not proj:
+            return notify("프로젝트가 없습니다. GUI에서 먼저 만들어주세요.", None, chat)
+        if cmd in ("/start", "/help"):
+            _, btns = tg_projects(chat)
+            return notify("지금 사용 중: %s\n\n%s\n\n아래 버튼으로 프로젝트를 바꿀 수 있습니다."
+                          % (proj["name"], TG_HELP), btns[:8], chat)
+        if cmd == "/cancel":
+            return notify("대기 중인 입력이 없습니다.", None, chat)
+        if cmd == "/projects":
+            t, btns = tg_projects(chat)
+            return notify(t, btns, chat)
+        if cmd == "/use":
+            try:
+                assert int(arg) >= 1
+                p = CFG["projects"][int(arg) - 1]
+            except (ValueError, IndexError, AssertionError):
+                return notify("번호가 올바르지 않습니다. /projects 로 확인하세요.", None, chat)
+            tg_cfg()["cur"][str(chat)] = p["id"]
+            save_cfg()
+            return notify(tg_project_card(p), None, chat)
+        if cmd in ("/newproject", "/np"):
+            if not arg:
+                return notify("프로젝트 이름을 함께 보내주세요. 예: /newproject 뉴스봇", None, chat)
+            try:
+                d = project_create({"name": arg, "description": arg,
+                                    "plan": copy.deepcopy(PRESETS[0]["plan"]), "stage_mode": "auto"})
+            except ApiError as e:
+                return notify(e.msg, None, chat)
+            tg_cfg()["cur"][str(chat)] = d["id"]
+            save_cfg()
+            return notify("새 프로젝트를 만들었습니다.\n\n%s\n\n에이전트와 참고 자료는 웹 화면에서 더 자세히 고칠 수 있습니다."
+                          % tg_project_card(proj_of(d["id"])), None, chat)
+        if cmd == "/jobs":
+            t, b = tg_jobs_text(proj)
+            return notify(t, b, chat)
+        if cmd == "/status":
+            act = [j for (pid, _), j in JOBS.items() if j["status"] in ("queued", "running")]
+            if not act:
+                return notify("실행 중인 작업이 없습니다.", None, chat)
+            return notify("실행 중\n" + "\n".join("· [%s] %s — %s" % (agent_name_safe(j["pid"]), j["title"][:40],
+                                                                    j["status"]) for j in act), None, chat)
+        if cmd == "/sched":
+            sc = proj.get("schedules", [])
+            if not sc:
+                return notify("[%s] 예약이 없습니다. GUI의 '예약' 화면에서 추가하세요." % proj["name"], None, chat)
+            return notify("[%s] 예약\n" % proj["name"] + "\n".join(
+                "· %s %s %s%s" % (x["time"], x["name"], "사용" if x.get("enabled", True) else "꺼짐",
+                                  " · 자동승인" if x.get("auto_approve") else "") for x in sc), None, chat)
+        if cmd and cmd not in ("/new",):
+            return notify("모르는 명령입니다.\n\n" + TG_HELP, None, chat)
+        req = arg if cmd == "/new" else text
+        if not req.strip():
+            return notify("요청 내용을 함께 보내주세요.", None, chat)
+        try:
+            job = create_job(proj, req, source="telegram", chat=chat)
+        except ApiError as e:
+            return notify(e.msg, None, chat)
+        notify("[%s] 작업을 시작했습니다: %s\n끝나면 알려드릴게요." % (proj["name"], job["title"]), None, chat)
+
+
+def agent_name_safe(pid):
+    p = next((x for x in CFG["projects"] if x["id"] == pid), None)
+    return p["name"] if p else pid
+
+
+def tg_handle(u):
+    cb = u.get("callback_query")
+    if cb:
+        chat = str(((cb.get("message") or {}).get("chat") or {}).get("id") or "")
+        try:
+            tg_call("answerCallbackQuery", {"callback_query_id": cb.get("id")}, 15)
+        except Exception:  # noqa: BLE001
+            pass
+        if chat and tg_allowed(chat):
+            tg_button(chat, str(cb.get("data") or ""))
+        return
+    msg = u.get("message") or u.get("edited_message") or {}
+    chat = str(((msg.get("chat") or {}).get("id")) or "")
+    text = (msg.get("text") or "").strip()
+    if not chat or not text:
+        return
+    if text.split()[0].lower() == "/pair":
+        code = text.split()[1].strip() if len(text.split()) > 1 else ""
+        with LOCK:
+            ok = hmac.compare_digest(code, PAIR_CODE)
+            if ok and chat not in tg_cfg()["chats"]:
+                tg_cfg()["chats"].append(chat)
+                save_cfg()
+        if ok:
+            return notify("연결되었습니다.\n\n" + TG_HELP, None, chat)
+        print("텔레그램: 잘못된 연결 코드 (chat %s)" % chat, flush=True)
+        return
+    if not tg_allowed(chat):
+        print("텔레그램: 허용되지 않은 chat %s 의 메시지를 무시했습니다" % chat, flush=True)
+        return
+    tg_message(chat, text)
+
+
+def tg_sender():
+    while True:
+        chat, text, buttons = NOTIFY.get()
+        try:
+            tg_send(chat, text, buttons)
+        except Exception as e:  # noqa: BLE001
+            print("텔레그램 전송 실패(chat %s): %s" % (chat, e), flush=True)
+
+
+def tg_loop():
+    offset, wait = 0, 1
+    try:
+        me = tg_call("getMe", {}, 20)
+        print("텔레그램 봇 연결: @%s (연결 코드: %s)" % (me.get("username", "?"), PAIR_CODE), flush=True)
+    except Exception as e:  # noqa: BLE001
+        print("텔레그램 봇 확인 실패: %s" % e, flush=True)
+    while True:
+        try:
+            ups = tg_call("getUpdates", {"offset": offset, "timeout": TG_POLL,
+                                         "allowed_updates": ["message", "callback_query"]}, TG_POLL + 15) or []
+            wait = 1
+            for u in ups:
+                offset = max(offset, int(u.get("update_id", 0)) + 1)
+                try:
+                    tg_handle(u)
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc()
+        except Exception as e:  # noqa: BLE001
+            print("텔레그램 수신 오류: %s (%d초 후 재시도)" % (str(e)[:120], wait), flush=True)
+            time.sleep(wait)
+            wait = min(wait * 2, 60)
+
+
+# ---------------------------------------------------------------- 예약 작업
+
+def validate_schedules(raw):
+    if not isinstance(raw, list) or len(raw) > 20:
+        raise ApiError(400, "예약은 20개까지 등록할 수 있습니다")
+    out, ids = [], set()
+    for x in raw:
+        if not isinstance(x, dict):
+            raise ApiError(400, "예약 형식 오류")
+        name = str(x.get("name") or "").strip()[:30]
+        req = str(x.get("request") or "").strip()[:5000]
+        if not name or not req:
+            raise ApiError(400, "예약 이름과 요청 내용을 입력하세요")
+        t = str(x.get("time") or "").strip()
+        if not re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", t):
+            raise ApiError(400, "시각은 HH:MM 형식이어야 합니다 (예: 07:30)")
+        days = sorted({int(d) for d in (x.get("days") or []) if str(d).isdigit() and 0 <= int(d) <= 6})
+        if not days:
+            raise ApiError(400, "'%s' 예약의 요일을 하나 이상 선택하세요" % name)
+        sid = str(x.get("id") or "")
+        if not ID_RE.match(sid) or sid in ids:
+            sid = secrets.token_hex(3)
+        ids.add(sid)
+        out.append({"id": sid, "name": name, "time": t, "days": days, "request": req,
+                    "auto_approve": bool(x.get("auto_approve", True)), "enabled": bool(x.get("enabled", True)),
+                    "last_run": str(x.get("last_run") or "")[:20]})
+    return out
+
+
+def sched_loop():
+    while True:
+        time.sleep(20)
+        try:
+            due = []
+            with LOCK:
+                lt = time.localtime()
+                stamp = time.strftime("%Y-%m-%d %H:%M", lt)
+                for proj in CFG["projects"]:
+                    for sc in proj.get("schedules", []):
+                        if (not sc.get("enabled", True) or sc.get("time") != stamp[11:]
+                                or lt.tm_wday not in sc.get("days", []) or sc.get("last_run") == stamp):
+                            continue
+                        sc["last_run"] = stamp
+                        due.append((proj, sc))
+                if due:
+                    save_cfg()
+                for proj, sc in due:
+                    try:
+                        job = create_job(proj, sc["request"], source="schedule",
+                                         auto_approve=sc.get("auto_approve", True),
+                                         title="%s (%s)" % (sc["name"], stamp[5:16]))
+                        print("예약 실행: [%s] %s -> %s" % (proj["name"], sc["name"], job["id"]), flush=True)
+                    except ApiError as e:
+                        print("예약 실행 실패: [%s] %s: %s" % (proj["name"], sc["name"], e.msg), flush=True)
+                        notify("[%s] 예약 '%s' 실행 실패: %s" % (proj["name"], sc["name"], e.msg))
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+
+# ---------------------------------------------------------------- 로그인 · 세션 · 접근 제한
+
+def is_local(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return a.is_loopback or a.is_private
+
+
+def prune_sessions():
+    t = time.time()
+    for k, v in list(SESSIONS.items()):
+        if v["exp"] < t:
+            SESSIONS.pop(k, None)
+
+
+def new_session(ip):
+    prune_sessions()
+    tok = secrets.token_urlsafe(32)
+    SESSIONS[tok] = {"ip": ip, "exp": time.time() + SESS_TTL, "since": now()}
+    return tok
+
+
+def blocked_for(ip):
+    f = FAILS.get(ip)
+    return max(0, int(f["until"] - time.time())) if f else 0
+
+
+def note_fail(ip, where):
+    f = FAILS.setdefault(ip, {"n": 0, "until": 0})
+    f["n"] += 1
+    if f["n"] >= MAX_FAILS:
+        wait = min(3600, 60 * 2 ** (f["n"] - MAX_FAILS))
+        f["until"] = time.time() + wait
+        print("로그인 차단: %s (%d회 실패, %d초)" % (ip, f["n"], wait), flush=True)
+        if f["n"] == MAX_FAILS or f["n"] % 10 == 0:
+            notify("경고: %s 에서 로그인 %d회 실패해 %d초 차단했습니다. (%s)" % (ip, f["n"], wait, where))
+    LOGINS.insert(0, {"ts": now(), "ip": ip, "ok": False})
+    del LOGINS[30:]
+
+
+def note_ok(ip):
+    known = any(x["ok"] and x["ip"] == ip for x in LOGINS)
+    FAILS.pop(ip, None)
+    LOGINS.insert(0, {"ts": now(), "ip": ip, "ok": True})
+    del LOGINS[30:]
+    if not known and not is_local(ip):
+        notify("새로운 곳에서 하네스에 로그인했습니다: %s" % ip)
+
+
+def check_pw(user, pw):
+    return (hmac.compare_digest(user.encode(), USER.encode())
+            and hmac.compare_digest(pw.encode(), PASSWORD.encode()))
+
+
+def security_state():
+    prune_sessions()
+    return {"https": PUBLIC_HTTPS, "proxy": TRUST_PROXY, "host": HOST, "public_host": PUBLIC_HOST,
+            "sessions": len(SESSIONS), "weak_password": len(PASSWORD) < 12,
+            "blocked": [{"ip": k, "left": blocked_for(k), "fails": v["n"]}
+                        for k, v in FAILS.items() if blocked_for(k) > 0],
+            "recent": LOGINS[:10]}
+
+
+LOGIN_HTML = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>에이전트 하네스 로그인</title><style>
+:root{color-scheme:light dark;--bg:#f6f5f2;--panel:#fff;--ink:#1d1d1b;--mute:#6b6a65;--line:#e4e2dc;--accent:#2f5d50;--accent-ink:#fff;--err:#b83232}
+@media (prefers-color-scheme:dark){:root{--bg:#171715;--panel:#201f1d;--ink:#ecebe6;--mute:#9a988f;--line:#34332f;--accent:#7fb7a4;--accent-ink:#10201a;--err:#ef7a7a}}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--ink);
+font:15px/1.6 -apple-system,"Apple SD Gothic Neo","Noto Sans KR",system-ui,sans-serif}
+form{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:26px;width:min(360px,92vw)}
+h1{font-size:17px;margin:0 0 4px}p.s{color:var(--mute);font-size:13px;margin:0 0 18px}
+label{display:block;font-size:13px;color:var(--mute);margin-bottom:12px}
+input{width:100%;box-sizing:border-box;font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:4px}
+button{width:100%;font:inherit;font-weight:600;cursor:pointer;border:0;border-radius:8px;padding:11px;background:var(--accent);color:var(--accent-ink);margin-top:6px}
+.e{color:var(--err);font-size:13px;margin:0 0 12px}
+</style></head><body><form method="post" action="/login" autocomplete="on">
+<h1>에이전트 하네스</h1><p class="s">@SUB@</p>@ERR@
+<label>아이디<input name="user" autocomplete="username" autofocus></label>
+<label>비밀번호<input name="password" type="password" autocomplete="current-password"></label>
+<button type="submit">로그인</button></form></body></html>"""
+
+# ---------------------------------------------------------------- HTTP
+
+ROUTES = []
+
+
+def route(method, pattern, lock=True):
+    def deco(fn):
+        ROUTES.append((method, re.compile("^" + pattern + "$"), fn, lock))
+        return fn
+    return deco
+
+
+@route("GET", r"/api/projects")
+def r_projects(m, b):
+    return {"projects": [psummary(p) for p in CFG["projects"]], "settings": CFG["settings"], "flags": FLAGS,
+            "queue": {"waiting": QUEUE.qsize(), "running": RUNNING}}
+
+
+@route("GET", r"/api/presets")
+def r_presets(m, b):
+    return {"presets": PRESETS}
+
+
+@route("POST", r"/api/projects")
+def r_project_create(m, b):
+    return project_create(b)
+
+
+@route("GET", r"/api/projects/([^/]+)")
+def r_project_get(m, b):
+    return project_detail(proj_of(m[1]))
+
+
+@route("POST", r"/api/projects/([^/]+)/update")
+def r_project_update(m, b):
+    return project_update(proj_of(m[1]), b)
+
+
+@route("POST", r"/api/projects/([^/]+)/delete")
+def r_project_delete(m, b):
+    return project_delete(proj_of(m[1]))
+
+
+@route("POST", r"/api/projects/([^/]+)/stages")
+def r_stages(m, b):
+    proj = proj_of(m[1])
+    proj["stages"] = validate_stages(proj, b.get("stages"))
+    save_cfg()
+    return project_detail(proj)
+
+
+@route("POST", r"/api/projects/([^/]+)/apply-plan")
+def r_apply(m, b):
+    proj = proj_of(m[1])
+    try:
+        plan = norm_plan(b.get("plan"), 10, 8)
+    except ValueError as e:
+        raise ApiError(400, str(e))
+    apply_plan(proj, plan)
+    save_cfg()
+    return project_detail(proj)
+
+
+@route("POST", r"/api/projects/([^/]+)/agents")
+def r_agent_create(m, b):
+    return agent_create(proj_of(m[1]), b)
+
+
+@route("GET", r"/api/projects/([^/]+)/agents/([^/]+)")
+def r_agent_get(m, b):
+    proj = proj_of(m[1])
+    return agent_info(proj, agent_of(proj, m[2]), True)
+
+
+@route("POST", r"/api/projects/([^/]+)/agents/([^/]+)/save")
+def r_agent_save(m, b):
+    proj = proj_of(m[1])
+    return agent_save(proj, agent_of(proj, m[2]), b)
+
+
+@route("POST", r"/api/projects/([^/]+)/agents/([^/]+)/remove")
+def r_agent_remove(m, b):
+    proj = proj_of(m[1])
+    return agent_remove(proj, agent_of(proj, m[2]))
+
+
+@route("POST", r"/api/projects/([^/]+)/agents/([^/]+)/rename-folder")
+def r_agent_rename(m, b):
+    proj = proj_of(m[1])
+    return rename_agent_folder(proj, agent_of(proj, m[2]))
+
+
+@route("POST", r"/api/projects/([^/]+)/agents/rename-all")
+def r_agents_rename_all(m, b):
+    proj = proj_of(m[1])
+    return {"results": [{"name": a["name"]} | rename_agent_folder(proj, a) for a in proj["agents"]]}
+
+
+@route("GET", r"/api/projects/([^/]+)/jobs")
+def r_jobs(m, b):
+    proj = proj_of(m[1])
+    js = sorted((j for (pid, _), j in JOBS.items() if pid == proj["id"]), key=lambda j: j["created"], reverse=True)
+    return {"jobs": [job_summary(j) for j in js[:80]]}
+
+
+@route("POST", r"/api/projects/([^/]+)/jobs")
+def r_job_create(m, b):
+    return job_summary(create_job(proj_of(m[1]), b.get("request")))
+
+
+@route("GET", r"/api/projects/([^/]+)/jobs/([^/]+)")
+def r_job_get(m, b):
+    proj = proj_of(m[1])
+    return job_detail(proj, job_of(proj, m[2]))
+
+
+@route("POST", r"/api/projects/([^/]+)/jobs/([^/]+)/(approve|restart|cancel)")
+def r_job_action(m, b):
+    proj = proj_of(m[1])
+    j = job_of(proj, m[2])
+    return {"approve": lambda: job_approve(proj, j), "restart": lambda: job_restart(proj, j, b),
+            "cancel": lambda: job_cancel(proj, j)}[m[3]]()
+
+
+@route("POST", r"/api/plan", lock=False)
+def r_plan(m, b):
+    name = str(b.get("name") or "").strip()[:40]
+    desc = str(b.get("description") or "").strip()[:2000]
+    if not desc and not name:
+        raise ApiError(400, "프로젝트 이름이나 설명을 입력하세요")
+    try:
+        ws = max(0, min(8, int(b.get("stages") or 0)))
+        wa = max(0, min(6, int(b.get("agents") or 0)))
+    except (TypeError, ValueError):
+        raise ApiError(400, "단계 수가 올바르지 않습니다")
+    return ai_plan(name or "(이름 없음)", desc or "(설명 없음)", ws, wa)
+
+
+@route("GET", r"/api/projects/([^/]+)/sources")
+def r_sources(m, b):
+    proj = proj_of(m[1])
+    return {"sources": src_list(proj), "mode": proj.get("use_sources", "prefer"),
+            "dir": str(proj_dirs(proj)["sources"])}
+
+
+@route("POST", r"/api/projects/([^/]+)/sources")
+def r_source_save(m, b):
+    proj = proj_of(m[1])
+    content = b.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise ApiError(400, "자료 내용을 입력하세요")
+    if len(content) > 300_000:
+        raise ApiError(400, "자료가 너무 깁니다 (30만 자 제한)")
+    p = src_path(proj, b.get("name"))
+    if not p.exists() and len(src_list(proj)) >= SRC_MAX:
+        raise ApiError(400, "자료는 %d개까지 등록할 수 있습니다" % SRC_MAX)
+    p.write_text(content.rstrip() + "\n")
+    return {"sources": src_list(proj)}
+
+
+@route("POST", r"/api/projects/([^/]+)/sources/read")
+def r_source_read(m, b):
+    proj = proj_of(m[1])
+    p = src_path(proj, b.get("name"))
+    t = read_text(p, 300_000)
+    if t is None:
+        raise ApiError(404, "자료를 찾을 수 없습니다")
+    return {"name": p.name, "content": t}
+
+
+@route("POST", r"/api/projects/([^/]+)/sources/delete")
+def r_source_delete(m, b):
+    proj = proj_of(m[1])
+    src_path(proj, b.get("name")).unlink(missing_ok=True)
+    return {"sources": src_list(proj)}
+
+
+@route("POST", r"/api/projects/([^/]+)/sources/mode")
+def r_source_mode(m, b):
+    proj = proj_of(m[1])
+    mode = str(b.get("mode") or "")
+    if mode not in ("off", "prefer", "only"):
+        raise ApiError(400, "자료 사용 방식이 올바르지 않습니다")
+    proj["use_sources"] = mode
+    save_cfg()
+    return {"mode": mode}
+
+
+@route("GET", r"/api/all-agents")
+def r_all_agents(m, b):
+    out = []
+    for p in CFG["projects"]:
+        for a in p["agents"]:
+            ws = proj_dirs(p)["root"] / a["workspace"]
+            role = role_text(read_text(ws / "CLAUDE.md", 3000))
+            out.append({"pid": p["id"], "pname": p["name"], "id": a["id"], "name": a["name"],
+                        "model": a.get("model", ""), "role": role[:1500],
+                        "web": parse_perms(ws / ".claude" / "settings.json").get("web", False)})
+    return {"agents": out}
+
+
+@route("POST", r"/api/projects/([^/]+)/agents/import")
+def r_agent_import(m, b):
+    proj = proj_of(m[1])
+    src = proj_of(str(b.get("from") or ""))
+    a = agent_of(src, str(b.get("agent") or ""))
+    ws = proj_dirs(src)["root"] / a["workspace"]
+    role = read_text(ws / "CLAUDE.md", 50000) or ""
+    perms = parse_perms(ws / ".claude" / "settings.json")
+    name = str(b.get("name") or a["name"]).strip()[:30] or a["name"]
+    new = create_agent_in(proj, name, "", perms, a.get("model", ""))
+    if role.strip():
+        (proj_dirs(proj)["root"] / new["workspace"] / "CLAUDE.md").write_text(role.rstrip() + "\n")
+    save_cfg()
+    return {"agent": agent_info(proj, new),
+            "note": "'%s' 프로젝트의 %s 를 복사해 왔습니다. 여기서 고쳐도 원본에는 영향이 없습니다." % (src["name"], a["name"])}
+
+
+@route("POST", r"/api/projects/([^/]+)/schedules")
+def r_schedules(m, b):
+    proj = proj_of(m[1])
+    proj["schedules"] = validate_schedules(b.get("schedules"))
+    save_cfg()
+    return project_detail(proj)
+
+
+@route("GET", r"/api/security")
+def r_security(m, b):
+    return security_state()
+
+
+@route("POST", r"/api/security/logout-all")
+def r_logout_all(m, b):
+    SESSIONS.clear()
+    return {"ok": True}
+
+
+@route("GET", r"/api/telegram")
+def r_tg(m, b):
+    t = tg_cfg()
+    return {"configured": bool(BOT_TOKEN), "pair_code": PAIR_CODE if BOT_TOKEN else "",
+            "chats": t["chats"], "notify": t.get("notify", True),
+            "cur": {k: agent_name_safe(v) for k, v in t["cur"].items()}}
+
+
+@route("POST", r"/api/telegram/update")
+def r_tg_update(m, b):
+    t = tg_cfg()
+    if "notify" in b:
+        t["notify"] = bool(b["notify"])
+    if b.get("unpair"):
+        c = str(b["unpair"])
+        t["chats"] = [x for x in t["chats"] if x != c]
+        t["cur"].pop(c, None)
+    save_cfg()
+    return r_tg(m, b)
+
+
+@route("POST", r"/api/telegram/test", lock=False)
+def r_tg_test(m, b):
+    if not BOT_TOKEN:
+        raise ApiError(400, "TELEGRAM_BOT_TOKEN 이 설정되지 않았습니다")
+    with LOCK:
+        chats = list(tg_cfg()["chats"])
+    if not chats:
+        raise ApiError(400, "연결된 대화가 없습니다. 봇에게 /pair 코드 를 보내 연결하세요")
+    try:
+        for c in chats:
+            tg_send(c, "에이전트 하네스 테스트 메시지입니다.")
+    except Exception as e:  # noqa: BLE001
+        raise ApiError(502, "전송 실패: %s" % str(e)[:200])
+    return {"sent": len(chats)}
+
+
+@route("POST", r"/api/settings")
+def r_settings(m, b):
+    return settings_update(b)
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "AgentHarness"
+
+    def log_message(self, *a):
+        pass
+
+    auth = None
+
+    def ip(self):
+        peer = self.client_address[0]
+        if TRUST_PROXY and is_local(peer):
+            xff = self.headers.get("X-Forwarded-For")
+            if xff:
+                return xff.split(",")[0].strip()[:45]
+        return peer
+
+    def cookie(self, name):
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return None
+        try:
+            c = http.cookies.SimpleCookie(raw)
+        except http.cookies.CookieError:
+            return None
+        return c[name].value if name in c else None
+
+    def send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")   # no-referrer 는 Origin 을 null 로 만들어 POST 가 막힌다
+        if PUBLIC_HTTPS:
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def js(self, code, obj):
+        self.send(code, json.dumps(obj, ensure_ascii=False))
+
+    def gate(self):
+        """세션 쿠키 또는 기본 인증. 공개 호스팅을 고려해 실패는 횟수 제한으로 막는다."""
+        ip = self.ip()
+        left = blocked_for(ip)
+        if left:
+            self.send(429, json.dumps({"error": "로그인 시도가 많아 %d초 동안 차단되었습니다" % left}))
+            return False
+        tok = self.cookie("ah_sess")
+        if tok:
+            sess = SESSIONS.get(tok)
+            if sess and sess["exp"] > time.time():
+                self.auth = "cookie"
+                return True
+        a = self.headers.get("Authorization", "")
+        if a.startswith("Basic "):
+            try:
+                u, p = base64.b64decode(a[6:]).decode("utf-8").split(":", 1)
+            except Exception:  # noqa: BLE001
+                u = p = ""
+            if check_pw(u, p):
+                self.auth = "basic"
+                return True
+            note_fail(ip, "기본 인증")
+            self.send(401, json.dumps({"error": "아이디 또는 비밀번호가 올바르지 않습니다"}))
+            return False
+        if urlparse(self.path).path.startswith("/api/"):
+            self.send(401, json.dumps({"error": "로그인이 필요합니다"}))
+        else:
+            self.send(303, "", "text/plain; charset=utf-8", {"Location": "/login"})
+        return False
+
+    def login_page(self, err=""):
+        left = blocked_for(self.ip())
+        if left:
+            err = "로그인 시도가 많아 %d초 동안 차단되었습니다." % left
+        sub = "이 서버는 에이전트를 실행합니다. 본인만 로그인하세요."
+        html = LOGIN_HTML.replace("@SUB@", sub).replace(
+            "@ERR@", ('<p class="e">%s</p>' % err.replace("<", "&lt;")) if err else "")
+        self.send(200, html,
+                  "text/html; charset=utf-8",
+                  {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"})
+
+    def do_login(self):
+        ip = self.ip()
+        if blocked_for(ip):
+            return self.login_page()
+        origin = self.headers.get("Origin")
+        if origin and urlparse(origin).netloc not in {self.headers.get("Host"), PUBLIC_HOST}:
+            return self.send(403, "허용되지 않은 출처", "text/plain; charset=utf-8")
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 4000:
+            return self.login_page("입력이 너무 깁니다.")
+        from urllib.parse import parse_qs
+        f = parse_qs(self.rfile.read(n).decode("utf-8", "replace"))
+        if not check_pw((f.get("user") or [""])[0], (f.get("password") or [""])[0]):
+            note_fail(ip, "로그인 화면")
+            return self.login_page("아이디 또는 비밀번호가 올바르지 않습니다.")
+        note_ok(ip)
+        tok = new_session(ip)
+        # 공개 도메인(https)으로 들어왔을 때만 Secure 쿠키를 쓴다. 내부 IP(http)에 Secure를 붙이면
+        # 브라우저가 쿠키 저장을 거부해 로그인이 계속 풀린다.
+        req_host = (self.headers.get("Host") or "").split(":")[0]
+        flags = "; Secure" if (PUBLIC_HTTPS and PUBLIC_HOST and req_host == PUBLIC_HOST) else ""
+        self.send(303, "", "text/plain; charset=utf-8",
+                  {"Location": "/", "Set-Cookie": "ah_sess=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d%s"
+                                                  % (tok, SESS_TTL, flags)})
+
+    def dispatch(self, method, body):
+        path = urlparse(self.path).path
+        for meth, rx, fn, lock in ROUTES:
+            if meth != method:
+                continue
+            m = rx.match(path)
+            if not m:
+                continue
+            try:
+                if lock:
+                    with LOCK:
+                        res = fn((None,) + m.groups(), body)
+                else:
+                    res = fn((None,) + m.groups(), body)
+                return self.js(200, res)
+            except ApiError as e:
+                return self.js(e.code, {"error": e.msg})
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+                return self.js(500, {"error": "서버 내부 오류 (서버 터미널 로그를 확인하세요)"})
+        self.js(404, {"error": "없는 경로"})
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/login":
+            return self.login_page()
+        if path == "/logout":
+            SESSIONS.pop(self.cookie("ah_sess") or "", None)
+            return self.send(303, "", "text/plain; charset=utf-8",
+                             {"Location": "/login", "Set-Cookie": "ah_sess=; Path=/; HttpOnly; Max-Age=0"})
+        if not self.gate():
+            return
+        if path == "/":
+            return self.send(200, INDEX_HTML, "text/html; charset=utf-8",
+                             {"Content-Security-Policy": "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'"})
+        self.dispatch("GET", {})
+
+    def do_POST(self):
+        if urlparse(self.path).path == "/login":
+            return self.do_login()
+        if not self.gate():
+            return
+        origin = self.headers.get("Origin")
+        ok_hosts = {self.headers.get("Host"), self.headers.get("X-Forwarded-Host"), PUBLIC_HOST}
+        if self.auth == "cookie" and not origin:
+            return self.js(403, {"error": "출처 헤더가 없는 요청은 거부합니다"})
+        if origin and urlparse(origin).netloc not in ok_hosts:
+            return self.js(403, {"error": "허용되지 않은 출처"})
+        if "application/json" not in (self.headers.get("Content-Type") or ""):
+            return self.js(415, {"error": "JSON만 허용"})
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 300_000:
+                return self.js(413, {"error": "요청이 너무 큼"})
+            body = json.loads(self.rfile.read(n) or b"{}")
+            if not isinstance(body, dict):
+                raise ValueError
+        except Exception:  # noqa: BLE001
+            return self.js(400, {"error": "JSON 형식 오류"})
+        self.dispatch("POST", body)
+
+
+def recover():
+    for proj in CFG["projects"]:
+        ensure_dirs(proj)
+        for p in sorted(proj_dirs(proj)["jobs"].glob("*.json")):
+            try:
+                j = json.loads(p.read_text())
+            except ValueError:
+                continue
+            j["pid"] = proj["id"]
+            j.setdefault("usage", {})
+            if j.get("status") in ("queued", "running"):
+                j["status"] = "failed"
+                j["error"] = "서버가 재시작되어 중단됨"
+                j["events"].append({"ts": now(), "agent": "system", "msg": "서버 재시작으로 중단됨. 다시 시작하세요", "kind": "err"})
+                write_json(p, j)
+            JOBS[(proj["id"], j["id"])] = j
+
+
+def main():
+    if not PASSWORD:
+        sys.exit("GUI_PASSWORD 가 설정되지 않았습니다. %s/.env 에 GUI_PASSWORD=원하는비밀번호 를 추가하세요." % BASE)
+    load_cfg()
+    recover()
+    probe_flags()
+    for _ in range(3):
+        threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=sched_loop, daemon=True).start()
+    if BOT_TOKEN:
+        threading.Thread(target=tg_sender, daemon=True).start()
+        threading.Thread(target=tg_loop, daemon=True).start()
+    else:
+        print("텔레그램: TELEGRAM_BOT_TOKEN 이 없어 봇 기능은 꺼져 있습니다", flush=True)
+    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(SystemExit(0)))
+    on = [k for k, v in FLAGS.items() if v]
+    print("에이전트 하네스 GUI: http://%s:%d  (사용자: %s)" % (HOST, PORT, USER), flush=True)
+    if PUBLIC_HOST:
+        print("공개 주소: https://%s" % PUBLIC_HOST, flush=True)
+    if len(PASSWORD) < 12:
+        print("경고: GUI_PASSWORD 가 %d자입니다. 인터넷에 공개한다면 12자 이상으로 바꾸세요." % len(PASSWORD), flush=True)
+    if HOST not in ("127.0.0.1", "localhost", "::1") and not PUBLIC_HTTPS:
+        print("경고: 암호화 없이 외부에 열려 있습니다. 리버스 프록시(HTTPS)를 두고 GUI_HOST=127.0.0.1 로 되돌리세요.",
+              flush=True)
+    print("토큰 절감 옵션 감지: %s" % (", ".join(on) or "없음"), flush=True)
+    try:
+        srv.serve_forever()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        for p in list(PROCS.values()):
+            kill_proc(p)
+
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>에이전트 하네스</title>
+<style>
+:root{--bg:#f6f5f2;--panel:#fff;--ink:#1d1d1b;--mute:#6b6a65;--line:#e4e2dc;--accent:#2f5d50;--accent-ink:#fff;--ok:#2f7d4f;--warn:#b7791f;--err:#b83232;--chip:#eeece6}
+@media (prefers-color-scheme:dark){:root{--bg:#171715;--panel:#201f1d;--ink:#ecebe6;--mute:#9a988f;--line:#34332f;--accent:#7fb7a4;--accent-ink:#10201a;--ok:#6fcf97;--warn:#e0b050;--err:#ef7a7a;--chip:#2a2926}}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,"Apple SD Gothic Neo","Noto Sans KR","Malgun Gothic",system-ui,sans-serif}
+header{display:flex;align-items:center;gap:14px;padding:10px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{font-size:16px;margin:0;font-weight:700;white-space:nowrap}
+header .sp{flex:1}
+header .q{color:var(--mute);font-size:13px;white-space:nowrap}
+.ptabs{display:flex;gap:6px;overflow:auto;padding:2px}
+.ptab{white-space:nowrap;border:1px solid var(--line);background:var(--bg);color:var(--ink);padding:6px 14px;border-radius:99px;font-weight:600;font-size:14px}
+.ptab.on{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.ptab i{font-style:normal;font-size:11px;margin-left:6px;padding:0 6px;border-radius:99px;background:color-mix(in srgb,var(--ink) 14%,transparent)}
+.ptab i.w{background:var(--warn);color:#fff}
+.ptab.add{border-style:dashed;color:var(--mute);background:none}
+.subnav{display:flex;align-items:center;gap:4px;padding:6px 20px;border-bottom:1px solid var(--line);background:var(--panel);overflow-x:auto}
+.nv{border:0;background:none;color:var(--mute);padding:6px 14px;border-radius:8px;font-weight:600;white-space:nowrap;flex:none}
+.nv.on{background:var(--chip);color:var(--ink)}
+.pdesc{margin-left:12px;color:var(--mute);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wrap{display:grid;grid-template-columns:320px minmax(0,1fr);gap:16px;padding:16px 20px;max-width:1280px;margin:0 auto}
+.page{padding:16px 20px;max-width:900px;margin:0 auto}
+@media (max-width:860px){.wrap{grid-template-columns:minmax(0,1fr);padding:12px}.page{padding:12px}header{padding:10px 12px}.subnav{padding:6px 12px}.pdesc{display:none}header h1{font-size:14px}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+.card+.card{margin-top:12px}
+.card h2{font-size:13px;margin:0 0 10px;color:var(--mute);font-weight:600;letter-spacing:.02em}
+textarea,select,input[type=text]{width:100%;font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+textarea{min-height:92px;resize:vertical}
+button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 14px}
+button.pri{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+button.dng{color:var(--err);border-color:var(--err)}
+button:disabled{opacity:.5;cursor:default}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.jobs{display:flex;flex-direction:column;gap:6px;margin-top:12px;max-height:60vh;overflow:auto}
+.job{padding:10px 11px;border:1px solid var(--line);border-radius:10px;cursor:pointer;background:var(--panel)}
+.job:hover{border-color:var(--accent)}
+.job.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+.job .t{font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.job .m{display:flex;gap:8px;align-items:center;color:var(--mute);font-size:12px;margin-top:3px;flex-wrap:wrap}
+.chip{display:inline-block;padding:1px 9px;border-radius:99px;font-size:12px;background:var(--chip);color:var(--mute);font-weight:600}
+.chip.running{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
+.chip.awaiting_user{background:color-mix(in srgb,var(--warn) 22%,transparent);color:var(--warn)}
+.chip.approved{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok)}
+.chip.failed,.chip.cancelled{background:color-mix(in srgb,var(--err) 18%,transparent);color:var(--err)}
+.empty{color:var(--mute);text-align:center;padding:60px 10px}
+.title{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:4px}
+.title h2{font-size:18px;margin:0;color:var(--ink)}
+.usage{font-size:12px;color:var(--mute);margin:2px 0 4px}
+.steps{display:flex;gap:6px;margin:12px 0;flex-wrap:wrap}
+.step{flex:1;min-width:92px;padding:8px 10px;border-radius:10px;border:1px solid var(--line);font-size:13px;background:var(--bg)}
+.step b{display:block;font-size:13px}
+.step span{color:var(--mute);font-size:12px}
+.step.done{border-color:var(--ok)}.step.done b::before{content:"✓ ";color:var(--ok)}
+.step.active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,var(--panel))}
+.step.active b::before{content:"● ";color:var(--accent);animation:p 1.2s infinite}
+.step.err{border-color:var(--err)}.step.err b::before{content:"✕ ";color:var(--err)}
+@keyframes p{50%{opacity:.3}}
+.approve{border:1px solid var(--warn);background:color-mix(in srgb,var(--warn) 8%,var(--panel));margin:10px 0}
+.approve h3{margin:0 0 6px;font-size:15px}
+.approve .sub{color:var(--mute);font-size:13px;margin-bottom:10px}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-top:14px;overflow:auto}
+.tab{padding:8px 12px;border:0;border-bottom:2px solid transparent;border-radius:0;background:none;color:var(--mute);white-space:nowrap}
+.tab.on{color:var(--ink);border-bottom-color:var(--accent);font-weight:600}
+.tab.none{opacity:.4}
+.doc{padding:14px 4px;max-height:58vh;overflow:auto}
+.doc h2,.doc h3,.doc h4,.doc h5{margin:1.1em 0 .4em;line-height:1.35;color:var(--ink);letter-spacing:0}
+.doc h2{font-size:20px}.doc h3{font-size:17px}.doc h4{font-size:15px}
+.doc p{margin:.5em 0}.doc ul{padding-left:20px}
+.doc code{background:var(--chip);padding:1px 5px;border-radius:4px;font-size:.92em}
+.doc pre{background:var(--chip);padding:10px;border-radius:8px;overflow:auto}
+.doc blockquote{margin:.6em 0;padding:2px 12px;border-left:3px solid var(--line);color:var(--mute)}
+.doc table{border-collapse:collapse;margin:.6em 0;font-size:14px}.doc td,.doc th{border:1px solid var(--line);padding:5px 9px}
+.doc a{color:var(--accent)}
+.doc hr{border:0;border-top:1px solid var(--line);margin:1em 0}
+.vd{font-size:13px;margin:4px 0;color:var(--mute)}
+.ev{margin-top:14px}
+.ev div{display:flex;gap:10px;font-size:13px;padding:3px 0;color:var(--mute)}
+.ev .ts{font-variant-numeric:tabular-nums;flex:none}
+.ev .ag{flex:none;min-width:48px;font-weight:600;color:var(--ink)}
+.ev .ok .mg{color:var(--ok)}.ev .warn .mg{color:var(--warn)}.ev .err .mg{color:var(--err)}
+.err-box{color:var(--err);font-size:13px;margin:6px 0;white-space:pre-wrap}
+label.lb{display:block;font-size:13px;color:var(--mute);margin:0 0 10px}
+label.lb select,label.lb input,label.lb textarea{display:block;margin-top:4px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;min-height:260px;line-height:1.55}
+.warnbox{border:1px solid var(--warn);background:color-mix(in srgb,var(--warn) 9%,var(--panel));border-radius:10px;padding:10px 14px;margin:10px 0;font-size:13px}
+.warnbox ul{margin:6px 0;padding-left:18px}
+.chk{display:flex;gap:8px;align-items:flex-start;margin:8px 0;font-size:14px}
+.chk input{margin-top:5px}
+.chk small{display:block;color:var(--mute);font-size:12px}
+.badges{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 12px}
+.tag{display:inline-block;font-size:11px;padding:0 7px;border-radius:6px;background:var(--chip);color:var(--mute);font-weight:600}
+.plan{border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:10px 0;background:var(--bg)}
+.plan .ph{font-size:12px;font-weight:700;color:var(--mute);margin:8px 0 4px}
+.plan .pa{margin:4px 0}
+.pst{margin:4px 0;padding-left:20px}.pst li{margin:6px 0}
+.sc{border:1px solid var(--line);border-radius:10px;margin:10px 0;background:var(--bg)}
+.sc.off{opacity:.6}
+.sch{display:flex;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.sch input[type=text]{flex:1;min-width:120px;width:auto}
+.sch select{width:auto}
+.sch button{padding:4px 10px}
+.sch b{width:22px;height:22px;border-radius:50%;background:var(--accent);color:var(--accent-ink);display:inline-flex;align-items:center;justify-content:center;font-size:12px}
+.inl{display:flex;gap:5px;align-items:center;font-size:13px;color:var(--mute);white-space:nowrap}
+.scb{padding:10px 12px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media (max-width:600px){.g2{grid-template-columns:1fr}}
+.ins{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 10px;font-size:13px}
+table.ut{border-collapse:collapse;width:100%;font-size:13px}.ut td,.ut th{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left}
+.tip{font-size:13px;color:var(--mute)}.tip li{margin:4px 0}
+#toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:9px 16px;border-radius:99px;font-size:13px;opacity:0;transition:.2s;pointer-events:none;max-width:90vw}
+#toast.show{opacity:1}
+</style>
+</head>
+<body>
+<header><h1>에이전트 하네스</h1><div class="ptabs" id="ptabs"></div><div class="sp"></div><div class="q" id="qinfo"></div><a class="q" href="/logout" style="color:var(--mute);margin-left:12px">로그아웃</a></header>
+<div class="subnav" id="subnav" hidden>
+  <button class="nv on" data-v="jobs">작업</button><button class="nv" data-v="agents">에이전트</button><button class="nv" data-v="sources">자료</button><button class="nv" data-v="stages">단계</button><button class="nv" data-v="sched">예약</button><button class="nv" data-v="settings">설정</button>
+  <span class="pdesc" id="pdesc"></span>
+</div>
+
+<div class="wrap" id="v-jobs">
+  <aside>
+    <div class="card">
+      <h2>새 작업 요청</h2>
+      <textarea id="req" placeholder="요청 내용을 입력하세요"></textarea>
+      <div class="row" style="margin-top:8px"><button class="pri" id="go">작업 시작</button></div>
+    </div>
+    <div class="jobs" id="jobs"></div>
+  </aside>
+  <main class="card" id="main"><div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div></main>
+</div>
+
+<div class="wrap" id="v-agents" hidden>
+  <aside>
+    <div class="card">
+      <h2>이 프로젝트의 에이전트</h2>
+      <div class="jobs" id="alist" style="margin-top:0;max-height:none"></div>
+      <div class="row" style="margin-top:10px"><button class="pri" id="anew">+ 새 에이전트</button><button id="aimp">가져오기</button></div>
+      <div class="row" style="margin-top:6px"><button id="arenall">전체 폴더 이름 정리</button></div>
+    </div>
+  </aside>
+  <main><div class="card" id="aedit"><div class="empty">왼쪽에서 에이전트를 선택하세요.</div></div><div id="imppanel2"></div></main>
+</div>
+
+<div class="page" id="v-sources" hidden></div>
+<div class="page" id="v-stages" hidden></div>
+<div class="page" id="v-sched" hidden></div>
+<div class="page" id="v-settings" hidden></div>
+<div class="page" id="v-newproj" hidden></div>
+<div id="toast"></div>
+
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const STATUS={queued:'대기',running:'진행 중',awaiting_user:'승인 대기',approved:'승인 완료',failed:'실패',cancelled:'중단'};
+const AG={system:'시스템',user:'나'};
+let P=[],cur=null,view='jobs',settings={},flags={},presets=[],pj=null;
+let sel=null,tab=null,tabPinned=false,last={},busy=false,tickN=0;
+
+function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>t.classList.remove('show'),2600)}
+async function api(path,opt){
+  const r=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'},credentials:'same-origin'},opt||{}));
+  if(r.status===401){location.href='/login';throw new Error('로그인이 필요합니다')}
+  let d={};try{d=await r.json()}catch(e){}
+  if(!r.ok)throw new Error(d.error||r.statusText);
+  return d;
+}
+const post=(path,obj)=>api(path,{method:'POST',body:JSON.stringify(obj||{})});
+const base=()=>'/api/projects/'+encodeURIComponent(cur);
+const fmtN=n=>{n=+n||0;return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(n)};
+const newTok=u=>(+u.input||0)+(+u.output||0)+(+u.cache_write||0);
+function usageLine(u){
+  if(!u||!u.calls)return '아직 사용량 없음';
+  return '호출 '+u.calls+'회 · 입력 '+fmtN(u.input)+' · 출력 '+fmtN(u.output)+' · 캐시 쓰기 '+fmtN(u.cache_write)+' · 캐시 읽기 '+fmtN(u.cache_read)+(u.cost?' · 추정 $'+(+u.cost).toFixed(3):'');
+}
+
+/* ---------- 마크다운 ---------- */
+function md(src){
+  const lines=esc(src).split('\n');let out='',code=false,list=false,para=[],tbl=[];
+  const inl=t=>t.replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>').replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  const fp=()=>{if(para.length){out+='<p>'+inl(para.join(' '))+'</p>';para=[]}};
+  const fl=()=>{if(list){out+='</ul>';list=false}};
+  const ft=()=>{if(tbl.length){const rows=tbl.filter(r=>!/^\s*\|?\s*:?-{2,}/.test(r));out+='<table>'+rows.map((r,i)=>'<tr>'+r.replace(/^\s*\||\|\s*$/g,'').split('|').map(c=>(i?'<td>':'<th>')+inl(c.trim())+(i?'</td>':'</th>')).join('')+'</tr>').join('')+'</table>';tbl=[]}};
+  for(const l of lines){
+    if(l.startsWith('```')){fp();fl();ft();out+=code?'</pre>':'<pre>';code=!code;continue}
+    if(code){out+=l+'\n';continue}
+    let m;
+    if(/^\s*\|/.test(l)){fp();fl();tbl.push(l);continue}else ft();
+    if(/^\s*(-{3,}|\*{3,})\s*$/.test(l)){fp();fl();out+='<hr>';continue}
+    if(m=l.match(/^(#{1,4})\s+(.*)$/)){fp();fl();const n=Math.min(m[1].length+1,5);out+='<h'+n+'>'+inl(m[2])+'</h'+n+'>'}
+    else if(m=l.match(/^\s*[-*]\s+(.*)$/)){fp();if(!list){out+='<ul>';list=true}out+='<li>'+inl(m[1])+'</li>'}
+    else if(m=l.match(/^&gt;\s?(.*)$/)){fp();fl();out+='<blockquote>'+inl(m[1])+'</blockquote>'}
+    else if(!l.trim()){fp();fl()}
+    else{fl();para.push(l)}
+  }
+  fp();fl();ft();if(code)out+='</pre>';return out;
+}
+const verdictOf=t=>{const m=(t||'').slice(0,600).match(/VERDICT:\s*(APPROVE|REVISE)/i);return m?m[1].toUpperCase():null};
+const stripV=t=>(t||'').replace(/^\s*VERDICT:.*\n?/i,'');
+
+/* ---------- 프로젝트 / 화면 전환 ---------- */
+async function loadProjects(){
+  const d=await api('/api/projects');
+  P=d.projects;settings=d.settings;flags=d.flags;
+  if(!cur||!P.find(p=>p.id===cur)){let s=null;try{s=localStorage.getItem('cur')}catch(e){}cur=(P.find(p=>p.id===s)||P[0]||{}).id||null}
+  const q=d.queue;$('#qinfo').textContent=[q.running?'실행 '+q.running:'',q.waiting?'대기 '+q.waiting:''].filter(Boolean).join(' · ');
+  $('#ptabs').innerHTML=P.map(p=>'<button class="ptab'+(p.id===cur?' on':'')+'" data-id="'+esc(p.id)+'">'+esc(p.name)+(p.active?'<i>'+p.active+'</i>':'')+(p.awaiting?'<i class="w">승인 '+p.awaiting+'</i>':'')+'</button>').join('')+'<button class="ptab add" id="padd">+ 프로젝트</button>';
+  const c=P.find(p=>p.id===cur);$('#pdesc').textContent=c?(c.description||''):'';
+}
+function setView(v){
+  view=v;
+  document.querySelectorAll('#subnav .nv').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
+  ['jobs','agents','sources','stages','sched','settings','newproj'].forEach(x=>{$('#v-'+x).hidden=x!==v});
+  $('#subnav').hidden=v==='newproj'||!cur;
+  last={};
+  if(v==='jobs'){loadList().then(()=>sel&&loadDetail(true)).catch(()=>{})}
+  if(v==='agents')loadAgents().catch(e=>toast(e.message));
+  if(v==='sources')loadSources().catch(e=>toast(e.message));
+  if(v==='stages')loadStages().catch(e=>toast(e.message));
+  if(v==='sched')loadSched().catch(e=>toast(e.message));
+  if(v==='settings')loadSettings().catch(e=>toast(e.message));
+  if(v==='newproj')initNewProj().catch(e=>toast(e.message));
+}
+function switchProject(id){
+  cur=id;try{localStorage.setItem('cur',id)}catch(e){}
+  sel=null;last={};selAgent=null;
+  $('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>';
+  $('#aedit').innerHTML='<div class="empty">왼쪽에서 에이전트를 선택하세요.</div>';
+  loadProjects().then(()=>setView(view==='newproj'?'jobs':view));
+}
+$('#ptabs').onclick=e=>{
+  if(e.target.closest('#padd')){setView('newproj');return}
+  const b=e.target.closest('.ptab');if(b)switchProject(b.dataset.id);
+};
+document.querySelectorAll('#subnav .nv').forEach(b=>b.onclick=()=>setView(b.dataset.v));
+
+/* ---------- 작업 ---------- */
+async function loadList(){
+  if(!cur)return;
+  const d=await api(base()+'/jobs');
+  const h=d.jobs.map(j=>'<div class="job'+(j.id===sel?' sel':'')+'" data-id="'+esc(j.id)+'"><div class="t">'+esc(j.title)+'</div><div class="m"><span class="chip '+j.status+'">'+STATUS[j.status]+'</span><span>'+esc(j.created.slice(5,16))+'</span>'+(j.tokens?'<span>토큰 '+fmtN(j.tokens)+'</span>':'')+'</div></div>').join('');
+  if(h!==last.list){last.list=h;$('#jobs').innerHTML=h||'<div class="empty" style="padding:20px">아직 작업이 없습니다</div>'}
+}
+async function loadDetail(force){
+  if(!sel||!cur||view!=='jobs')return;
+  let d;try{d=await api(base()+'/jobs/'+encodeURIComponent(sel))}catch(e){return}
+  const j=d.job,f=d.files,stg=d.stages.filter(s=>s.enabled);
+  const steps=stg.map(s=>[s.id,s.name,s.agent]).concat([['user','최종 승인','나']]);
+  const keys=steps.map(s=>s[0]);
+  if(!tabPinned){const w=d.stages.slice().reverse().find(s=>s.kind==='work'&&f[s.id]!=null);tab=f.final?'final':(w?w.id:'request')}
+  const nS=stg.length;
+  const ci=j.status==='awaiting_user'?nS:j.status==='approved'?nS+1:Math.max(0,keys.indexOf(j.step));
+  const st=i=>i<ci?'done':i===ci?((j.status==='failed'||j.status==='cancelled')?'err':(j.status==='running'||j.status==='awaiting_user')?'active':'wait'):'wait';
+  const u=j.usage||{};
+  const bys=Object.entries(u.by_stage||{}).map(([k,v])=>{const s=d.stages.find(x=>x.id===k);return esc(s?s.name:(k==='plan'?'자동 구성':k))+' '+fmtN(newTok(v))}).join(' · ');
+  const srcL={telegram:'텔레그램',schedule:'예약 실행'}[j.source];
+  const head='<div class="title"><h2>'+esc(j.title)+'</h2><span class="chip '+j.status+'">'+STATUS[j.status]+'</span>'+(srcL?'<span class="chip">'+srcL+'</span>':'')+(j.auto_approve?'<span class="chip">자동 승인</span>':'')+(d.auto_planned?'<span class="chip approved">자동 구성</span>':'')+'</div>'
+    +'<div class="usage">'+esc(usageLine(u))+(d.limit?' · 작업 한도 '+fmtN(d.limit)+' 중 새 토큰 '+fmtN(newTok(u)):'')+'</div>'
+    +(bys?'<div class="usage">단계별 새 토큰: '+bys+'</div>':'')
+    +'<div class="steps">'+steps.map((s,i)=>'<div class="step '+st(i)+'"><b>'+esc(s[1])+'</b><span>'+esc(s[2])+'</span></div>').join('')+'</div>'
+    +(j.error?'<div class="err-box">'+esc(j.error)+'</div>':'');
+  const evh='<div class="ev">'+j.events.slice().reverse().map(e=>'<div class="'+e.kind+'"><span class="ts">'+esc((e.ts||'').slice(11,19))+'</span><span class="ag">'+esc(AG[e.agent]||e.agent)+'</span><span class="mg">'+esc(e.msg)+'</span></div>').join('')+'</div>';
+  const actKey=j.id+'|'+j.status;
+  if(last.act!==actKey||force){
+    last.act=actKey;
+    const works=stg.filter(s=>s.kind==='work');
+    const opts='<option value="first">처음부터</option>'+works.map((s,i)=>'<option value="'+esc(s.id)+'"'+(i===works.length-1&&works.length>1?' selected':'')+'>'+esc(s.name)+'부터</option>').join('');
+    let act='';
+    if(j.status==='awaiting_user'){
+      const lastRev=stg.slice().reverse().find(s=>s.kind==='review'&&f[s.id]!=null);
+      const rv=lastRev?verdictOf(f[lastRev.id]):'APPROVE';
+      act='<div class="card approve"><h3>최종 승인이 필요합니다</h3><div class="sub">'+(rv==='APPROVE'?'검토를 통과한 결과물입니다.':'검토 단계의 수정요청이 남은 상태입니다. 해당 탭에서 내용을 확인하세요.')+' 승인하면 outbox에 approved 파일로 저장됩니다.</div>'
+        +'<div class="row"><button class="pri" id="ap">최종 승인</button></div><hr style="border:0;border-top:1px solid var(--line);margin:12px 0">'
+        +'<textarea id="fb" placeholder="수정이 필요하면 요청 내용을 적어주세요"></textarea>'
+        +'<div class="row" style="margin-top:8px"><select id="st" style="width:auto">'+opts+'</select><button id="rj">반려하고 다시 작업</button></div></div>';
+    }else if(j.status==='running'||j.status==='queued'){
+      act='<div class="row" style="margin:10px 0"><button class="dng" id="cn">작업 중단</button></div>';
+    }else if(j.status==='failed'||j.status==='cancelled'){
+      act='<div class="row" style="margin:10px 0"><select id="st" style="width:auto">'+opts.replace(' selected','')+'</select><button class="pri" id="rt">다시 시도</button></div>';
+    }else if(j.status==='approved'){
+      act='<div class="vd">승인 완료: shared/outbox/approved_'+esc(j.id)+'.md</div>';
+    }
+    $('#act').innerHTML=act;bindJob(j);
+  }
+  const tdef=[['final','최종본']].concat(d.stages.slice().reverse().map(s=>[s.id,s.name+(s.kind==='review'?' (검토)':'')+(s.enabled?'':' ·꺼짐')])).concat([['request','요청']]);
+  const tabsH='<div class="tabs">'+tdef.map(t=>'<button class="tab'+(tab===t[0]?' on':'')+(f[t[0]]!=null?'':' none')+'" data-t="'+esc(t[0])+'">'+esc(t[1])+'</button>').join('')+'</div>';
+  const txt=f[tab];const ts=d.stages.find(s=>s.id===tab);const isRev=ts&&ts.kind==='review';
+  let vd='';if(isRev){const v=verdictOf(txt);if(v)vd='<div class="vd">판정: <b>'+(v==='APPROVE'?'승인':'수정요청')+'</b></div>'}
+  const docH=txt==null?'<div class="empty" style="padding:30px">아직 만들어지지 않았습니다</div>':vd+md(isRev?stripV(txt):txt);
+  const sig=JSON.stringify([head,evh,tabsH,docH]);
+  if(last.sig!==sig||force){
+    const keep=$('.doc')?$('.doc').scrollTop:0;
+    $('#hd').innerHTML=head;$('#tb').innerHTML=tabsH;$('#ev').innerHTML=evh;
+    const dc=$('.doc');dc.innerHTML=docH;if(last.sel===sel&&last.tab===tab)dc.scrollTop=keep;
+    last.sig=sig;last.sel=sel;last.tab=tab;
+  }
+}
+function bindJob(j){
+  const q=s=>$(s);
+  const run=async(fn,msg)=>{if(busy)return;busy=true;try{await fn();toast(msg);last.act=null;await tick(true)}catch(e){toast(e.message)}busy=false};
+  const url=base()+'/jobs/'+j.id;
+  if(q('#ap'))q('#ap').onclick=()=>{if(confirm('이 결과물을 최종 승인할까요?'))run(()=>post(url+'/approve'),'승인되었습니다')};
+  if(q('#rj'))q('#rj').onclick=()=>{const fb=q('#fb').value.trim();if(!fb){toast('수정 요청 내용을 적어주세요');return}run(()=>post(url+'/restart',{feedback:fb,start:q('#st').value}),'다시 작업을 시작합니다')};
+  if(q('#rt'))q('#rt').onclick=()=>run(()=>post(url+'/restart',{start:q('#st').value}),'다시 시작합니다');
+  if(q('#cn'))q('#cn').onclick=()=>{if(confirm('작업을 중단할까요?'))run(()=>post(url+'/cancel'),'중단 요청')};
+}
+function selectJob(id){
+  sel=id;tab=null;tabPinned=false;last={list:last.list};
+  $('#main').innerHTML='<div id="hd"></div><div id="act"></div><div id="tb"></div><div class="doc"></div><h2 style="margin:16px 0 0;font-size:13px;color:var(--mute)">진행 기록</h2><div id="ev"></div>';
+  $('#tb').onclick=e=>{const b=e.target.closest('.tab');if(b){tab=b.dataset.t;tabPinned=true;loadDetail(true)}};
+  tick(true);
+}
+$('#jobs').onclick=e=>{const j=e.target.closest('.job');if(j)selectJob(j.dataset.id)};
+$('#go').onclick=async()=>{
+  const t=$('#req').value.trim();if(!t){toast('요청 내용을 입력하세요');return}
+  try{const j=await post(base()+'/jobs',{request:t});$('#req').value='';await loadList();selectJob(j.id)}catch(e){toast(e.message)}
+};
+
+/* ---------- 에이전트 ---------- */
+let selAgent=null;
+async function loadAgents(){
+  pj=await api(base());
+  $('#alist').innerHTML=pj.agents.map(a=>'<div class="job'+(a.id===selAgent?' sel':'')+'" data-id="'+esc(a.id)+'"><div class="t">'+esc(a.name)+'</div><div class="m"><span>'+esc(a.workspace)+'</span>'+(a.problems.length?'<span class="chip failed">설정 확인</span>':'<span class="chip approved">정상</span>')+'</div></div>').join('')||'<div class="empty" style="padding:16px">에이전트가 없습니다</div>';
+}
+function permsHtml(p){
+  return '<label class="chk"><input type="checkbox" id="pweb"'+(p.web?' checked':'')+'><span>웹 검색·페이지 읽기 허용<small>인터넷 자료가 필요한 역할만 켜세요</small></span></label>'
+    +'<label class="chk"><input type="checkbox" id="pbash"'+(p.bash?' checked':'')+'><span>셸 명령 실행 허용 (Bash)<small>주의: 켜면 에이전트가 파이에서 명령을 실행할 수 있습니다. sudo와 rm은 계속 막힙니다</small></span></label>';
+}
+async function openAgent(id){
+  selAgent=id;
+  const a=await api(base()+'/agents/'+encodeURIComponent(id));
+  const warn=a.problems.length?'<div class="warnbox"><b>확인이 필요합니다</b><ul>'+a.problems.map(p=>'<li>'+esc(p)+'</li>').join('')+'</ul>아래 [저장]을 누르면 기본 권한 설정을 만들고 폴더 신뢰도 등록합니다.</div>':'';
+  const st=a.stages.length?a.stages.map(s=>'<span class="chip running">'+esc(s)+'</span>').join(''):'<span class="chip">담당 단계 없음</span>';
+  $('#aedit').innerHTML='<div class="title"><h2>'+esc(a.name)+'</h2></div><div class="badges"><span class="chip">'+esc(a.workspace)+'</span>'+st+'</div>'+warn
+    +'<div class="g2"><label class="lb">이름<input type="text" id="an" maxlength="30" value="'+esc(a.name)+'"></label>'
+    +'<label class="lb">모델 (비우면 기본값. 예: haiku, sonnet, opus)<input type="text" id="am" value="'+esc(a.model)+'" placeholder="기본값"></label></div>'
+    +permsHtml(a.perms)
+    +'<label class="lb" style="margin-top:10px">역할 설명 (CLAUDE.md)'+(a.has_md?'':' - 아직 없어서 기본 틀을 채웠습니다')+'<textarea id="amd" class="mono" spellcheck="false">'+esc(a.claude_md)+'</textarea></label>'
+    +'<div class="vd">저장하면 이전 내용은 shared/history/_agents 에 백업됩니다. 권한 설정(settings.json)은 위 체크박스 기준으로 다시 만들어집니다.</div>'
+    +'<div class="row" style="margin-top:10px"><button class="pri" id="asave">저장</button><button id="aren">폴더 이름 정리</button><button class="dng" id="adel">목록에서 제거</button></div>';
+  $('#aren').onclick=async()=>{
+    try{const r=await post(base()+'/agents/'+id+'/rename-folder');
+      toast(r.changed?('폴더 이름을 "'+r.workspace+'"로 바꿨습니다'):'이미 정리되어 있습니다');
+      await loadAgents();await openAgent(id)}catch(e){toast(e.message)}
+  };
+  $('#asave').onclick=async()=>{
+    try{const r=await post(base()+'/agents/'+id+'/save',{name:$('#an').value,model:$('#am').value,claude_md:$('#amd').value,perms:{web:$('#pweb').checked,bash:$('#pbash').checked}});
+      toast(r.warning||'저장했습니다');await loadAgents();await openAgent(id)}catch(e){toast(e.message)}
+  };
+  $('#adel').onclick=async()=>{
+    if(!confirm('이 에이전트를 목록에서 제거할까요? 폴더와 파일은 지워지지 않습니다.'))return;
+    try{await post(base()+'/agents/'+id+'/remove');selAgent=null;$('#aedit').innerHTML='<div class="empty">제거했습니다.</div>';toast('목록에서 제거했습니다');await loadAgents()}catch(e){toast(e.message)}
+  };
+  loadAgents();
+}
+function newAgentForm(){
+  selAgent=null;
+  $('#aedit').innerHTML='<div class="title"><h2>새 에이전트</h2></div>'
+    +'<div class="g2"><label class="lb">이름<input type="text" id="nn" maxlength="30" placeholder="예: 번역가"></label>'
+    +'<label class="lb">모델 (선택)<input type="text" id="nm" placeholder="기본값"></label></div>'
+    +'<label class="lb">역할 설명 (나중에 자유롭게 고칠 수 있습니다)<textarea id="nd" placeholder="예: 완성된 글을 영어로 번역한다."></textarea></label>'
+    +permsHtml({web:false,bash:false})
+    +'<label class="lb">이미 만들어 둔 폴더를 연결하려면 폴더 이름 입력 (선택)<input type="text" id="nw" placeholder="비워 두면 새 폴더를 자동으로 만듭니다"></label>'
+    +'<div class="row"><button class="pri" id="ncreate">에이전트 만들기</button></div>';
+  $('#ncreate').onclick=async()=>{
+    try{const r=await post(base()+'/agents',{name:$('#nn').value,model:$('#nm').value,description:$('#nd').value,workspace:$('#nw').value,perms:{web:$('#pweb').checked,bash:$('#pbash').checked}});
+      toast(r.warning||'만들었습니다');await loadAgents();await openAgent(r.agent.id)}catch(e){toast(e.message)}
+  };
+  loadAgents();
+}
+$('#alist').onclick=e=>{const j=e.target.closest('.job');if(j)openAgent(j.dataset.id).catch(x=>toast(x.message))};
+$('#anew').onclick=newAgentForm;
+$('#arenall').onclick=async()=>{
+  if(!confirm('이 프로젝트의 모든 에이전트 폴더 이름을 정리할까요? 실행 중인 작업이 없을 때만 됩니다.'))return;
+  try{const r=await post(base()+'/agents/rename-all');
+    const n=r.results.filter(x=>x.changed).length;
+    toast(n?n+'개 폴더 이름을 정리했습니다':'이미 전부 정리되어 있습니다');
+    await loadAgents();if(selAgent)await openAgent(selAgent)}catch(e){toast(e.message)}
+};
+$('#aimp').onclick=async()=>{
+  const host=$('#imppanel2');
+  host.innerHTML='<div class="card"><h2>기존 에이전트 가져오기</h2><div class="vd">불러오는 중...</div></div>';
+  let d;try{d=await api('/api/all-agents')}catch(e){toast(e.message);host.innerHTML='';return}
+  const list=d.agents.filter(a=>a.pid!==cur);
+  if(!list.length){host.innerHTML='<div class="card"><h2>기존 에이전트 가져오기</h2><div class="empty" style="padding:16px">다른 프로젝트에 가져올 에이전트가 없습니다</div></div>';return}
+  host.innerHTML='<div class="card"><h2>기존 에이전트 가져오기</h2>'
+    +'<div class="vd" style="margin-bottom:8px">선택하면 이 프로젝트로 복사됩니다. 복사본이라 고쳐도 원본에는 영향이 없습니다.</div>'
+    +'<div class="jobs" style="margin-top:0;max-height:50vh">'+list.map((a,i)=>'<div class="job" data-i="'+i+'"><div class="t">'+esc(a.name)+' <span class="tag">'+esc(a.pname)+'</span>'+(a.web?' <span class="tag">웹</span>':'')+(a.model?' <span class="tag">'+esc(a.model)+'</span>':'')+'</div><div class="m">'+esc((a.role||'').slice(0,90))+'</div></div>').join('')+'</div>'
+    +'<div class="row" style="margin-top:10px"><button id="imp2close">닫기</button></div></div>';
+  host.querySelectorAll('.job').forEach(el=>el.onclick=async()=>{
+    const a=list[+el.dataset.i];
+    try{const r=await post(base()+'/agents/import',{from:a.pid,agent:a.id});toast(r.note||'가져왔습니다');host.innerHTML='';await loadAgents();await openAgent(r.agent.id)}catch(e){toast(e.message)}});
+  $('#imp2close').onclick=()=>{host.innerHTML=''};
+};
+
+/* ---------- 구성 추천 (프리셋 / AI) ---------- */
+function planHtml(p){
+  const an={},sn={};p.agents.forEach(a=>an[a.key]=a.name);p.stages.forEach(s=>sn[s.id]=s.name);
+  return '<div class="plan"><div class="ph">에이전트 '+p.agents.length+'명</div>'
+    +p.agents.map(a=>'<div class="pa"><b>'+esc(a.name)+'</b>'+(a.web?' <span class="tag">웹</span>':'')+(a.model?' <span class="tag">'+esc(a.model)+'</span>':'')+'<div class="vd">'+esc(a.role)+'</div></div>').join('')
+    +'<div class="ph">단계 '+p.stages.length+'개 (호출 최소 '+p.stages.length+'회/작업)</div><ol class="pst">'
+    +p.stages.map(s=>'<li><b>'+esc(s.name)+'</b> <span class="tag">'+(s.kind==='review'?'검토':'작업')+'</span> '+esc(an[s.agent]||s.agent)+(s.kind==='review'?' → '+esc(sn[s.target]||'')+' 검토':'')+'<div class="vd">'+esc(s.instruction)+'</div></li>').join('')+'</ol></div>';
+}
+const presetOpts=()=>presets.map((p,i)=>'<option value="'+i+'">'+esc(p.label)+'</option>').join('');
+function countSel(sid,aid){
+  const o=(n,lab)=>'<option value="'+n+'">'+lab+'</option>';
+  return '<label class="inl">단계 수<select id="'+sid+'" style="width:auto">'+o(0,'자동')+[2,3,4,5,6,7,8].map(n=>o(n,n+'개')).join('')+'</select></label>'
+    +'<label class="inl">에이전트 수<select id="'+aid+'" style="width:auto">'+o(0,'자동')+[2,3,4,5,6].map(n=>o(n,n+'명')).join('')+'</select></label>';
+}
+
+/* ---------- 단계 ---------- */
+let ES=[],planCur=null;
+async function loadStages(){
+  pj=await api(base());
+  if(!presets.length)presets=(await api('/api/presets')).presets;
+  ES=JSON.parse(JSON.stringify(pj.stages));planCur=null;
+  const autoNote=pj.stage_mode==='auto'?'<div class="warnbox">이 프로젝트는 <b>요청별 자동 구성</b>으로 설정되어 있습니다. 실제 작업은 매번 AI가 새로 설계한 단계로 실행되고, 아래 구성은 설계가 실패했을 때만 쓰이는 대체용입니다. 고정 구성으로 되돌리려면 설정 화면에서 바꾸세요.</div>':'';
+  $('#v-stages').innerHTML=autoNote+'<div class="card"><h2>단계 추천</h2>'
+    +'<div class="vd" style="margin:0 0 8px">프리셋은 토큰이 들지 않습니다. AI 추천은 1회 호출(토큰 소량 사용)로 프로젝트 설명에 맞는 구성을 제안합니다. 적용 전에 미리보기로 확인하세요.</div>'
+    +'<div class="row"><select id="prs" style="flex:1"><option value="">프리셋 선택...</option>'+presetOpts()+'</select></div>'
+    +'<label class="lb" style="margin-top:10px">AI 추천용 프로젝트 설명<textarea id="pd2" placeholder="어떤 작업을 하는 프로젝트인지 적어주세요">'+esc(pj.description)+'</textarea></label>'
+    +'<div class="row">'+countSel('pcs','pca')+'<button id="paib">AI 추천 받기</button></div><div id="pprev"></div>'
+    +'<div class="row" id="papply" hidden><button class="pri" id="papplyb">이 구성으로 교체</button><span class="vd">기존 단계는 대체되고, 추천 에이전트가 새로 만들어집니다. 기존 에이전트는 그대로 남습니다.</span></div></div>'
+    +'<div class="card"><h2>단계 파이프라인 (위에서 아래로 실행)</h2>'
+    +'<div class="vd" style="margin:0 0 6px">검토 단계가 수정요청(REVISE)을 내면 대상 단계로 돌아가 다시 수행합니다 (프로젝트 설정의 반복 횟수까지). 불필요한 단계는 \'사용\'을 꺼서 토큰을 아낄 수 있습니다.</div>'
+    +'<div id="stlist"></div><div class="row"><button id="stadd">+ 단계 추가</button><button class="pri" id="stsave">저장</button></div></div>';
+  $('#prs').onchange=e=>{const v=e.target.value;if(v===''){return}planCur=presets[+v].plan;showPlan(presets[+v].desc)};
+  $('#paib').onclick=async()=>{
+    const d=$('#pd2').value.trim();if(!d){toast('프로젝트 설명을 적어주세요');return}
+    $('#paib').disabled=true;$('#paib').textContent='추천 생성 중...';
+    try{const r=await post('/api/plan',{name:pj.name,description:d,stages:+$('#pcs').value,agents:+$('#pca').value});planCur=r.plan;showPlan('AI 추천 사용량: 입력 '+fmtN(r.usage.input)+' · 출력 '+fmtN(r.usage.output)+' · 캐시 '+fmtN((+r.usage.cache_write||0)+(+r.usage.cache_read||0)))}catch(e){toast(e.message)}
+    $('#paib').disabled=false;$('#paib').textContent='AI 추천 받기';
+  };
+  $('#papplyb').onclick=async()=>{
+    if(!planCur||!confirm('현재 단계를 이 구성으로 교체할까요?'))return;
+    try{await post(base()+'/apply-plan',{plan:planCur});toast('적용했습니다');await loadProjects();await loadStages()}catch(e){toast(e.message)}
+  };
+  const L=$('#stlist');
+  L.addEventListener('input',e=>{
+    const c=e.target.closest('.sc');if(!c)return;const f=e.target.dataset.f;if(!f||e.target.type==='checkbox')return;
+    if(f==='name'||f==='instruction')ES[+c.dataset.i][f]=e.target.value;
+    else if(f==='max_turns')ES[+c.dataset.i][f]=parseInt(e.target.value)||0;
+  });
+  L.addEventListener('change',e=>{
+    const c=e.target.closest('.sc');if(!c)return;const i=+c.dataset.i,f=e.target.dataset.f;if(!f)return;const s=ES[i];
+    if(f==='enabled'||f==='polish')s[f]=e.target.checked;
+    else if(f==='inputs'){const v=e.target.dataset.v;s.inputs=s.inputs.filter(x=>x!==v);if(e.target.checked)s.inputs.push(v)}
+    else if(f==='kind'){s.kind=e.target.value;if(s.kind==='review'&&!s.target&&i>0)s.target=ES[i-1].id;if(s.kind==='work'){s.target='';s.polish=false}}
+    else if(f==='name'){s.name=e.target.value}
+    else if(f==='max_turns'){s.max_turns=parseInt(e.target.value)||0;return}
+    else s[f]=e.target.value;
+    if(['enabled','kind','name','target'].includes(f))renderStages();
+  });
+  L.addEventListener('click',e=>{
+    const b=e.target.closest('button[data-a]');if(!b)return;const i=+b.closest('.sc').dataset.i,a=b.dataset.a;
+    if(a==='up'&&i>0)[ES[i-1],ES[i]]=[ES[i],ES[i-1]];
+    else if(a==='down'&&i<ES.length-1)[ES[i+1],ES[i]]=[ES[i],ES[i+1]];
+    else if(a==='del'){
+      if(ES.length<=1){toast('단계는 최소 1개가 필요합니다');return}
+      const id=ES[i].id;ES.splice(i,1);
+      ES.forEach((s,k)=>{s.inputs=s.inputs.filter(x=>x!==id);if(s.target===id){s.target=k>0?ES[k-1].id:'';if(!s.target)s.kind='work'}});
+    }
+    renderStages();
+  });
+  $('#stadd').onclick=()=>{
+    const ids=new Set(ES.map(s=>s.id));let n=1;while(ids.has('s'+n))n++;
+    ES.push({id:'s'+n,name:'새 단계',kind:'work',agent:pj.agents[0]?pj.agents[0].id:'',target:'',inputs:[],instruction:'',enabled:true,max_turns:0,polish:false});
+    renderStages();
+  };
+  $('#stsave').onclick=async()=>{
+    try{await post(base()+'/stages',{stages:ES});toast('단계를 저장했습니다');await loadProjects();await loadStages()}catch(e){toast(e.message)}
+  };
+  renderStages();
+}
+function showPlan(note){$('#pprev').innerHTML=(note?'<div class="vd">'+esc(note)+'</div>':'')+planHtml(planCur);$('#papply').hidden=false}
+function renderStages(){
+  const ao=sel_=>pj.agents.map(a=>'<option value="'+esc(a.id)+'"'+(a.id===sel_?' selected':'')+'>'+esc(a.name)+'</option>').join('');
+  $('#stlist').innerHTML=ES.map((s,i)=>{
+    const prev=ES.slice(0,i);
+    return '<div class="sc'+(s.enabled?'':' off')+'" data-i="'+i+'"><div class="sch"><b>'+(i+1)+'</b>'
+      +'<label class="inl"><input type="checkbox" data-f="enabled"'+(s.enabled?' checked':'')+'> 사용</label>'
+      +'<input type="text" data-f="name" value="'+esc(s.name)+'" maxlength="30">'
+      +'<select data-f="kind"><option value="work"'+(s.kind==='work'?' selected':'')+'>작업</option><option value="review"'+(s.kind==='review'?' selected':'')+(i?'':' disabled')+'>검토</option></select>'
+      +'<button data-a="up"'+(i?'':' disabled')+'>↑</button><button data-a="down"'+(i<ES.length-1?'':' disabled')+'>↓</button><button class="dng" data-a="del">삭제</button></div>'
+      +'<div class="scb"><div class="g2"><label class="lb">담당 에이전트<select data-f="agent">'+ao(s.agent)+'</select></label>'
+      +(s.kind==='review'?'<label class="lb">검토 대상 단계<select data-f="target">'+prev.map(p=>'<option value="'+esc(p.id)+'"'+(p.id===s.target?' selected':'')+'>'+esc(p.name)+'</option>').join('')+'</select></label>'
+        :'<label class="lb">최대 턴 (0=기본 '+15+')<input type="text" data-f="max_turns" value="'+(s.max_turns||0)+'"></label>')+'</div>'
+      +(s.kind==='review'?'<label class="lb">최대 턴 (0=기본 8)<input type="text" data-f="max_turns" value="'+(s.max_turns||0)+'" style="width:100px"></label>':'')
+      +(prev.length?'<div class="vd">함께 읽을 이전 단계 결과 (요청 파일은 항상 포함)</div><div class="row" style="margin-bottom:8px">'+prev.filter(p=>p.id!==s.target).map(p=>'<label class="inl"><input type="checkbox" data-f="inputs" data-v="'+esc(p.id)+'"'+(s.inputs.includes(p.id)?' checked':'')+'> '+esc(p.name)+'</label>').join('')+'</div>':'')
+      +'<label class="lb">지시<textarea data-f="instruction" rows="3" style="min-height:64px">'+esc(s.instruction)+'</textarea></label>'
+      +(s.kind==='review'?'<label class="chk"><input type="checkbox" data-f="polish"'+(s.polish?' checked':'')+'><span>승인 시 다듬은 최종본 작성<small>켜면 이 검토 단계가 최종본(final)을 만듭니다. 끄면 마지막 작업 단계의 결과가 최종본이 됩니다</small></span></label>':'')
+      +'</div></div>';
+  }).join('');
+}
+
+/* ---------- 참고 자료 ---------- */
+const SRCMODE={off:['사용 안 함','자료를 프롬프트에 넣지 않습니다'],
+  prefer:['우선 참고 (권장)','이 자료를 먼저 근거로 삼고, 부족하면 다른 방법으로 보완합니다'],
+  only:['이 자료만 사용','자료에 없는 내용은 추측하지 않고 「제공된 자료에 없음」이라고 밝힙니다']};
+let srcEdit=null;
+async function loadSources(){
+  const d=await api(base()+'/sources');
+  const list=d.sources.length?d.sources.map(s=>'<div class="sc"><div class="sch"><b>자</b><input type="text" value="'+esc(s.name)+'" readonly style="flex:1;border:0;background:none">'
+    +'<span class="vd">'+fmtN(s.size)+'B</span><button data-edit="'+esc(s.name)+'">편집</button><button class="dng" data-del="'+esc(s.name)+'">삭제</button></div>'
+    +'<div class="scb"><div class="vd" style="white-space:pre-wrap">'+esc(s.preview)+(s.size>200?' …':'')+'</div></div></div>').join(''):'<div class="empty" style="padding:20px">등록된 자료가 없습니다</div>';
+  $('#v-sources').innerHTML='<div class="card"><h2>참고 자료 (내가 제공하는 근거)</h2>'
+    +'<div class="vd" style="margin:0 0 8px">여기에 넣은 자료를 에이전트가 읽고 근거로 씁니다. 서비스 설명, 내부 규정, 가격표, 자주 묻는 질문처럼 답변의 바탕이 될 내용을 넣으세요.</div>'
+    +'<label class="lb">자료 사용 방식<select id="smd" style="width:auto">'+Object.keys(SRCMODE).map(k=>'<option value="'+k+'"'+(d.mode===k?' selected':'')+'>'+SRCMODE[k][0]+'</option>').join('')+'</select></label>'
+    +'<div class="vd">'+esc(SRCMODE[d.mode][1])+'</div></div>'
+    +'<div class="card"><h2>자료 목록 ('+d.sources.length+')</h2>'+list
+    +'<div class="row" style="margin-top:10px"><button class="pri" id="srcnew">+ 자료 추가</button></div>'
+    +'<div class="vd" style="margin-top:8px">파일을 직접 넣어도 됩니다: <code>'+esc(d.dir)+'</code> 폴더에 .md 또는 .txt 파일을 복사하면 여기에 나타납니다.</div></div>'
+    +'<div id="srcform"></div>';
+  $('#smd').onchange=async e=>{try{await post(base()+'/sources/mode',{mode:e.target.value});toast('저장했습니다');await loadSources()}catch(err){toast(err.message)}};
+  $('#srcnew').onclick=()=>srcForm('','');
+  document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{
+    if(!confirm(b.dataset.del+' 자료를 삭제할까요?'))return;
+    try{await post(base()+'/sources/delete',{name:b.dataset.del});toast('삭제했습니다');await loadSources()}catch(e){toast(e.message)}});
+  document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=async()=>{
+    try{const full=await post(base()+'/sources/read',{name:b.dataset.edit});srcForm(full.name,full.content)}catch(e){toast(e.message)}});
+  if(srcEdit){srcForm(srcEdit.name,srcEdit.content);srcEdit=null}
+}
+function srcForm(name,content){
+  $('#srcform').innerHTML='<div class="card"><h2>'+(name?'자료 편집: '+esc(name):'새 자료')+'</h2>'
+    +'<label class="lb">제목 (파일 이름)<input type="text" id="srcn" maxlength="60" value="'+esc(name)+'" placeholder="예: 서비스 소개.md"'+(name?' readonly':'')+'></label>'
+    +'<label class="lb">내용<textarea id="srcc" class="mono" placeholder="답변의 근거가 될 내용을 붙여넣으세요">'+esc(content)+'</textarea></label>'
+    +'<div class="row"><button class="pri" id="srcsave">저장</button><button id="srccancel">취소</button></div></div>';
+  $('#srcsave').onclick=async()=>{
+    const n=$('#srcn').value.trim(),c=$('#srcc').value;
+    if(!n){toast('제목을 입력하세요');return}
+    if(!c.trim()){toast('내용을 입력하세요');return}
+    try{await post(base()+'/sources',{name:n,content:c});toast('저장했습니다');await loadSources()}catch(e){toast(e.message)}
+  };
+  $('#srccancel').onclick=()=>{$('#srcform').innerHTML=''};
+  $('#srcform').scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+
+/* ---------- 예약 ---------- */
+const DAYS=['월','화','수','목','금','토','일'];
+let SC=[];
+async function loadSched(){
+  pj=await api(base());
+  SC=JSON.parse(JSON.stringify(pj.schedules||[]));
+  $('#v-sched').innerHTML='<div class="card"><h2>예약 작업</h2>'
+    +'<div class="vd" style="margin:0 0 6px">정한 시각에 요청이 자동으로 실행됩니다. 자동 승인을 켜두면 사람 확인 없이 완료되고, 텔레그램이 연결돼 있으면 결과가 바로 전송됩니다. 뉴스 봇처럼 매일 받아보는 용도에 쓰세요.</div>'
+    +'<div class="vd" style="margin:0 0 10px">실행마다 이 프로젝트의 단계 수만큼 호출이 일어납니다. 매일 돌리는 예약은 단계를 적게 두는 편이 좋습니다. 서버가 꺼져 있던 시각의 예약은 건너뜁니다.</div>'
+    +'<div id="sclist"></div><div class="row"><button id="scadd">+ 예약 추가</button><button class="pri" id="scsave">저장</button></div></div>';
+  const L=$('#sclist');
+  L.addEventListener('input',e=>{const c=e.target.closest('.sc');if(!c)return;const f=e.target.dataset.f;if(f&&e.target.type!=='checkbox')SC[+c.dataset.i][f]=e.target.value});
+  L.addEventListener('change',e=>{
+    const c=e.target.closest('.sc');if(!c)return;const i=+c.dataset.i,f=e.target.dataset.f;if(!f)return;const x=SC[i];
+    if(f==='days'){const v=+e.target.dataset.v;x.days=x.days.filter(d=>d!==v);if(e.target.checked)x.days.push(v)}
+    else if(e.target.type==='checkbox'){x[f]=e.target.checked;if(f==='enabled')renderSched()}
+    else x[f]=e.target.value;
+  });
+  L.addEventListener('click',e=>{
+    const b=e.target.closest('button[data-a]');if(!b)return;
+    if(b.dataset.a==='del'){SC.splice(+b.closest('.sc').dataset.i,1);renderSched()}
+  });
+  $('#scadd').onclick=()=>{SC.push({id:'',name:'새 예약',time:'07:30',days:[0,1,2,3,4],request:'',auto_approve:true,enabled:true,last_run:''});renderSched()};
+  $('#scsave').onclick=async()=>{
+    try{await post(base()+'/schedules',{schedules:SC});toast('예약을 저장했습니다');await loadProjects();await loadSched()}catch(e){toast(e.message)}
+  };
+  renderSched();
+}
+function renderSched(){
+  $('#sclist').innerHTML=SC.length?SC.map((x,i)=>'<div class="sc'+(x.enabled?'':' off')+'" data-i="'+i+'"><div class="sch">'
+    +'<label class="inl"><input type="checkbox" data-f="enabled"'+(x.enabled?' checked':'')+'> 사용</label>'
+    +'<input type="text" data-f="name" value="'+esc(x.name)+'" maxlength="30">'
+    +'<label class="inl">시각<input type="text" data-f="time" value="'+esc(x.time)+'" placeholder="07:30" style="width:70px"></label>'
+    +'<button class="dng" data-a="del">삭제</button></div>'
+    +'<div class="scb"><div class="row" style="margin-bottom:8px">'+DAYS.map((d,n)=>'<label class="inl"><input type="checkbox" data-f="days" data-v="'+n+'"'+(x.days.includes(n)?' checked':'')+'> '+d+'</label>').join('')+'</div>'
+    +'<label class="lb">요청 내용 (작업 화면에 입력하는 것과 같습니다)<textarea data-f="request" rows="3" style="min-height:64px" placeholder="예: 오늘 국내 IT 뉴스 중 중요한 5건을 요약해줘">'+esc(x.request)+'</textarea></label>'
+    +'<label class="chk"><input type="checkbox" data-f="auto_approve"'+(x.auto_approve?' checked':'')+'><span>자동 승인<small>끄면 완료 후 텔레그램으로 승인 버튼이 오고, 승인해야 결과가 전송됩니다</small></span></label>'
+    +(x.last_run?'<div class="vd">마지막 실행: '+esc(x.last_run)+'</div>':'')
+    +'</div></div>').join(''):'<div class="empty" style="padding:20px">등록된 예약이 없습니다</div>';
+}
+
+/* ---------- 설정 ---------- */
+function tgCard(t){
+  if(!t.configured)return '<div class="card"><h2>텔레그램 (모바일에서 사용)</h2>'
+    +'<div class="vd">아직 봇 토큰이 없습니다. 텔레그램에서 <b>@BotFather</b> 에게 <b>/newbot</b> 으로 봇을 만든 뒤, 받은 토큰을 파이의 <b>~/agents/.env</b> 에 아래처럼 추가하고 서버를 다시 켜세요.</div>'
+    +'<pre style="background:var(--chip);padding:10px;border-radius:8px;font-size:13px;overflow:auto">TELEGRAM_BOT_TOKEN=받은토큰</pre>'
+    +'<div class="vd">연결하면 휴대폰에서 작업을 요청하고, 완료 알림과 승인 버튼을 받을 수 있습니다. 예약 작업 결과도 여기로 옵니다.</div></div>';
+  return '<div class="card"><h2>텔레그램 (모바일에서 사용)</h2>'
+    +'<div class="vd">봇과의 대화창에서 아래 명령을 한 번 보내면 연결됩니다. 연결된 대화만 작업을 요청할 수 있습니다.</div>'
+    +'<pre style="background:var(--chip);padding:10px;border-radius:8px;font-size:14px">/pair '+esc(t.pair_code)+'</pre>'
+    +'<div class="vd">연결 코드는 서버를 다시 켤 때마다 새로 만들어집니다. 이미 연결된 대화는 그대로 유지됩니다.</div>'
+    +'<div style="margin:10px 0">연결된 대화: '+(t.chats.length?t.chats.map(c=>'<span class="chip approved">'+esc(c)+(t.cur[c]?' · '+esc(t.cur[c]):'')+'</span> <button data-unpair="'+esc(c)+'" style="padding:2px 8px">해제</button>').join(' '):'<span class="chip">없음</span>')+'</div>'
+    +'<label class="chk"><input type="checkbox" id="tgn"'+(t.notify?' checked':'')+'><span>완료·실패 알림 보내기<small>GUI에서 시작한 작업의 알림도 연결된 모든 대화로 보냅니다</small></span></label>'
+    +'<div class="row" style="margin-top:8px"><button class="pri" id="tgsave">저장</button><button id="tgtest">테스트 메시지 보내기</button></div></div>';
+}
+function secCard(s){
+  const bad=[];
+  if(s.weak_password)bad.push('비밀번호가 12자 미만입니다. 인터넷에 공개한다면 더 길게 바꾸세요.');
+  if(s.host!=='127.0.0.1'&&!s.https)bad.push('암호화 없이 외부에 열려 있습니다. HTTPS 리버스 프록시를 두고 GUI_HOST는 127.0.0.1로 되돌리세요.');
+  if(s.https&&!s.proxy)bad.push('HTTPS는 켜져 있지만 TRUST_PROXY가 꺼져 있어 접속 IP가 프록시 주소로 기록됩니다.');
+  return '<div class="card"><h2>보안 상태</h2>'
+    +'<div class="row" style="margin-bottom:8px"><span class="chip '+(s.https?'approved':'failed')+'">HTTPS '+(s.https?'사용':'미설정')+'</span>'
+    +'<span class="chip '+(s.proxy?'approved':'')+'">프록시 IP 인식 '+(s.proxy?'켜짐':'꺼짐')+'</span>'
+    +'<span class="chip">바인딩 '+esc(s.host)+'</span>'+(s.public_host?'<span class="chip">'+esc(s.public_host)+'</span>':'')
+    +'<span class="chip">로그인 세션 '+s.sessions+'</span></div>'
+    +(bad.length?'<div class="warnbox"><b>확인이 필요합니다</b><ul>'+bad.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul></div>':'')
+    +(s.blocked.length?'<div class="vd">차단 중: '+s.blocked.map(b=>esc(b.ip)+' ('+b.left+'초, 실패 '+b.fails+'회)').join(', ')+'</div>':'')
+    +'<div class="vd" style="margin-top:6px">최근 로그인</div><table class="ut"><tr><th>시각</th><th>IP</th><th>결과</th></tr>'
+    +(s.recent.length?s.recent.map(r=>'<tr><td>'+esc(r.ts.slice(5,16))+'</td><td>'+esc(r.ip)+'</td><td>'+(r.ok?'성공':'<b style="color:var(--err)">실패</b>')+'</td></tr>').join(''):'<tr><td colspan="3">기록 없음</td></tr>')
+    +'</table><div class="row" style="margin-top:10px"><button class="dng" id="slog">모든 기기에서 로그아웃</button></div></div>';
+}
+async function loadSettings(){
+  pj=await api(base());
+  const tg=await api('/api/telegram');
+  const sec=await api('/api/security');
+  const fl=Object.keys(flags).map(k=>'<span class="chip '+(flags[k]?'approved':'')+'">'+esc(k)+' '+(flags[k]?'사용':'미지원')+'</span>').join(' ');
+  $('#v-settings').innerHTML='<div class="card"><h2>프로젝트 설정</h2>'
+    +'<label class="lb">이름<input type="text" id="sn" maxlength="40" value="'+esc(pj.name)+'"></label>'
+    +'<label class="lb">설명<textarea id="sd" style="min-height:64px">'+esc(pj.description)+'</textarea></label>'
+    +'<label class="lb">검토 단계의 수정요청 최대 반복 횟수<select id="sr" style="width:auto">'+[0,1,2,3].map(n=>'<option value="'+n+'"'+(pj.max_rounds===n?' selected':'')+'>'+n+'회'+(n===1?' (권장)':n===0?' (반복 안 함, 최저 비용)':'')+'</option>').join('')+'</select></label>'
+    +'<div class="vd">반복 1회마다 2~3번의 호출이 추가됩니다. 비용을 줄이려면 1회 이하를 권장합니다.</div>'
+    +'<label class="lb" style="margin-top:12px">요청 처리 방식<select id="smode" style="width:auto">'
+    +'<option value="fixed"'+(pj.stage_mode!=='auto'?' selected':'')+'>고정 파이프라인 (아래 \'단계\'에서 정한 구성을 항상 그대로 실행)</option>'
+    +'<option value="auto"'+(pj.stage_mode==='auto'?' selected':'')+'>요청별 자동 구성 (AI가 요청마다 에이전트·단계 수를 다시 설계)</option>'
+    +'</select></label>'
+    +'<div class="vd">자동 구성은 매 요청마다 설계 호출이 1회 추가됩니다. 대신 간단한 요청은 단계를 줄이고, 복잡한 요청만 단계를 늘려 전체적으로는 토큰을 아낄 수 있습니다. \'단계\' 화면의 구성은 자동 설계가 실패했을 때 쓰이는 대체 파이프라인으로 남습니다.</div>'
+    +'<div class="row" style="margin-top:8px"><button class="pri" id="ssave">저장</button><button class="dng" id="sdel">프로젝트 제거</button></div>'
+    +'<div class="vd">작업 폴더: '+esc(pj.root==='.'?'~/agents (기존 작업 공간)':'~/agents/'+pj.root)+'</div></div>'
+    +'<div class="card"><h2>전체 설정 (모든 프로젝트 공통)</h2>'
+    +'<div class="g2"><label class="lb">동시에 실행할 작업 수<select id="gp">'+[1,2,3].map(n=>'<option value="'+n+'"'+(settings.parallel===n?' selected':'')+'>'+n+'개'+(n===1?' (라즈베리파이 권장)':'')+'</option>').join('')+'</select></label>'
+    +'<label class="lb">작업당 토큰 한도 (0=무제한, 새 토큰 기준)<input type="text" id="gt" value="'+(settings.job_token_limit||0)+'"></label></div>'
+    +'<label class="lb">단계 추천(AI)에 쓸 모델<input type="text" id="gm" value="'+esc(settings.planner_model||'')+'" placeholder="sonnet"></label>'
+    +'<div class="vd">동시 실행은 프로젝트가 달라도 합산됩니다. 한 번에 에이전트 1개가 메모리를 약 300~500MB 쓰므로 4GB 파이는 1~2개를 권장합니다.</div>'
+    +'<div class="row" style="margin-top:8px"><button class="pri" id="gsave">저장</button></div></div>'
+    +'<div class="card"><h2>토큰 절감 옵션 (설치된 claude가 지원하면 자동 적용)</h2><div class="row">'+fl+'</div>'
+    +'<ul class="tip"><li><b>--tools</b>: 에이전트가 쓰는 도구만 모델에 알려 매 호출의 고정 토큰을 줄입니다.</li><li><b>--strict-mcp-config, --disable-slash-commands, --no-session-persistence</b>: 불필요한 도구·스킬 목록과 세션 파일 저장을 끕니다.</li><li>단계마다 최대 턴이 제한되고, 에이전트에게 설명 없이 파일만 저장하도록 지시합니다.</li></ul></div>'
+    +tgCard(tg)+secCard(sec)
+    +'<div class="card"><h2>프로젝트별 사용량 (새 토큰 = 입력 + 출력 + 캐시 쓰기)</h2><table class="ut"><tr><th>프로젝트</th><th>작업</th><th>새 토큰</th><th>추정 비용</th></tr>'
+    +P.map(p=>'<tr><td>'+esc(p.name)+'</td><td>'+p.jobs+'</td><td>'+fmtN(p.tokens)+'</td><td>'+(p.cost?'$'+p.cost.toFixed(3):'-')+'</td></tr>').join('')+'</table></div>'
+    +'<div class="card"><h2>토큰 아끼는 방법</h2><ul class="tip"><li>꼭 필요한 단계만 두세요. 단계 1개 = 호출 1회입니다. 필요 없는 단계는 \'사용\'을 끄세요.</li>'
+    +'<li>검토·검수처럼 단순한 단계의 에이전트는 모델을 <b>haiku</b>로 지정하세요.</li><li>수정요청 반복 횟수를 1회 이하로 두세요.</li>'
+    +'<li>요청에 분량과 범위를 구체적으로 적으면 불필요한 장문 생성을 줄입니다.</li><li>작업 상세 화면의 단계별 새 토큰 수치로 가장 비싼 단계를 찾아 조정하세요.</li></ul></div>';
+  $('#ssave').onclick=async()=>{try{await post(base()+'/update',{name:$('#sn').value,description:$('#sd').value,max_rounds:+$('#sr').value,stage_mode:$('#smode').value});toast('저장했습니다');await loadProjects();await loadSettings()}catch(e){toast(e.message)}};
+  $('#sdel').onclick=async()=>{if(!confirm('이 프로젝트를 목록에서 제거할까요? 폴더와 파일은 지워지지 않습니다.'))return;try{await post(base()+'/delete');toast('제거했습니다');cur=null;await loadProjects();setView('jobs')}catch(e){toast(e.message)}};
+  $('#gsave').onclick=async()=>{try{await post('/api/settings',{parallel:+$('#gp').value,job_token_limit:parseInt($('#gt').value)||0,planner_model:$('#gm').value});toast('저장했습니다');await loadProjects()}catch(e){toast(e.message)}};
+  $('#slog').onclick=async()=>{if(!confirm('모든 기기의 로그인을 끊을까요? 이 화면도 다시 로그인해야 합니다.'))return;
+    try{await post('/api/security/logout-all');location.href='/login'}catch(e){toast(e.message)}};
+  if($('#tgsave'))$('#tgsave').onclick=async()=>{try{await post('/api/telegram/update',{notify:$('#tgn').checked});toast('저장했습니다')}catch(e){toast(e.message)}};
+  if($('#tgtest'))$('#tgtest').onclick=async()=>{try{const r=await post('/api/telegram/test');toast(r.sent+'개 대화로 보냈습니다')}catch(e){toast(e.message)}};
+  document.querySelectorAll('[data-unpair]').forEach(b=>b.onclick=async()=>{
+    if(!confirm('이 대화의 연결을 해제할까요?'))return;
+    try{await post('/api/telegram/update',{unpair:b.dataset.unpair});toast('해제했습니다');await loadSettings()}catch(e){toast(e.message)}});
+}
+
+/* ---------- 새 프로젝트 ---------- */
+let newPlan=null,manual=[],allAgents=null;
+function manualPlan(){
+  const ag=manual.filter(a=>a.name.trim()).map((a,i)=>({key:'m'+(i+1),name:a.name.trim(),role:a.role.trim(),web:!!a.web,model:a.model||''}));
+  if(!ag.length)return null;
+  const st=ag.map((a,i)=>({name:a.name,agent:a.key,kind:'work',instruction:a.role||'요청을 수행한다.',inputs:i?[ag[0].name]:[]}));
+  if(st.length>1){const l=st[st.length-1];l.kind='review';l.target=st[st.length-2].name;l.polish=true}
+  return {agents:ag,stages:st};
+}
+function manualRows(){
+  return manual.map((a,i)=>'<div class="sc" data-i="'+i+'"><div class="sch"><b>'+(i+1)+'</b>'
+    +'<input type="text" data-f="name" value="'+esc(a.name)+'" maxlength="30" placeholder="이름 (예: 리서처)">'
+    +'<label class="inl"><input type="checkbox" data-f="web"'+(a.web?' checked':'')+'> 웹</label>'
+    +'<input type="text" data-f="model" value="'+esc(a.model||'')+'" placeholder="모델(선택)" style="width:110px">'
+    +'<button class="dng" data-a="del">삭제</button></div>'
+    +'<div class="scb"><label class="lb">이 에이전트가 할 일<textarea data-f="role" rows="2" style="min-height:52px" placeholder="예: 자료를 조사해 사실만 정리하고 출처를 적는다">'+esc(a.role)+'</textarea></label></div></div>').join('')
+    ||'<div class="empty" style="padding:16px">아직 에이전트가 없습니다. 아래에서 추가하세요.</div>';
+}
+function renderManual(){
+  $('#mlist').innerHTML=manualRows();
+  const p=manualPlan();
+  $('#npprev').innerHTML=p?planHtml(p):'<div class="vd">에이전트를 1명 이상 추가하면 미리보기가 나옵니다.</div>';
+}
+async function initNewProj(){
+  if(!presets.length)presets=(await api('/api/presets')).presets;
+  newPlan=presets[0].plan;manual=[];
+  $('#v-newproj').innerHTML='<div class="card"><h2>새 프로젝트</h2>'
+    +'<label class="lb">프로젝트 이름<input type="text" id="npn" maxlength="40" placeholder="예: 블로그 자동화"></label>'
+    +'<label class="lb">설명<textarea id="npd" placeholder="어떤 작업을 하는 프로젝트인지 적어주세요"></textarea></label>'
+    +'<label class="lb">에이전트 구성 방법<select id="npmode">'
+    +'<option value="preset">프리셋에서 고르기 (토큰 안 듦)</option>'
+    +'<option value="ai">AI 추천 받기 (호출 1회)</option>'
+    +'<option value="manual">직접 만들기 (내가 역할을 정함)</option></select></label>'
+    +'<div id="npbody"></div><div id="npprev"></div>'
+    +'<label class="chk" style="margin-top:12px"><input type="checkbox" id="npauto"><span>요청마다 AI가 단계를 다시 설계<small>등록한 에이전트 중에서 요청에 맞게 골라 씁니다. 위 구성은 설계 실패 시 쓰는 대체용이 됩니다.</small></span></label>'
+    +'<div class="row" style="margin-top:12px"><button class="pri" id="npgo">프로젝트 만들기</button><button id="npcancel">취소</button></div></div>'
+    +'<div id="imppanel"></div>';
+  $('#npmode').onchange=e=>npBody(e.target.value);
+  npBody('preset');
+  $('#npgo').onclick=async()=>{
+    const mode=$('#npmode').value;
+    let plan=mode==='manual'?manualPlan():newPlan;
+    if(!plan){toast('에이전트를 1명 이상 추가하세요');return}
+    try{const r=await post('/api/projects',{name:$('#npn').value,description:$('#npd').value,plan:plan,stage_mode:$('#npauto').checked?'auto':'fixed'});
+      toast('프로젝트를 만들었습니다');cur=r.id;try{localStorage.setItem('cur',r.id)}catch(e){}await loadProjects();view='agents';setView('agents')}catch(e){toast(e.message)}
+  };
+  $('#npcancel').onclick=()=>setView('jobs');
+}
+function npBody(mode){
+  const show=note=>{$('#npprev').innerHTML=(note?'<div class="vd">'+esc(note)+'</div>':'')+planHtml(newPlan)};
+  if(mode==='preset'){
+    $('#npbody').innerHTML='<label class="lb">프리셋<select id="nps">'+presetOpts()+'</select></label>';
+    $('#nps').onchange=e=>{newPlan=presets[+e.target.value].plan;show(presets[+e.target.value].desc)};
+    newPlan=presets[0].plan;show(presets[0].desc);
+  }else if(mode==='ai'){
+    $('#npbody').innerHTML='<div class="row">'+countSel('ncs','nca')+'<button id="npai">AI 추천 받기</button></div>'
+      +'<div class="vd">설명을 자세히 적을수록 원하는 에이전트가 나옵니다. 마음에 안 들면 다시 받거나, 만든 뒤 에이전트 화면에서 고치면 됩니다.</div>';
+    $('#npprev').innerHTML='';
+    $('#npai').onclick=async()=>{
+      const d=$('#npd').value.trim();if(!d){toast('설명을 먼저 적어주세요');return}
+      $('#npai').disabled=true;$('#npai').textContent='추천 생성 중...';
+      try{const r=await post('/api/plan',{name:$('#npn').value,description:d,stages:+$('#ncs').value,agents:+$('#nca').value});
+        newPlan=r.plan;show('AI 추천 결과 (사용량: 입력 '+fmtN(r.usage.input)+' · 출력 '+fmtN(r.usage.output)+')')}catch(e){toast(e.message)}
+      $('#npai').disabled=false;$('#npai').textContent='AI 추천 받기';
+    };
+  }else{
+    $('#npbody').innerHTML='<div id="mlist"></div>'
+      +'<div class="row" style="margin-top:8px"><button id="madd">+ 에이전트 추가</button><button id="mimp">기존 에이전트 가져오기</button></div>'
+      +'<div class="vd">맨 아래 에이전트는 앞 결과를 검토하는 역할이 됩니다(2명 이상일 때). 만든 뒤 단계 화면에서 자유롭게 바꿀 수 있습니다.</div>';
+    renderManual();
+    const L=$('#mlist');
+    L.addEventListener('input',e=>{const c=e.target.closest('.sc');if(!c)return;const f=e.target.dataset.f;
+      if(f&&e.target.type!=='checkbox'){manual[+c.dataset.i][f]=e.target.value;if(f==='name'||f==='role')$('#npprev').innerHTML=manualPlan()?planHtml(manualPlan()):''}});
+    L.addEventListener('change',e=>{const c=e.target.closest('.sc');if(!c)return;
+      if(e.target.dataset.f==='web')manual[+c.dataset.i].web=e.target.checked});
+    L.addEventListener('click',e=>{const b=e.target.closest('button[data-a="del"]');if(b){manual.splice(+b.closest('.sc').dataset.i,1);renderManual()}});
+    $('#madd').onclick=()=>{manual.push({name:'',role:'',web:false,model:''});renderManual()};
+    $('#mimp').onclick=()=>importPanel(a=>{manual.push({name:a.name,role:a.role,web:a.web,model:a.model});renderManual();$('#imppanel').innerHTML=''});
+  }
+}
+async function importPanel(onPick){
+  $('#imppanel').innerHTML='<div class="card"><h2>기존 에이전트 가져오기</h2><div class="vd">불러오는 중...</div></div>';
+  let d;try{d=await api('/api/all-agents')}catch(e){toast(e.message);$('#imppanel').innerHTML='';return}
+  if(!d.agents.length){$('#imppanel').innerHTML='<div class="card"><h2>기존 에이전트 가져오기</h2><div class="empty" style="padding:16px">가져올 에이전트가 없습니다</div></div>';return}
+  $('#imppanel').innerHTML='<div class="card"><h2>기존 에이전트 가져오기</h2>'
+    +'<div class="vd" style="margin-bottom:8px">다른 프로젝트의 에이전트를 복사해 옵니다. 복사본이라 고쳐도 원본에는 영향이 없습니다.</div>'
+    +'<div class="jobs" style="margin-top:0;max-height:50vh">'+d.agents.map((a,i)=>'<div class="job" data-i="'+i+'"><div class="t">'+esc(a.name)+' <span class="tag">'+esc(a.pname)+'</span>'+(a.web?' <span class="tag">웹</span>':'')+(a.model?' <span class="tag">'+esc(a.model)+'</span>':'')+'</div><div class="m">'+esc((a.role||'').slice(0,90))+'</div></div>').join('')+'</div>'
+    +'<div class="row" style="margin-top:10px"><button id="impclose">닫기</button></div></div>';
+  $('#imppanel').querySelectorAll('.job').forEach(el=>el.onclick=()=>onPick(d.agents[+el.dataset.i]));
+  $('#impclose').onclick=()=>{$('#imppanel').innerHTML=''};
+  $('#imppanel').scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+
+/* ---------- 폴링 ---------- */
+async function tick(force){
+  if(document.hidden&&!force)return;
+  try{await loadProjects();if(view==='jobs'){await loadList();await loadDetail(force)}}catch(e){}
+}
+setInterval(()=>{tickN++;if(P.some(p=>p.active>0)||tickN%3===0)tick(false)},3000);
+loadProjects().then(()=>setView(cur?'jobs':'newproj')).catch(e=>toast(e.message));
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    main()

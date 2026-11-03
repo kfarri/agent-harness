@@ -1,0 +1,760 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>에이전트 하네스</title>
+<style>
+:root{--bg:#f6f5f2;--panel:#fff;--ink:#1d1d1b;--mute:#6b6a65;--line:#e4e2dc;--accent:#2f5d50;--accent-ink:#fff;--ok:#2f7d4f;--warn:#b7791f;--err:#b83232;--chip:#eeece6}
+@media (prefers-color-scheme:dark){:root{--bg:#171715;--panel:#201f1d;--ink:#ecebe6;--mute:#9a988f;--line:#34332f;--accent:#7fb7a4;--accent-ink:#10201a;--ok:#6fcf97;--warn:#e0b050;--err:#ef7a7a;--chip:#2a2926}}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,"Apple SD Gothic Neo","Noto Sans KR","Malgun Gothic",system-ui,sans-serif}
+header{display:flex;align-items:center;gap:14px;padding:10px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{font-size:16px;margin:0;font-weight:700;white-space:nowrap}
+header .sp{flex:1}
+header .q{color:var(--mute);font-size:13px;white-space:nowrap}
+.ptabs{display:flex;gap:6px;overflow:auto;padding:2px}
+.ptab{white-space:nowrap;border:1px solid var(--line);background:var(--bg);color:var(--ink);padding:6px 14px;border-radius:99px;font-weight:600;font-size:14px}
+.ptab.on{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.ptab i{font-style:normal;font-size:11px;margin-left:6px;padding:0 6px;border-radius:99px;background:color-mix(in srgb,var(--ink) 14%,transparent)}
+.ptab i.w{background:var(--warn);color:#fff}
+.ptab.add{border-style:dashed;color:var(--mute);background:none}
+.subnav{display:flex;align-items:center;gap:4px;padding:6px 20px;border-bottom:1px solid var(--line);background:var(--panel);overflow-x:auto}
+.nv{border:0;background:none;color:var(--mute);padding:6px 14px;border-radius:8px;font-weight:600;white-space:nowrap;flex:none}
+.nv.on{background:var(--chip);color:var(--ink)}
+.pdesc{margin-left:12px;color:var(--mute);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wrap{display:grid;grid-template-columns:320px minmax(0,1fr);gap:16px;padding:16px 20px;max-width:1280px;margin:0 auto}
+.page{padding:16px 20px;max-width:900px;margin:0 auto}
+@media (max-width:860px){.wrap{grid-template-columns:minmax(0,1fr);padding:12px}.page{padding:12px}header{padding:10px 12px}.subnav{padding:6px 12px}.pdesc{display:none}header h1{font-size:14px}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+.card+.card{margin-top:12px}
+.card h2{font-size:13px;margin:0 0 10px;color:var(--mute);font-weight:600;letter-spacing:.02em}
+textarea,select,input[type=text]{width:100%;font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+textarea{min-height:92px;resize:vertical}
+button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 14px}
+button.pri{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+button.dng{color:var(--err);border-color:var(--err)}
+button:disabled{opacity:.5;cursor:default}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.jobs{display:flex;flex-direction:column;gap:6px;margin-top:12px;max-height:60vh;overflow:auto}
+.job{padding:10px 11px;border:1px solid var(--line);border-radius:10px;cursor:pointer;background:var(--panel)}
+.job:hover{border-color:var(--accent)}
+.job.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+.job .t{font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.job .m{display:flex;gap:8px;align-items:center;color:var(--mute);font-size:12px;margin-top:3px;flex-wrap:wrap}
+.chip{display:inline-block;padding:1px 9px;border-radius:99px;font-size:12px;background:var(--chip);color:var(--mute);font-weight:600}
+.chip.running{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
+.chip.awaiting_user{background:color-mix(in srgb,var(--warn) 22%,transparent);color:var(--warn)}
+.chip.approved{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok)}
+.chip.failed,.chip.cancelled{background:color-mix(in srgb,var(--err) 18%,transparent);color:var(--err)}
+.empty{color:var(--mute);text-align:center;padding:60px 10px}
+.title{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:4px}
+.title h2{font-size:18px;margin:0;color:var(--ink)}
+.usage{font-size:12px;color:var(--mute);margin:2px 0 4px}
+.steps{display:flex;gap:6px;margin:12px 0;flex-wrap:wrap}
+.step{flex:1;min-width:92px;padding:8px 10px;border-radius:10px;border:1px solid var(--line);font-size:13px;background:var(--bg)}
+.step b{display:block;font-size:13px}
+.step span{color:var(--mute);font-size:12px}
+.step.done{border-color:var(--ok)}.step.done b::before{content:"✓ ";color:var(--ok)}
+.step.active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,var(--panel))}
+.step.active b::before{content:"● ";color:var(--accent);animation:p 1.2s infinite}
+.step.err{border-color:var(--err)}.step.err b::before{content:"✕ ";color:var(--err)}
+@keyframes p{50%{opacity:.3}}
+.approve{border:1px solid var(--warn);background:color-mix(in srgb,var(--warn) 8%,var(--panel));margin:10px 0}
+.approve h3{margin:0 0 6px;font-size:15px}
+.approve .sub{color:var(--mute);font-size:13px;margin-bottom:10px}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-top:14px;overflow:auto}
+.tab{padding:8px 12px;border:0;border-bottom:2px solid transparent;border-radius:0;background:none;color:var(--mute);white-space:nowrap}
+.tab.on{color:var(--ink);border-bottom-color:var(--accent);font-weight:600}
+.tab.none{opacity:.4}
+.doc{padding:14px 4px;max-height:58vh;overflow:auto}
+.doc h2,.doc h3,.doc h4,.doc h5{margin:1.1em 0 .4em;line-height:1.35;color:var(--ink);letter-spacing:0}
+.doc h2{font-size:20px}.doc h3{font-size:17px}.doc h4{font-size:15px}
+.doc p{margin:.5em 0}.doc ul{padding-left:20px}
+.doc code{background:var(--chip);padding:1px 5px;border-radius:4px;font-size:.92em}
+.doc pre{background:var(--chip);padding:10px;border-radius:8px;overflow:auto}
+.doc blockquote{margin:.6em 0;padding:2px 12px;border-left:3px solid var(--line);color:var(--mute)}
+.doc table{border-collapse:collapse;margin:.6em 0;font-size:14px}.doc td,.doc th{border:1px solid var(--line);padding:5px 9px}
+.doc a{color:var(--accent)}
+.doc hr{border:0;border-top:1px solid var(--line);margin:1em 0}
+.vd{font-size:13px;margin:4px 0;color:var(--mute)}
+.ev{margin-top:14px}
+.ev div{display:flex;gap:10px;font-size:13px;padding:3px 0;color:var(--mute)}
+.ev .ts{font-variant-numeric:tabular-nums;flex:none}
+.ev .ag{flex:none;min-width:48px;font-weight:600;color:var(--ink)}
+.ev .ok .mg{color:var(--ok)}.ev .warn .mg{color:var(--warn)}.ev .err .mg{color:var(--err)}
+.err-box{color:var(--err);font-size:13px;margin:6px 0;white-space:pre-wrap}
+label.lb{display:block;font-size:13px;color:var(--mute);margin:0 0 10px}
+label.lb select,label.lb input,label.lb textarea{display:block;margin-top:4px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;min-height:260px;line-height:1.55}
+.warnbox{border:1px solid var(--warn);background:color-mix(in srgb,var(--warn) 9%,var(--panel));border-radius:10px;padding:10px 14px;margin:10px 0;font-size:13px}
+.warnbox ul{margin:6px 0;padding-left:18px}
+.chk{display:flex;gap:8px;align-items:flex-start;margin:8px 0;font-size:14px}
+.chk input{margin-top:5px}
+.chk small{display:block;color:var(--mute);font-size:12px}
+.badges{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 12px}
+.tag{display:inline-block;font-size:11px;padding:0 7px;border-radius:6px;background:var(--chip);color:var(--mute);font-weight:600}
+.plan{border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:10px 0;background:var(--bg)}
+.plan .ph{font-size:12px;font-weight:700;color:var(--mute);margin:8px 0 4px}
+.plan .pa{margin:4px 0}
+.pst{margin:4px 0;padding-left:20px}.pst li{margin:6px 0}
+.sc{border:1px solid var(--line);border-radius:10px;margin:10px 0;background:var(--bg)}
+.sc.off{opacity:.6}
+.sch{display:flex;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.sch input[type=text]{flex:1;min-width:120px;width:auto}
+.sch select{width:auto}
+.sch button{padding:4px 10px}
+.sch b{width:22px;height:22px;border-radius:50%;background:var(--accent);color:var(--accent-ink);display:inline-flex;align-items:center;justify-content:center;font-size:12px}
+.inl{display:flex;gap:5px;align-items:center;font-size:13px;color:var(--mute);white-space:nowrap}
+.scb{padding:10px 12px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media (max-width:600px){.g2{grid-template-columns:1fr}}
+.ins{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 10px;font-size:13px}
+table.ut{border-collapse:collapse;width:100%;font-size:13px}.ut td,.ut th{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left}
+.tip{font-size:13px;color:var(--mute)}.tip li{margin:4px 0}
+#toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:9px 16px;border-radius:99px;font-size:13px;opacity:0;transition:.2s;pointer-events:none;max-width:90vw}
+#toast.show{opacity:1}
+</style>
+</head>
+<body>
+<header><h1>에이전트 하네스</h1><div class="ptabs" id="ptabs"></div><div class="sp"></div><div class="q" id="qinfo"></div><a class="q" href="/logout" style="color:var(--mute);margin-left:12px">로그아웃</a></header>
+<div class="subnav" id="subnav" hidden>
+  <button class="nv on" data-v="jobs">작업</button><button class="nv" data-v="agents">에이전트</button><button class="nv" data-v="sources">자료</button><button class="nv" data-v="stages">단계</button><button class="nv" data-v="sched">예약</button><button class="nv" data-v="settings">설정</button>
+  <span class="pdesc" id="pdesc"></span>
+</div>
+
+<div class="wrap" id="v-jobs">
+  <aside>
+    <div class="card">
+      <h2>새 작업 요청</h2>
+      <textarea id="req" placeholder="요청 내용을 입력하세요"></textarea>
+      <div class="row" style="margin-top:8px"><button class="pri" id="go">작업 시작</button></div>
+    </div>
+    <div class="jobs" id="jobs"></div>
+  </aside>
+  <main class="card" id="main"><div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div></main>
+</div>
+
+<div class="wrap" id="v-agents" hidden>
+  <aside>
+    <div class="card">
+      <h2>이 프로젝트의 에이전트</h2>
+      <div class="jobs" id="alist" style="margin-top:0;max-height:none"></div>
+      <div class="row" style="margin-top:10px"><button class="pri" id="anew">+ 새 에이전트</button><button id="aimp">가져오기</button></div>
+      <div class="row" style="margin-top:6px"><button id="arenall">전체 폴더 이름 정리</button></div>
+    </div>
+  </aside>
+  <main><div class="card" id="aedit"><div class="empty">왼쪽에서 에이전트를 선택하세요.</div></div><div id="imppanel2"></div></main>
+</div>
+
+<div class="page" id="v-sources" hidden></div>
+<div class="page" id="v-stages" hidden></div>
+<div class="page" id="v-sched" hidden></div>
+<div class="page" id="v-settings" hidden></div>
+<div class="page" id="v-newproj" hidden></div>
+<div id="toast"></div>
+
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const STATUS={queued:'대기',running:'진행 중',awaiting_user:'승인 대기',approved:'승인 완료',failed:'실패',cancelled:'중단'};
+const AG={system:'시스템',user:'나'};
+let P=[],cur=null,view='jobs',settings={},flags={},presets=[],pj=null;
+let sel=null,tab=null,tabPinned=false,last={},busy=false,tickN=0;
+
+function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>t.classList.remove('show'),2600)}
+async function api(path,opt){
+  const r=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'},credentials:'same-origin'},opt||{}));
+  if(r.status===401){location.href='/login';throw new Error('로그인이 필요합니다')}
+  let d={};try{d=await r.json()}catch(e){}
+  if(!r.ok)throw new Error(d.error||r.statusText);
+  return d;
+}
+const post=(path,obj)=>api(path,{method:'POST',body:JSON.stringify(obj||{})});
+const base=()=>'/api/projects/'+encodeURIComponent(cur);
+const fmtN=n=>{n=+n||0;return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(n)};
+const newTok=u=>(+u.input||0)+(+u.output||0)+(+u.cache_write||0);
+function usageLine(u){
+  if(!u||!u.calls)return '아직 사용량 없음';
+  return '호출 '+u.calls+'회 · 입력 '+fmtN(u.input)+' · 출력 '+fmtN(u.output)+' · 캐시 쓰기 '+fmtN(u.cache_write)+' · 캐시 읽기 '+fmtN(u.cache_read)+(u.cost?' · 추정 $'+(+u.cost).toFixed(3):'');
+}
+
+/* ---------- 마크다운 ---------- */
+function md(src){
+  const lines=esc(src).split('\n');let out='',code=false,list=false,para=[],tbl=[];
+  const inl=t=>t.replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>').replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  const fp=()=>{if(para.length){out+='<p>'+inl(para.join(' '))+'</p>';para=[]}};
+  const fl=()=>{if(list){out+='</ul>';list=false}};
+  const ft=()=>{if(tbl.length){const rows=tbl.filter(r=>!/^\s*\|?\s*:?-{2,}/.test(r));out+='<table>'+rows.map((r,i)=>'<tr>'+r.replace(/^\s*\||\|\s*$/g,'').split('|').map(c=>(i?'<td>':'<th>')+inl(c.trim())+(i?'</td>':'</th>')).join('')+'</tr>').join('')+'</table>';tbl=[]}};
+  for(const l of lines){
+    if(l.startsWith('```')){fp();fl();ft();out+=code?'</pre>':'<pre>';code=!code;continue}
+    if(code){out+=l+'\n';continue}
+    let m;
+    if(/^\s*\|/.test(l)){fp();fl();tbl.push(l);continue}else ft();
+    if(/^\s*(-{3,}|\*{3,})\s*$/.test(l)){fp();fl();out+='<hr>';continue}
+    if(m=l.match(/^(#{1,4})\s+(.*)$/)){fp();fl();const n=Math.min(m[1].length+1,5);out+='<h'+n+'>'+inl(m[2])+'</h'+n+'>'}
+    else if(m=l.match(/^\s*[-*]\s+(.*)$/)){fp();if(!list){out+='<ul>';list=true}out+='<li>'+inl(m[1])+'</li>'}
+    else if(m=l.match(/^&gt;\s?(.*)$/)){fp();fl();out+='<blockquote>'+inl(m[1])+'</blockquote>'}
+    else if(!l.trim()){fp();fl()}
+    else{fl();para.push(l)}
+  }
+  fp();fl();ft();if(code)out+='</pre>';return out;
+}
+const verdictOf=t=>{const m=(t||'').slice(0,600).match(/VERDICT:\s*(APPROVE|REVISE)/i);return m?m[1].toUpperCase():null};
+const stripV=t=>(t||'').replace(/^\s*VERDICT:.*\n?/i,'');
+
+/* ---------- 프로젝트 / 화면 전환 ---------- */
+async function loadProjects(){
+  const d=await api('/api/projects');
+  P=d.projects;settings=d.settings;flags=d.flags;
+  if(!cur||!P.find(p=>p.id===cur)){let s=null;try{s=localStorage.getItem('cur')}catch(e){}cur=(P.find(p=>p.id===s)||P[0]||{}).id||null}
+  const q=d.queue;$('#qinfo').textContent=[q.running?'실행 '+q.running:'',q.waiting?'대기 '+q.waiting:''].filter(Boolean).join(' · ');
+  $('#ptabs').innerHTML=P.map(p=>'<button class="ptab'+(p.id===cur?' on':'')+'" data-id="'+esc(p.id)+'">'+esc(p.name)+(p.active?'<i>'+p.active+'</i>':'')+(p.awaiting?'<i class="w">승인 '+p.awaiting+'</i>':'')+'</button>').join('')+'<button class="ptab add" id="padd">+ 프로젝트</button>';
+  const c=P.find(p=>p.id===cur);$('#pdesc').textContent=c?(c.description||''):'';
+}
+function setView(v){
+  view=v;
+  document.querySelectorAll('#subnav .nv').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
+  ['jobs','agents','sources','stages','sched','settings','newproj'].forEach(x=>{$('#v-'+x).hidden=x!==v});
+  $('#subnav').hidden=v==='newproj'||!cur;
+  last={};
+  if(v==='jobs'){loadList().then(()=>sel&&loadDetail(true)).catch(()=>{})}
+  if(v==='agents')loadAgents().catch(e=>toast(e.message));
+  if(v==='sources')loadSources().catch(e=>toast(e.message));
+  if(v==='stages')loadStages().catch(e=>toast(e.message));
+  if(v==='sched')loadSched().catch(e=>toast(e.message));
+  if(v==='settings')loadSettings().catch(e=>toast(e.message));
+  if(v==='newproj')initNewProj().catch(e=>toast(e.message));
+}
+function switchProject(id){
+  cur=id;try{localStorage.setItem('cur',id)}catch(e){}
+  sel=null;last={};selAgent=null;
+  $('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>';
+  $('#aedit').innerHTML='<div class="empty">왼쪽에서 에이전트를 선택하세요.</div>';
+  loadProjects().then(()=>setView(view==='newproj'?'jobs':view));
+}
+$('#ptabs').onclick=e=>{
+  if(e.target.closest('#padd')){setView('newproj');return}
+  const b=e.target.closest('.ptab');if(b)switchProject(b.dataset.id);
+};
+document.querySelectorAll('#subnav .nv').forEach(b=>b.onclick=()=>setView(b.dataset.v));
+
+/* ---------- 작업 ---------- */
+async function loadList(){
+  if(!cur)return;
+  const d=await api(base()+'/jobs');
+  const h=d.jobs.map(j=>'<div class="job'+(j.id===sel?' sel':'')+'" data-id="'+esc(j.id)+'"><div class="t">'+esc(j.title)+'</div><div class="m"><span class="chip '+j.status+'">'+STATUS[j.status]+'</span><span>'+esc(j.created.slice(5,16))+'</span>'+(j.tokens?'<span>토큰 '+fmtN(j.tokens)+'</span>':'')+'</div></div>').join('');
+  if(h!==last.list){last.list=h;$('#jobs').innerHTML=h||'<div class="empty" style="padding:20px">아직 작업이 없습니다</div>'}
+}
+async function loadDetail(force){
+  if(!sel||!cur||view!=='jobs')return;
+  let d;try{d=await api(base()+'/jobs/'+encodeURIComponent(sel))}catch(e){return}
+  const j=d.job,f=d.files,stg=d.stages.filter(s=>s.enabled);
+  const steps=stg.map(s=>[s.id,s.name,s.agent]).concat([['user','최종 승인','나']]);
+  const keys=steps.map(s=>s[0]);
+  if(!tabPinned){const w=d.stages.slice().reverse().find(s=>s.kind==='work'&&f[s.id]!=null);tab=f.final?'final':(w?w.id:'request')}
+  const nS=stg.length;
+  const ci=j.status==='awaiting_user'?nS:j.status==='approved'?nS+1:Math.max(0,keys.indexOf(j.step));
+  const st=i=>i<ci?'done':i===ci?((j.status==='failed'||j.status==='cancelled')?'err':(j.status==='running'||j.status==='awaiting_user')?'active':'wait'):'wait';
+  const u=j.usage||{};
+  const bys=Object.entries(u.by_stage||{}).map(([k,v])=>{const s=d.stages.find(x=>x.id===k);return esc(s?s.name:(k==='plan'?'자동 구성':k))+' '+fmtN(newTok(v))}).join(' · ');
+  const srcL={telegram:'텔레그램',schedule:'예약 실행'}[j.source];
+  const head='<div class="title"><h2>'+esc(j.title)+'</h2><span class="chip '+j.status+'">'+STATUS[j.status]+'</span>'+(srcL?'<span class="chip">'+srcL+'</span>':'')+(j.auto_approve?'<span class="chip">자동 승인</span>':'')+(d.auto_planned?'<span class="chip approved">자동 구성</span>':'')+'</div>'
+    +'<div class="usage">'+esc(usageLine(u))+(d.limit?' · 작업 한도 '+fmtN(d.limit)+' 중 새 토큰 '+fmtN(newTok(u)):'')+'</div>'
+    +(bys?'<div class="usage">단계별 새 토큰: '+bys+'</div>':'')
+    +'<div class="steps">'+steps.map((s,i)=>'<div class="step '+st(i)+'"><b>'+esc(s[1])+'</b><span>'+esc(s[2])+'</span></div>').join('')+'</div>'
+    +(j.error?'<div class="err-box">'+esc(j.error)+'</div>':'');
+  const evh='<div class="ev">'+j.events.slice().reverse().map(e=>'<div class="'+e.kind+'"><span class="ts">'+esc((e.ts||'').slice(11,19))+'</span><span class="ag">'+esc(AG[e.agent]||e.agent)+'</span><span class="mg">'+esc(e.msg)+'</span></div>').join('')+'</div>';
+  const actKey=j.id+'|'+j.status;
+  if(last.act!==actKey||force){
+    last.act=actKey;
+    const works=stg.filter(s=>s.kind==='work');
+    const opts='<option value="first">처음부터</option>'+works.map((s,i)=>'<option value="'+esc(s.id)+'"'+(i===works.length-1&&works.length>1?' selected':'')+'>'+esc(s.name)+'부터</option>').join('');
+    let act='';
+    if(j.status==='awaiting_user'){
+      const lastRev=stg.slice().reverse().find(s=>s.kind==='review'&&f[s.id]!=null);
+      const rv=lastRev?verdictOf(f[lastRev.id]):'APPROVE';
+      act='<div class="card approve"><h3>최종 승인이 필요합니다</h3><div class="sub">'+(rv==='APPROVE'?'검토를 통과한 결과물입니다.':'검토 단계의 수정요청이 남은 상태입니다. 해당 탭에서 내용을 확인하세요.')+' 승인하면 outbox에 approved 파일로 저장됩니다.</div>'
+        +'<div class="row"><button class="pri" id="ap">최종 승인</button></div><hr style="border:0;border-top:1px solid var(--line);margin:12px 0">'
+        +'<textarea id="fb" placeholder="수정이 필요하면 요청 내용을 적어주세요"></textarea>'
+        +'<div class="row" style="margin-top:8px"><select id="st" style="width:auto">'+opts+'</select><button id="rj">반려하고 다시 작업</button></div></div>';
+    }else if(j.status==='running'||j.status==='queued'){
+      act='<div class="row" style="margin:10px 0"><button class="dng" id="cn">작업 중단</button></div>';
+    }else if(j.status==='failed'||j.status==='cancelled'){
+      act='<div class="row" style="margin:10px 0"><select id="st" style="width:auto">'+opts.replace(' selected','')+'</select><button class="pri" id="rt">다시 시도</button></div>';
+    }else if(j.status==='approved'){
+      act='<div class="vd">승인 완료: shared/outbox/approved_'+esc(j.id)+'.md</div>';
+    }
+    $('#act').innerHTML=act;bindJob(j);
+  }
+  const tdef=[['final','최종본']].concat(d.stages.slice().reverse().map(s=>[s.id,s.name+(s.kind==='review'?' (검토)':'')+(s.enabled?'':' ·꺼짐')])).concat([['request','요청']]);
+  const tabsH='<div class="tabs">'+tdef.map(t=>'<button class="tab'+(tab===t[0]?' on':'')+(f[t[0]]!=null?'':' none')+'" data-t="'+esc(t[0])+'">'+esc(t[1])+'</button>').join('')+'</div>';
+  const txt=f[tab];const ts=d.stages.find(s=>s.id===tab);const isRev=ts&&ts.kind==='review';
+  let vd='';if(isRev){const v=verdictOf(txt);if(v)vd='<div class="vd">판정: <b>'+(v==='APPROVE'?'승인':'수정요청')+'</b></div>'}
+  const docH=txt==null?'<div class="empty" style="padding:30px">아직 만들어지지 않았습니다</div>':vd+md(isRev?stripV(txt):txt);
+  const sig=JSON.stringify([head,evh,tabsH,docH]);
+  if(last.sig!==sig||force){
+    const keep=$('.doc')?$('.doc').scrollTop:0;
+    $('#hd').innerHTML=head;$('#tb').innerHTML=tabsH;$('#ev').innerHTML=evh;
+    const dc=$('.doc');dc.innerHTML=docH;if(last.sel===sel&&last.tab===tab)dc.scrollTop=keep;
+    last.sig=sig;last.sel=sel;last.tab=tab;
+  }
+}
+function bindJob(j){
+  const q=s=>$(s);
+  const run=async(fn,msg)=>{if(busy)return;busy=true;try{await fn();toast(msg);last.act=null;await tick(true)}catch(e){toast(e.message)}busy=false};
+  const url=base()+'/jobs/'+j.id;
+  if(q('#ap'))q('#ap').onclick=()=>{if(confirm('이 결과물을 최종 승인할까요?'))run(()=>post(url+'/approve'),'승인되었습니다')};
+  if(q('#rj'))q('#rj').onclick=()=>{const fb=q('#fb').value.trim();if(!fb){toast('수정 요청 내용을 적어주세요');return}run(()=>post(url+'/restart',{feedback:fb,start:q('#st').value}),'다시 작업을 시작합니다')};
+  if(q('#rt'))q('#rt').onclick=()=>run(()=>post(url+'/restart',{start:q('#st').value}),'다시 시작합니다');
+  if(q('#cn'))q('#cn').onclick=()=>{if(confirm('작업을 중단할까요?'))run(()=>post(url+'/cancel'),'중단 요청')};
+}
+function selectJob(id){
+  sel=id;tab=null;tabPinned=false;last={list:last.list};
+  $('#main').innerHTML='<div id="hd"></div><div id="act"></div><div id="tb"></div><div class="doc"></div><h2 style="margin:16px 0 0;font-size:13px;color:var(--mute)">진행 기록</h2><div id="ev"></div>';
+  $('#tb').onclick=e=>{const b=e.target.closest('.tab');if(b){tab=b.dataset.t;tabPinned=true;loadDetail(true)}};
+  tick(true);
+}
+$('#jobs').onclick=e=>{const j=e.target.closest('.job');if(j)selectJob(j.dataset.id)};
+$('#go').onclick=async()=>{
+  const t=$('#req').value.trim();if(!t){toast('요청 내용을 입력하세요');return}
+  try{const j=await post(base()+'/jobs',{request:t});$('#req').value='';await loadList();selectJob(j.id)}catch(e){toast(e.message)}
+};
+
+/* ---------- 에이전트 ---------- */
+let selAgent=null;
+async function loadAgents(){
+  pj=await api(base());
+  $('#alist').innerHTML=pj.agents.map(a=>'<div class="job'+(a.id===selAgent?' sel':'')+'" data-id="'+esc(a.id)+'"><div class="t">'+esc(a.name)+'</div><div class="m"><span>'+esc(a.workspace)+'</span>'+(a.problems.length?'<span class="chip failed">설정 확인</span>':'<span class="chip approved">정상</span>')+'</div></div>').join('')||'<div class="empty" style="padding:16px">에이전트가 없습니다</div>';
+}
+function permsHtml(p){
+  return '<label class="chk"><input type="checkbox" id="pweb"'+(p.web?' checked':'')+'><span>웹 검색·페이지 읽기 허용<small>인터넷 자료가 필요한 역할만 켜세요</small></span></label>'
+    +'<label class="chk"><input type="checkbox" id="pbash"'+(p.bash?' checked':'')+'><span>셸 명령 실행 허용 (Bash)<small>주의: 켜면 에이전트가 파이에서 명령을 실행할 수 있습니다. sudo와 rm은 계속 막힙니다</small></span></label>';
+}
+async function openAgent(id){
+  selAgent=id;
+  const a=await api(base()+'/agents/'+encodeURIComponent(id));
+  const warn=a.problems.length?'<div class="warnbox"><b>확인이 필요합니다</b><ul>'+a.problems.map(p=>'<li>'+esc(p)+'</li>').join('')+'</ul>아래 [저장]을 누르면 기본 권한 설정을 만들고 폴더 신뢰도 등록합니다.</div>':'';
+  const st=a.stages.length?a.stages.map(s=>'<span class="chip running">'+esc(s)+'</span>').join(''):'<span class="chip">담당 단계 없음</span>';
+  $('#aedit').innerHTML='<div class="title"><h2>'+esc(a.name)+'</h2></div><div class="badges"><span class="chip">'+esc(a.workspace)+'</span>'+st+'</div>'+warn
+    +'<div class="g2"><label class="lb">이름<input type="text" id="an" maxlength="30" value="'+esc(a.name)+'"></label>'
+    +'<label class="lb">모델 (비우면 기본값. 예: haiku, sonnet, opus)<input type="text" id="am" value="'+esc(a.model)+'" placeholder="기본값"></label></div>'
+    +permsHtml(a.perms)
+    +'<label class="lb" style="margin-top:10px">역할 설명 (CLAUDE.md)'+(a.has_md?'':' - 아직 없어서 기본 틀을 채웠습니다')+'<textarea id="amd" class="mono" spellcheck="false">'+esc(a.claude_md)+'</textarea></label>'
+    +'<div class="vd">저장하면 이전 내용은 shared/history/_agents 에 백업됩니다. 권한 설정(settings.json)은 위 체크박스 기준으로 다시 만들어집니다.</div>'
+    +'<div class="row" style="margin-top:10px"><button class="pri" id="asave">저장</button><button id="aren">폴더 이름 정리</button><button class="dng" id="adel">목록에서 제거</button></div>';
+  $('#aren').onclick=async()=>{
+    try{const r=await post(base()+'/agents/'+id+'/rename-folder');
+      toast(r.changed?('폴더 이름을 "'+r.workspace+'"로 바꿨습니다'):'이미 정리되어 있습니다');
+      await loadAgents();await openAgent(id)}catch(e){toast(e.message)}
+  };
+  $('#asave').onclick=async()=>{
+    try{const r=await post(base()+'/agents/'+id+'/save',{name:$('#an').value,model:$('#am').value,claude_md:$('#amd').value,perms:{web:$('#pweb').checked,bash:$('#pbash').checked}});
+      toast(r.warning||'저장했습니다');await loadAgents();await openAgent(id)}catch(e){toast(e.message)}
+  };
+  $('#adel').onclick=async()=>{
+    if(!confirm('이 에이전트를 목록에서 제거할까요? 폴더와 파일은 지워지지 않습니다.'))return;
+    try{await post(base()+'/agents/'+id+'/remove');selAgent=null;$('#aedit').innerHTML='<div class="empty">제거했습니다.</div>';toast('목록에서 제거했습니다');await loadAgents()}catch(e){toast(e.message)}
+  };
+  loadAgents();
+}
+function newAgentForm(){
+  selAgent=null;
+  $('#aedit').innerHTML='<div class="title"><h2>새 에이전트</h2></div>'
+    +'<div class="g2"><label class="lb">이름<input type="text" id="nn" maxlength="30" placeholder="예: 번역가"></label>'
+    +'<label class="lb">모델 (선택)<input type="text" id="nm" placeholder="기본값"></label></div>'
+    +'<label class="lb">역할 설명 (나중에 자유롭게 고칠 수 있습니다)<textarea id="nd" placeholder="예: 완성된 글을 영어로 번역한다."></textarea></label>'
+    +permsHtml({web:false,bash:false})
+    +'<label class="lb">이미 만들어 둔 폴더를 연결하려면 폴더 이름 입력 (선택)<input type="text" id="nw" placeholder="비워 두면 새 폴더를 자동으로 만듭니다"></label>'
+    +'<div class="row"><button class="pri" id="ncreate">에이전트 만들기</button></div>';
+  $('#ncreate').onclick=async()=>{
+    try{const r=await post(base()+'/agents',{name:$('#nn').value,model:$('#nm').value,description:$('#nd').value,workspace:$('#nw').value,perms:{web:$('#pweb').checked,bash:$('#pbash').checked}});
+      toast(r.warning||'만들었습니다');await loadAgents();await openAgent(r.agent.id)}catch(e){toast(e.message)}
+  };
+  loadAgents();
+}
+$('#alist').onclick=e=>{const j=e.target.closest('.job');if(j)openAgent(j.dataset.id).catch(x=>toast(x.message))};
+$('#anew').onclick=newAgentForm;
+$('#arenall').onclick=async()=>{
+  if(!confirm('이 프로젝트의 모든 에이전트 폴더 이름을 정리할까요? 실행 중인 작업이 없을 때만 됩니다.'))return;
+  try{const r=await post(base()+'/agents/rename-all');
+    const n=r.results.filter(x=>x.changed).length;
+    toast(n?n+'개 폴더 이름을 정리했습니다':'이미 전부 정리되어 있습니다');
+    await loadAgents();if(selAgent)await openAgent(selAgent)}catch(e){toast(e.message)}
+};
+$('#aimp').onclick=async()=>{
+  const host=$('#imppanel2');
+  host.innerHTML='<div class="card"><h2>기존 에이전트 가져오기</h2><div class="vd">불러오는 중...</div></div>';
+  let d;try{d=await api('/api/all-agents')}catch(e){toast(e.message);host.innerHTML='';return}
+  const list=d.agents.filter(a=>a.pid!==cur);
+  if(!list.length){host.innerHTML='<div class="card"><h2>기존 에이전트 가져오기</h2><div class="empty" style="padding:16px">다른 프로젝트에 가져올 에이전트가 없습니다</div></div>';return}
+  host.innerHTML='<div class="card"><h2>기존 에이전트 가져오기</h2>'
+    +'<div class="vd" style="margin-bottom:8px">선택하면 이 프로젝트로 복사됩니다. 복사본이라 고쳐도 원본에는 영향이 없습니다.</div>'
+    +'<div class="jobs" style="margin-top:0;max-height:50vh">'+list.map((a,i)=>'<div class="job" data-i="'+i+'"><div class="t">'+esc(a.name)+' <span class="tag">'+esc(a.pname)+'</span>'+(a.web?' <span class="tag">웹</span>':'')+(a.model?' <span class="tag">'+esc(a.model)+'</span>':'')+'</div><div class="m">'+esc((a.role||'').slice(0,90))+'</div></div>').join('')+'</div>'
+    +'<div class="row" style="margin-top:10px"><button id="imp2close">닫기</button></div></div>';
+  host.querySelectorAll('.job').forEach(el=>el.onclick=async()=>{
+    const a=list[+el.dataset.i];
+    try{const r=await post(base()+'/agents/import',{from:a.pid,agent:a.id});toast(r.note||'가져왔습니다');host.innerHTML='';await loadAgents();await openAgent(r.agent.id)}catch(e){toast(e.message)}});
+  $('#imp2close').onclick=()=>{host.innerHTML=''};
+};
+
+/* ---------- 구성 추천 (프리셋 / AI) ---------- */
+function planHtml(p){
+  const an={},sn={};p.agents.forEach(a=>an[a.key]=a.name);p.stages.forEach(s=>sn[s.id]=s.name);
+  return '<div class="plan"><div class="ph">에이전트 '+p.agents.length+'명</div>'
+    +p.agents.map(a=>'<div class="pa"><b>'+esc(a.name)+'</b>'+(a.web?' <span class="tag">웹</span>':'')+(a.model?' <span class="tag">'+esc(a.model)+'</span>':'')+'<div class="vd">'+esc(a.role)+'</div></div>').join('')
+    +'<div class="ph">단계 '+p.stages.length+'개 (호출 최소 '+p.stages.length+'회/작업)</div><ol class="pst">'
+    +p.stages.map(s=>'<li><b>'+esc(s.name)+'</b> <span class="tag">'+(s.kind==='review'?'검토':'작업')+'</span> '+esc(an[s.agent]||s.agent)+(s.kind==='review'?' → '+esc(sn[s.target]||'')+' 검토':'')+'<div class="vd">'+esc(s.instruction)+'</div></li>').join('')+'</ol></div>';
+}
+const presetOpts=()=>presets.map((p,i)=>'<option value="'+i+'">'+esc(p.label)+'</option>').join('');
+function countSel(sid,aid){
+  const o=(n,lab)=>'<option value="'+n+'">'+lab+'</option>';
+  return '<label class="inl">단계 수<select id="'+sid+'" style="width:auto">'+o(0,'자동')+[2,3,4,5,6,7,8].map(n=>o(n,n+'개')).join('')+'</select></label>'
+    +'<label class="inl">에이전트 수<select id="'+aid+'" style="width:auto">'+o(0,'자동')+[2,3,4,5,6].map(n=>o(n,n+'명')).join('')+'</select></label>';
+}
+
+/* ---------- 단계 ---------- */
+let ES=[],planCur=null;
+async function loadStages(){
+  pj=await api(base());
+  if(!presets.length)presets=(await api('/api/presets')).presets;
+  ES=JSON.parse(JSON.stringify(pj.stages));planCur=null;
+  const autoNote=pj.stage_mode==='auto'?'<div class="warnbox">이 프로젝트는 <b>요청별 자동 구성</b>으로 설정되어 있습니다. 실제 작업은 매번 AI가 새로 설계한 단계로 실행되고, 아래 구성은 설계가 실패했을 때만 쓰이는 대체용입니다. 고정 구성으로 되돌리려면 설정 화면에서 바꾸세요.</div>':'';
+  $('#v-stages').innerHTML=autoNote+'<div class="card"><h2>단계 추천</h2>'
+    +'<div class="vd" style="margin:0 0 8px">프리셋은 토큰이 들지 않습니다. AI 추천은 1회 호출(토큰 소량 사용)로 프로젝트 설명에 맞는 구성을 제안합니다. 적용 전에 미리보기로 확인하세요.</div>'
+    +'<div class="row"><select id="prs" style="flex:1"><option value="">프리셋 선택...</option>'+presetOpts()+'</select></div>'
+    +'<label class="lb" style="margin-top:10px">AI 추천용 프로젝트 설명<textarea id="pd2" placeholder="어떤 작업을 하는 프로젝트인지 적어주세요">'+esc(pj.description)+'</textarea></label>'
+    +'<div class="row">'+countSel('pcs','pca')+'<button id="paib">AI 추천 받기</button></div><div id="pprev"></div>'
+    +'<div class="row" id="papply" hidden><button class="pri" id="papplyb">이 구성으로 교체</button><span class="vd">기존 단계는 대체되고, 추천 에이전트가 새로 만들어집니다. 기존 에이전트는 그대로 남습니다.</span></div></div>'
+    +'<div class="card"><h2>단계 파이프라인 (위에서 아래로 실행)</h2>'
+    +'<div class="vd" style="margin:0 0 6px">검토 단계가 수정요청(REVISE)을 내면 대상 단계로 돌아가 다시 수행합니다 (프로젝트 설정의 반복 횟수까지). 불필요한 단계는 \'사용\'을 꺼서 토큰을 아낄 수 있습니다.</div>'
+    +'<div id="stlist"></div><div class="row"><button id="stadd">+ 단계 추가</button><button class="pri" id="stsave">저장</button></div></div>';
+  $('#prs').onchange=e=>{const v=e.target.value;if(v===''){return}planCur=presets[+v].plan;showPlan(presets[+v].desc)};
+  $('#paib').onclick=async()=>{
+    const d=$('#pd2').value.trim();if(!d){toast('프로젝트 설명을 적어주세요');return}
+    $('#paib').disabled=true;$('#paib').textContent='추천 생성 중...';
+    try{const r=await post('/api/plan',{name:pj.name,description:d,stages:+$('#pcs').value,agents:+$('#pca').value});planCur=r.plan;showPlan('AI 추천 사용량: 입력 '+fmtN(r.usage.input)+' · 출력 '+fmtN(r.usage.output)+' · 캐시 '+fmtN((+r.usage.cache_write||0)+(+r.usage.cache_read||0)))}catch(e){toast(e.message)}
+    $('#paib').disabled=false;$('#paib').textContent='AI 추천 받기';
+  };
+  $('#papplyb').onclick=async()=>{
+    if(!planCur||!confirm('현재 단계를 이 구성으로 교체할까요?'))return;
+    try{await post(base()+'/apply-plan',{plan:planCur});toast('적용했습니다');await loadProjects();await loadStages()}catch(e){toast(e.message)}
+  };
+  const L=$('#stlist');
+  L.addEventListener('input',e=>{
+    const c=e.target.closest('.sc');if(!c)return;const f=e.target.dataset.f;if(!f||e.target.type==='checkbox')return;
+    if(f==='name'||f==='instruction')ES[+c.dataset.i][f]=e.target.value;
+    else if(f==='max_turns')ES[+c.dataset.i][f]=parseInt(e.target.value)||0;
+  });
+  L.addEventListener('change',e=>{
+    const c=e.target.closest('.sc');if(!c)return;const i=+c.dataset.i,f=e.target.dataset.f;if(!f)return;const s=ES[i];
+    if(f==='enabled'||f==='polish')s[f]=e.target.checked;
+    else if(f==='inputs'){const v=e.target.dataset.v;s.inputs=s.inputs.filter(x=>x!==v);if(e.target.checked)s.inputs.push(v)}
+    else if(f==='kind'){s.kind=e.target.value;if(s.kind==='review'&&!s.target&&i>0)s.target=ES[i-1].id;if(s.kind==='work'){s.target='';s.polish=false}}
+    else if(f==='name'){s.name=e.target.value}
+    else if(f==='max_turns'){s.max_turns=parseInt(e.target.value)||0;return}
+    else s[f]=e.target.value;
+    if(['enabled','kind','name','target'].includes(f))renderStages();
+  });
+  L.addEventListener('click',e=>{
+    const b=e.target.closest('button[data-a]');if(!b)return;const i=+b.closest('.sc').dataset.i,a=b.dataset.a;
+    if(a==='up'&&i>0)[ES[i-1],ES[i]]=[ES[i],ES[i-1]];
+    else if(a==='down'&&i<ES.length-1)[ES[i+1],ES[i]]=[ES[i],ES[i+1]];
+    else if(a==='del'){
+      if(ES.length<=1){toast('단계는 최소 1개가 필요합니다');return}
+      const id=ES[i].id;ES.splice(i,1);
+      ES.forEach((s,k)=>{s.inputs=s.inputs.filter(x=>x!==id);if(s.target===id){s.target=k>0?ES[k-1].id:'';if(!s.target)s.kind='work'}});
+    }
+    renderStages();
+  });
+  $('#stadd').onclick=()=>{
+    const ids=new Set(ES.map(s=>s.id));let n=1;while(ids.has('s'+n))n++;
+    ES.push({id:'s'+n,name:'새 단계',kind:'work',agent:pj.agents[0]?pj.agents[0].id:'',target:'',inputs:[],instruction:'',enabled:true,max_turns:0,polish:false});
+    renderStages();
+  };
+  $('#stsave').onclick=async()=>{
+    try{await post(base()+'/stages',{stages:ES});toast('단계를 저장했습니다');await loadProjects();await loadStages()}catch(e){toast(e.message)}
+  };
+  renderStages();
+}
+function showPlan(note){$('#pprev').innerHTML=(note?'<div class="vd">'+esc(note)+'</div>':'')+planHtml(planCur);$('#papply').hidden=false}
+function renderStages(){
+  const ao=sel_=>pj.agents.map(a=>'<option value="'+esc(a.id)+'"'+(a.id===sel_?' selected':'')+'>'+esc(a.name)+'</option>').join('');
+  $('#stlist').innerHTML=ES.map((s,i)=>{
+    const prev=ES.slice(0,i);
+    return '<div class="sc'+(s.enabled?'':' off')+'" data-i="'+i+'"><div class="sch"><b>'+(i+1)+'</b>'
+      +'<label class="inl"><input type="checkbox" data-f="enabled"'+(s.enabled?' checked':'')+'> 사용</label>'
+      +'<input type="text" data-f="name" value="'+esc(s.name)+'" maxlength="30">'
+      +'<select data-f="kind"><option value="work"'+(s.kind==='work'?' selected':'')+'>작업</option><option value="review"'+(s.kind==='review'?' selected':'')+(i?'':' disabled')+'>검토</option></select>'
+      +'<button data-a="up"'+(i?'':' disabled')+'>↑</button><button data-a="down"'+(i<ES.length-1?'':' disabled')+'>↓</button><button class="dng" data-a="del">삭제</button></div>'
+      +'<div class="scb"><div class="g2"><label class="lb">담당 에이전트<select data-f="agent">'+ao(s.agent)+'</select></label>'
+      +(s.kind==='review'?'<label class="lb">검토 대상 단계<select data-f="target">'+prev.map(p=>'<option value="'+esc(p.id)+'"'+(p.id===s.target?' selected':'')+'>'+esc(p.name)+'</option>').join('')+'</select></label>'
+        :'<label class="lb">최대 턴 (0=기본 '+15+')<input type="text" data-f="max_turns" value="'+(s.max_turns||0)+'"></label>')+'</div>'
+      +(s.kind==='review'?'<label class="lb">최대 턴 (0=기본 8)<input type="text" data-f="max_turns" value="'+(s.max_turns||0)+'" style="width:100px"></label>':'')
+      +(prev.length?'<div class="vd">함께 읽을 이전 단계 결과 (요청 파일은 항상 포함)</div><div class="row" style="margin-bottom:8px">'+prev.filter(p=>p.id!==s.target).map(p=>'<label class="inl"><input type="checkbox" data-f="inputs" data-v="'+esc(p.id)+'"'+(s.inputs.includes(p.id)?' checked':'')+'> '+esc(p.name)+'</label>').join('')+'</div>':'')
+      +'<label class="lb">지시<textarea data-f="instruction" rows="3" style="min-height:64px">'+esc(s.instruction)+'</textarea></label>'
+      +(s.kind==='review'?'<label class="chk"><input type="checkbox" data-f="polish"'+(s.polish?' checked':'')+'><span>승인 시 다듬은 최종본 작성<small>켜면 이 검토 단계가 최종본(final)을 만듭니다. 끄면 마지막 작업 단계의 결과가 최종본이 됩니다</small></span></label>':'')
+      +'</div></div>';
+  }).join('');
+}
+
+/* ---------- 참고 자료 ---------- */
+const SRCMODE={off:['사용 안 함','자료를 프롬프트에 넣지 않습니다'],
+  prefer:['우선 참고 (권장)','이 자료를 먼저 근거로 삼고, 부족하면 다른 방법으로 보완합니다'],
+  only:['이 자료만 사용','자료에 없는 내용은 추측하지 않고 「제공된 자료에 없음」이라고 밝힙니다']};
+let srcEdit=null;
+async function loadSources(){
+  const d=await api(base()+'/sources');
+  const list=d.sources.length?d.sources.map(s=>'<div class="sc"><div class="sch"><b>자</b><input type="text" value="'+esc(s.name)+'" readonly style="flex:1;border:0;background:none">'
+    +'<span class="vd">'+fmtN(s.size)+'B</span><button data-edit="'+esc(s.name)+'">편집</button><button class="dng" data-del="'+esc(s.name)+'">삭제</button></div>'
+    +'<div class="scb"><div class="vd" style="white-space:pre-wrap">'+esc(s.preview)+(s.size>200?' …':'')+'</div></div></div>').join(''):'<div class="empty" style="padding:20px">등록된 자료가 없습니다</div>';
+  $('#v-sources').innerHTML='<div class="card"><h2>참고 자료 (내가 제공하는 근거)</h2>'
+    +'<div class="vd" style="margin:0 0 8px">여기에 넣은 자료를 에이전트가 읽고 근거로 씁니다. 서비스 설명, 내부 규정, 가격표, 자주 묻는 질문처럼 답변의 바탕이 될 내용을 넣으세요.</div>'
+    +'<label class="lb">자료 사용 방식<select id="smd" style="width:auto">'+Object.keys(SRCMODE).map(k=>'<option value="'+k+'"'+(d.mode===k?' selected':'')+'>'+SRCMODE[k][0]+'</option>').join('')+'</select></label>'
+    +'<div class="vd">'+esc(SRCMODE[d.mode][1])+'</div></div>'
+    +'<div class="card"><h2>자료 목록 ('+d.sources.length+')</h2>'+list
+    +'<div class="row" style="margin-top:10px"><button class="pri" id="srcnew">+ 자료 추가</button></div>'
+    +'<div class="vd" style="margin-top:8px">파일을 직접 넣어도 됩니다: <code>'+esc(d.dir)+'</code> 폴더에 .md 또는 .txt 파일을 복사하면 여기에 나타납니다.</div></div>'
+    +'<div id="srcform"></div>';
+  $('#smd').onchange=async e=>{try{await post(base()+'/sources/mode',{mode:e.target.value});toast('저장했습니다');await loadSources()}catch(err){toast(err.message)}};
+  $('#srcnew').onclick=()=>srcForm('','');
+  document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{
+    if(!confirm(b.dataset.del+' 자료를 삭제할까요?'))return;
+    try{await post(base()+'/sources/delete',{name:b.dataset.del});toast('삭제했습니다');await loadSources()}catch(e){toast(e.message)}});
+  document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=async()=>{
+    try{const full=await post(base()+'/sources/read',{name:b.dataset.edit});srcForm(full.name,full.content)}catch(e){toast(e.message)}});
+  if(srcEdit){srcForm(srcEdit.name,srcEdit.content);srcEdit=null}
+}
+function srcForm(name,content){
+  $('#srcform').innerHTML='<div class="card"><h2>'+(name?'자료 편집: '+esc(name):'새 자료')+'</h2>'
+    +'<label class="lb">제목 (파일 이름)<input type="text" id="srcn" maxlength="60" value="'+esc(name)+'" placeholder="예: 서비스 소개.md"'+(name?' readonly':'')+'></label>'
+    +'<label class="lb">내용<textarea id="srcc" class="mono" placeholder="답변의 근거가 될 내용을 붙여넣으세요">'+esc(content)+'</textarea></label>'
+    +'<div class="row"><button class="pri" id="srcsave">저장</button><button id="srccancel">취소</button></div></div>';
+  $('#srcsave').onclick=async()=>{
+    const n=$('#srcn').value.trim(),c=$('#srcc').value;
+    if(!n){toast('제목을 입력하세요');return}
+    if(!c.trim()){toast('내용을 입력하세요');return}
+    try{await post(base()+'/sources',{name:n,content:c});toast('저장했습니다');await loadSources()}catch(e){toast(e.message)}
+  };
+  $('#srccancel').onclick=()=>{$('#srcform').innerHTML=''};
+  $('#srcform').scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+
+/* ---------- 예약 ---------- */
+const DAYS=['월','화','수','목','금','토','일'];
+let SC=[];
+async function loadSched(){
+  pj=await api(base());
+  SC=JSON.parse(JSON.stringify(pj.schedules||[]));
+  $('#v-sched').innerHTML='<div class="card"><h2>예약 작업</h2>'
+    +'<div class="vd" style="margin:0 0 6px">정한 시각에 요청이 자동으로 실행됩니다. 자동 승인을 켜두면 사람 확인 없이 완료되고, 텔레그램이 연결돼 있으면 결과가 바로 전송됩니다. 뉴스 봇처럼 매일 받아보는 용도에 쓰세요.</div>'
+    +'<div class="vd" style="margin:0 0 10px">실행마다 이 프로젝트의 단계 수만큼 호출이 일어납니다. 매일 돌리는 예약은 단계를 적게 두는 편이 좋습니다. 서버가 꺼져 있던 시각의 예약은 건너뜁니다.</div>'
+    +'<div id="sclist"></div><div class="row"><button id="scadd">+ 예약 추가</button><button class="pri" id="scsave">저장</button></div></div>';
+  const L=$('#sclist');
+  L.addEventListener('input',e=>{const c=e.target.closest('.sc');if(!c)return;const f=e.target.dataset.f;if(f&&e.target.type!=='checkbox')SC[+c.dataset.i][f]=e.target.value});
+  L.addEventListener('change',e=>{
+    const c=e.target.closest('.sc');if(!c)return;const i=+c.dataset.i,f=e.target.dataset.f;if(!f)return;const x=SC[i];
+    if(f==='days'){const v=+e.target.dataset.v;x.days=x.days.filter(d=>d!==v);if(e.target.checked)x.days.push(v)}
+    else if(e.target.type==='checkbox'){x[f]=e.target.checked;if(f==='enabled')renderSched()}
+    else x[f]=e.target.value;
+  });
+  L.addEventListener('click',e=>{
+    const b=e.target.closest('button[data-a]');if(!b)return;
+    if(b.dataset.a==='del'){SC.splice(+b.closest('.sc').dataset.i,1);renderSched()}
+  });
+  $('#scadd').onclick=()=>{SC.push({id:'',name:'새 예약',time:'07:30',days:[0,1,2,3,4],request:'',auto_approve:true,enabled:true,last_run:''});renderSched()};
+  $('#scsave').onclick=async()=>{
+    try{await post(base()+'/schedules',{schedules:SC});toast('예약을 저장했습니다');await loadProjects();await loadSched()}catch(e){toast(e.message)}
+  };
+  renderSched();
+}
+function renderSched(){
+  $('#sclist').innerHTML=SC.length?SC.map((x,i)=>'<div class="sc'+(x.enabled?'':' off')+'" data-i="'+i+'"><div class="sch">'
+    +'<label class="inl"><input type="checkbox" data-f="enabled"'+(x.enabled?' checked':'')+'> 사용</label>'
+    +'<input type="text" data-f="name" value="'+esc(x.name)+'" maxlength="30">'
+    +'<label class="inl">시각<input type="text" data-f="time" value="'+esc(x.time)+'" placeholder="07:30" style="width:70px"></label>'
+    +'<button class="dng" data-a="del">삭제</button></div>'
+    +'<div class="scb"><div class="row" style="margin-bottom:8px">'+DAYS.map((d,n)=>'<label class="inl"><input type="checkbox" data-f="days" data-v="'+n+'"'+(x.days.includes(n)?' checked':'')+'> '+d+'</label>').join('')+'</div>'
+    +'<label class="lb">요청 내용 (작업 화면에 입력하는 것과 같습니다)<textarea data-f="request" rows="3" style="min-height:64px" placeholder="예: 오늘 국내 IT 뉴스 중 중요한 5건을 요약해줘">'+esc(x.request)+'</textarea></label>'
+    +'<label class="chk"><input type="checkbox" data-f="auto_approve"'+(x.auto_approve?' checked':'')+'><span>자동 승인<small>끄면 완료 후 텔레그램으로 승인 버튼이 오고, 승인해야 결과가 전송됩니다</small></span></label>'
+    +(x.last_run?'<div class="vd">마지막 실행: '+esc(x.last_run)+'</div>':'')
+    +'</div></div>').join(''):'<div class="empty" style="padding:20px">등록된 예약이 없습니다</div>';
+}
+
+/* ---------- 설정 ---------- */
+function tgCard(t){
+  if(!t.configured)return '<div class="card"><h2>텔레그램 (모바일에서 사용)</h2>'
+    +'<div class="vd">아직 봇 토큰이 없습니다. 텔레그램에서 <b>@BotFather</b> 에게 <b>/newbot</b> 으로 봇을 만든 뒤, 받은 토큰을 파이의 <b>~/agents/.env</b> 에 아래처럼 추가하고 서버를 다시 켜세요.</div>'
+    +'<pre style="background:var(--chip);padding:10px;border-radius:8px;font-size:13px;overflow:auto">TELEGRAM_BOT_TOKEN=받은토큰</pre>'
+    +'<div class="vd">연결하면 휴대폰에서 작업을 요청하고, 완료 알림과 승인 버튼을 받을 수 있습니다. 예약 작업 결과도 여기로 옵니다.</div></div>';
+  return '<div class="card"><h2>텔레그램 (모바일에서 사용)</h2>'
+    +'<div class="vd">봇과의 대화창에서 아래 명령을 한 번 보내면 연결됩니다. 연결된 대화만 작업을 요청할 수 있습니다.</div>'
+    +'<pre style="background:var(--chip);padding:10px;border-radius:8px;font-size:14px">/pair '+esc(t.pair_code)+'</pre>'
+    +'<div class="vd">연결 코드는 서버를 다시 켤 때마다 새로 만들어집니다. 이미 연결된 대화는 그대로 유지됩니다.</div>'
+    +'<div style="margin:10px 0">연결된 대화: '+(t.chats.length?t.chats.map(c=>'<span class="chip approved">'+esc(c)+(t.cur[c]?' · '+esc(t.cur[c]):'')+'</span> <button data-unpair="'+esc(c)+'" style="padding:2px 8px">해제</button>').join(' '):'<span class="chip">없음</span>')+'</div>'
+    +'<label class="chk"><input type="checkbox" id="tgn"'+(t.notify?' checked':'')+'><span>완료·실패 알림 보내기<small>GUI에서 시작한 작업의 알림도 연결된 모든 대화로 보냅니다</small></span></label>'
+    +'<div class="row" style="margin-top:8px"><button class="pri" id="tgsave">저장</button><button id="tgtest">테스트 메시지 보내기</button></div></div>';
+}
+function secCard(s){
+  const bad=[];
+  if(s.weak_password)bad.push('비밀번호가 12자 미만입니다. 인터넷에 공개한다면 더 길게 바꾸세요.');
+  if(s.host!=='127.0.0.1'&&!s.https)bad.push('암호화 없이 외부에 열려 있습니다. HTTPS 리버스 프록시를 두고 GUI_HOST는 127.0.0.1로 되돌리세요.');
+  if(s.https&&!s.proxy)bad.push('HTTPS는 켜져 있지만 TRUST_PROXY가 꺼져 있어 접속 IP가 프록시 주소로 기록됩니다.');
+  return '<div class="card"><h2>보안 상태</h2>'
+    +'<div class="row" style="margin-bottom:8px"><span class="chip '+(s.https?'approved':'failed')+'">HTTPS '+(s.https?'사용':'미설정')+'</span>'
+    +'<span class="chip '+(s.proxy?'approved':'')+'">프록시 IP 인식 '+(s.proxy?'켜짐':'꺼짐')+'</span>'
+    +'<span class="chip">바인딩 '+esc(s.host)+'</span>'+(s.public_host?'<span class="chip">'+esc(s.public_host)+'</span>':'')
+    +'<span class="chip">로그인 세션 '+s.sessions+'</span></div>'
+    +(bad.length?'<div class="warnbox"><b>확인이 필요합니다</b><ul>'+bad.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul></div>':'')
+    +(s.blocked.length?'<div class="vd">차단 중: '+s.blocked.map(b=>esc(b.ip)+' ('+b.left+'초, 실패 '+b.fails+'회)').join(', ')+'</div>':'')
+    +'<div class="vd" style="margin-top:6px">최근 로그인</div><table class="ut"><tr><th>시각</th><th>IP</th><th>결과</th></tr>'
+    +(s.recent.length?s.recent.map(r=>'<tr><td>'+esc(r.ts.slice(5,16))+'</td><td>'+esc(r.ip)+'</td><td>'+(r.ok?'성공':'<b style="color:var(--err)">실패</b>')+'</td></tr>').join(''):'<tr><td colspan="3">기록 없음</td></tr>')
+    +'</table><div class="row" style="margin-top:10px"><button class="dng" id="slog">모든 기기에서 로그아웃</button></div></div>';
+}
+async function loadSettings(){
+  pj=await api(base());
+  const tg=await api('/api/telegram');
+  const sec=await api('/api/security');
+  const fl=Object.keys(flags).map(k=>'<span class="chip '+(flags[k]?'approved':'')+'">'+esc(k)+' '+(flags[k]?'사용':'미지원')+'</span>').join(' ');
+  $('#v-settings').innerHTML='<div class="card"><h2>프로젝트 설정</h2>'
+    +'<label class="lb">이름<input type="text" id="sn" maxlength="40" value="'+esc(pj.name)+'"></label>'
+    +'<label class="lb">설명<textarea id="sd" style="min-height:64px">'+esc(pj.description)+'</textarea></label>'
+    +'<label class="lb">검토 단계의 수정요청 최대 반복 횟수<select id="sr" style="width:auto">'+[0,1,2,3].map(n=>'<option value="'+n+'"'+(pj.max_rounds===n?' selected':'')+'>'+n+'회'+(n===1?' (권장)':n===0?' (반복 안 함, 최저 비용)':'')+'</option>').join('')+'</select></label>'
+    +'<div class="vd">반복 1회마다 2~3번의 호출이 추가됩니다. 비용을 줄이려면 1회 이하를 권장합니다.</div>'
+    +'<label class="lb" style="margin-top:12px">요청 처리 방식<select id="smode" style="width:auto">'
+    +'<option value="fixed"'+(pj.stage_mode!=='auto'?' selected':'')+'>고정 파이프라인 (아래 \'단계\'에서 정한 구성을 항상 그대로 실행)</option>'
+    +'<option value="auto"'+(pj.stage_mode==='auto'?' selected':'')+'>요청별 자동 구성 (AI가 요청마다 에이전트·단계 수를 다시 설계)</option>'
+    +'</select></label>'
+    +'<div class="vd">자동 구성은 매 요청마다 설계 호출이 1회 추가됩니다. 대신 간단한 요청은 단계를 줄이고, 복잡한 요청만 단계를 늘려 전체적으로는 토큰을 아낄 수 있습니다. \'단계\' 화면의 구성은 자동 설계가 실패했을 때 쓰이는 대체 파이프라인으로 남습니다.</div>'
+    +'<div class="row" style="margin-top:8px"><button class="pri" id="ssave">저장</button><button class="dng" id="sdel">프로젝트 제거</button></div>'
+    +'<div class="vd">작업 폴더: '+esc(pj.root==='.'?'~/agents (기존 작업 공간)':'~/agents/'+pj.root)+'</div></div>'
+    +'<div class="card"><h2>전체 설정 (모든 프로젝트 공통)</h2>'
+    +'<div class="g2"><label class="lb">동시에 실행할 작업 수<select id="gp">'+[1,2,3].map(n=>'<option value="'+n+'"'+(settings.parallel===n?' selected':'')+'>'+n+'개'+(n===1?' (라즈베리파이 권장)':'')+'</option>').join('')+'</select></label>'
+    +'<label class="lb">작업당 토큰 한도 (0=무제한, 새 토큰 기준)<input type="text" id="gt" value="'+(settings.job_token_limit||0)+'"></label></div>'
+    +'<label class="lb">단계 추천(AI)에 쓸 모델<input type="text" id="gm" value="'+esc(settings.planner_model||'')+'" placeholder="sonnet"></label>'
+    +'<div class="vd">동시 실행은 프로젝트가 달라도 합산됩니다. 한 번에 에이전트 1개가 메모리를 약 300~500MB 쓰므로 4GB 파이는 1~2개를 권장합니다.</div>'
+    +'<div class="row" style="margin-top:8px"><button class="pri" id="gsave">저장</button></div></div>'
+    +'<div class="card"><h2>토큰 절감 옵션 (설치된 claude가 지원하면 자동 적용)</h2><div class="row">'+fl+'</div>'
+    +'<ul class="tip"><li><b>--tools</b>: 에이전트가 쓰는 도구만 모델에 알려 매 호출의 고정 토큰을 줄입니다.</li><li><b>--strict-mcp-config, --disable-slash-commands, --no-session-persistence</b>: 불필요한 도구·스킬 목록과 세션 파일 저장을 끕니다.</li><li>단계마다 최대 턴이 제한되고, 에이전트에게 설명 없이 파일만 저장하도록 지시합니다.</li></ul></div>'
+    +tgCard(tg)+secCard(sec)
+    +'<div class="card"><h2>프로젝트별 사용량 (새 토큰 = 입력 + 출력 + 캐시 쓰기)</h2><table class="ut"><tr><th>프로젝트</th><th>작업</th><th>새 토큰</th><th>추정 비용</th></tr>'
+    +P.map(p=>'<tr><td>'+esc(p.name)+'</td><td>'+p.jobs+'</td><td>'+fmtN(p.tokens)+'</td><td>'+(p.cost?'$'+p.cost.toFixed(3):'-')+'</td></tr>').join('')+'</table></div>'
+    +'<div class="card"><h2>토큰 아끼는 방법</h2><ul class="tip"><li>꼭 필요한 단계만 두세요. 단계 1개 = 호출 1회입니다. 필요 없는 단계는 \'사용\'을 끄세요.</li>'
+    +'<li>검토·검수처럼 단순한 단계의 에이전트는 모델을 <b>haiku</b>로 지정하세요.</li><li>수정요청 반복 횟수를 1회 이하로 두세요.</li>'
+    +'<li>요청에 분량과 범위를 구체적으로 적으면 불필요한 장문 생성을 줄입니다.</li><li>작업 상세 화면의 단계별 새 토큰 수치로 가장 비싼 단계를 찾아 조정하세요.</li></ul></div>';
+  $('#ssave').onclick=async()=>{try{await post(base()+'/update',{name:$('#sn').value,description:$('#sd').value,max_rounds:+$('#sr').value,stage_mode:$('#smode').value});toast('저장했습니다');await loadProjects();await loadSettings()}catch(e){toast(e.message)}};
+  $('#sdel').onclick=async()=>{if(!confirm('이 프로젝트를 목록에서 제거할까요? 폴더와 파일은 지워지지 않습니다.'))return;try{await post(base()+'/delete');toast('제거했습니다');cur=null;await loadProjects();setView('jobs')}catch(e){toast(e.message)}};
+  $('#gsave').onclick=async()=>{try{await post('/api/settings',{parallel:+$('#gp').value,job_token_limit:parseInt($('#gt').value)||0,planner_model:$('#gm').value});toast('저장했습니다');await loadProjects()}catch(e){toast(e.message)}};
+  $('#slog').onclick=async()=>{if(!confirm('모든 기기의 로그인을 끊을까요? 이 화면도 다시 로그인해야 합니다.'))return;
+    try{await post('/api/security/logout-all');location.href='/login'}catch(e){toast(e.message)}};
+  if($('#tgsave'))$('#tgsave').onclick=async()=>{try{await post('/api/telegram/update',{notify:$('#tgn').checked});toast('저장했습니다')}catch(e){toast(e.message)}};
+  if($('#tgtest'))$('#tgtest').onclick=async()=>{try{const r=await post('/api/telegram/test');toast(r.sent+'개 대화로 보냈습니다')}catch(e){toast(e.message)}};
+  document.querySelectorAll('[data-unpair]').forEach(b=>b.onclick=async()=>{
+    if(!confirm('이 대화의 연결을 해제할까요?'))return;
+    try{await post('/api/telegram/update',{unpair:b.dataset.unpair});toast('해제했습니다');await loadSettings()}catch(e){toast(e.message)}});
+}
+
+/* ---------- 새 프로젝트 ---------- */
+let newPlan=null,manual=[],allAgents=null;
+function manualPlan(){
+  const ag=manual.filter(a=>a.name.trim()).map((a,i)=>({key:'m'+(i+1),name:a.name.trim(),role:a.role.trim(),web:!!a.web,model:a.model||''}));
+  if(!ag.length)return null;
+  const st=ag.map((a,i)=>({name:a.name,agent:a.key,kind:'work',instruction:a.role||'요청을 수행한다.',inputs:i?[ag[0].name]:[]}));
+  if(st.length>1){const l=st[st.length-1];l.kind='review';l.target=st[st.length-2].name;l.polish=true}
+  return {agents:ag,stages:st};
+}
+function manualRows(){
+  return manual.map((a,i)=>'<div class="sc" data-i="'+i+'"><div class="sch"><b>'+(i+1)+'</b>'
+    +'<input type="text" data-f="name" value="'+esc(a.name)+'" maxlength="30" placeholder="이름 (예: 리서처)">'
+    +'<label class="inl"><input type="checkbox" data-f="web"'+(a.web?' checked':'')+'> 웹</label>'
+    +'<input type="text" data-f="model" value="'+esc(a.model||'')+'" placeholder="모델(선택)" style="width:110px">'
+    +'<button class="dng" data-a="del">삭제</button></div>'
+    +'<div class="scb"><label class="lb">이 에이전트가 할 일<textarea data-f="role" rows="2" style="min-height:52px" placeholder="예: 자료를 조사해 사실만 정리하고 출처를 적는다">'+esc(a.role)+'</textarea></label></div></div>').join('')
+    ||'<div class="empty" style="padding:16px">아직 에이전트가 없습니다. 아래에서 추가하세요.</div>';
+}
+function renderManual(){
+  $('#mlist').innerHTML=manualRows();
+  const p=manualPlan();
+  $('#npprev').innerHTML=p?planHtml(p):'<div class="vd">에이전트를 1명 이상 추가하면 미리보기가 나옵니다.</div>';
+}
+async function initNewProj(){
+  if(!presets.length)presets=(await api('/api/presets')).presets;
+  newPlan=presets[0].plan;manual=[];
+  $('#v-newproj').innerHTML='<div class="card"><h2>새 프로젝트</h2>'
+    +'<label class="lb">프로젝트 이름<input type="text" id="npn" maxlength="40" placeholder="예: 블로그 자동화"></label>'
+    +'<label class="lb">설명<textarea id="npd" placeholder="어떤 작업을 하는 프로젝트인지 적어주세요"></textarea></label>'
+    +'<label class="lb">에이전트 구성 방법<select id="npmode">'
+    +'<option value="preset">프리셋에서 고르기 (토큰 안 듦)</option>'
+    +'<option value="ai">AI 추천 받기 (호출 1회)</option>'
+    +'<option value="manual">직접 만들기 (내가 역할을 정함)</option></select></label>'
+    +'<div id="npbody"></div><div id="npprev"></div>'
+    +'<label class="chk" style="margin-top:12px"><input type="checkbox" id="npauto"><span>요청마다 AI가 단계를 다시 설계<small>등록한 에이전트 중에서 요청에 맞게 골라 씁니다. 위 구성은 설계 실패 시 쓰는 대체용이 됩니다.</small></span></label>'
+    +'<div class="row" style="margin-top:12px"><button class="pri" id="npgo">프로젝트 만들기</button><button id="npcancel">취소</button></div></div>'
+    +'<div id="imppanel"></div>';
+  $('#npmode').onchange=e=>npBody(e.target.value);
+  npBody('preset');
+  $('#npgo').onclick=async()=>{
+    const mode=$('#npmode').value;
+    let plan=mode==='manual'?manualPlan():newPlan;
+    if(!plan){toast('에이전트를 1명 이상 추가하세요');return}
+    try{const r=await post('/api/projects',{name:$('#npn').value,description:$('#npd').value,plan:plan,stage_mode:$('#npauto').checked?'auto':'fixed'});
+      toast('프로젝트를 만들었습니다');cur=r.id;try{localStorage.setItem('cur',r.id)}catch(e){}await loadProjects();view='agents';setView('agents')}catch(e){toast(e.message)}
+  };
+  $('#npcancel').onclick=()=>setView('jobs');
+}
+function npBody(mode){
+  const show=note=>{$('#npprev').innerHTML=(note?'<div class="vd">'+esc(note)+'</div>':'')+planHtml(newPlan)};
+  if(mode==='preset'){
+    $('#npbody').innerHTML='<label class="lb">프리셋<select id="nps">'+presetOpts()+'</select></label>';
+    $('#nps').onchange=e=>{newPlan=presets[+e.target.value].plan;show(presets[+e.target.value].desc)};
+    newPlan=presets[0].plan;show(presets[0].desc);
+  }else if(mode==='ai'){
+    $('#npbody').innerHTML='<div class="row">'+countSel('ncs','nca')+'<button id="npai">AI 추천 받기</button></div>'
+      +'<div class="vd">설명을 자세히 적을수록 원하는 에이전트가 나옵니다. 마음에 안 들면 다시 받거나, 만든 뒤 에이전트 화면에서 고치면 됩니다.</div>';
+    $('#npprev').innerHTML='';
+    $('#npai').onclick=async()=>{
+      const d=$('#npd').value.trim();if(!d){toast('설명을 먼저 적어주세요');return}
+      $('#npai').disabled=true;$('#npai').textContent='추천 생성 중...';
+      try{const r=await post('/api/plan',{name:$('#npn').value,description:d,stages:+$('#ncs').value,agents:+$('#nca').value});
+        newPlan=r.plan;show('AI 추천 결과 (사용량: 입력 '+fmtN(r.usage.input)+' · 출력 '+fmtN(r.usage.output)+')')}catch(e){toast(e.message)}
+      $('#npai').disabled=false;$('#npai').textContent='AI 추천 받기';
+    };
+  }else{
+    $('#npbody').innerHTML='<div id="mlist"></div>'
+      +'<div class="row" style="margin-top:8px"><button id="madd">+ 에이전트 추가</button><button id="mimp">기존 에이전트 가져오기</button></div>'
+      +'<div class="vd">맨 아래 에이전트는 앞 결과를 검토하는 역할이 됩니다(2명 이상일 때). 만든 뒤 단계 화면에서 자유롭게 바꿀 수 있습니다.</div>';
+    renderManual();
+    const L=$('#mlist');
+    L.addEventListener('input',e=>{const c=e.target.closest('.sc');if(!c)return;const f=e.target.dataset.f;
+      if(f&&e.target.type!=='checkbox'){manual[+c.dataset.i][f]=e.target.value;if(f==='name'||f==='role')$('#npprev').innerHTML=manualPlan()?planHtml(manualPlan()):''}});
+    L.addEventListener('change',e=>{const c=e.target.closest('.sc');if(!c)return;
+      if(e.target.dataset.f==='web')manual[+c.dataset.i].web=e.target.checked});
+    L.addEventListener('click',e=>{const b=e.target.closest('button[data-a="del"]');if(b){manual.splice(+b.closest('.sc').dataset.i,1);renderManual()}});
+    $('#madd').onclick=()=>{manual.push({name:'',role:'',web:false,model:''});renderManual()};
+    $('#mimp').onclick=()=>importPanel(a=>{manual.push({name:a.name,role:a.role,web:a.web,model:a.model});renderManual();$('#imppanel').innerHTML=''});
+  }
+}
+async function importPanel(onPick){
+  $('#imppanel').innerHTML='<div class="card"><h2>기존 에이전트 가져오기</h2><div class="vd">불러오는 중...</div></div>';
+  let d;try{d=await api('/api/all-agents')}catch(e){toast(e.message);$('#imppanel').innerHTML='';return}
+  if(!d.agents.length){$('#imppanel').innerHTML='<div class="card"><h2>기존 에이전트 가져오기</h2><div class="empty" style="padding:16px">가져올 에이전트가 없습니다</div></div>';return}
+  $('#imppanel').innerHTML='<div class="card"><h2>기존 에이전트 가져오기</h2>'
+    +'<div class="vd" style="margin-bottom:8px">다른 프로젝트의 에이전트를 복사해 옵니다. 복사본이라 고쳐도 원본에는 영향이 없습니다.</div>'
+    +'<div class="jobs" style="margin-top:0;max-height:50vh">'+d.agents.map((a,i)=>'<div class="job" data-i="'+i+'"><div class="t">'+esc(a.name)+' <span class="tag">'+esc(a.pname)+'</span>'+(a.web?' <span class="tag">웹</span>':'')+(a.model?' <span class="tag">'+esc(a.model)+'</span>':'')+'</div><div class="m">'+esc((a.role||'').slice(0,90))+'</div></div>').join('')+'</div>'
+    +'<div class="row" style="margin-top:10px"><button id="impclose">닫기</button></div></div>';
+  $('#imppanel').querySelectorAll('.job').forEach(el=>el.onclick=()=>onPick(d.agents[+el.dataset.i]));
+  $('#impclose').onclick=()=>{$('#imppanel').innerHTML=''};
+  $('#imppanel').scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+
+/* ---------- 폴링 ---------- */
+async function tick(force){
+  if(document.hidden&&!force)return;
+  try{await loadProjects();if(view==='jobs'){await loadList();await loadDetail(force)}}catch(e){}
+}
+setInterval(()=>{tickN++;if(P.some(p=>p.active>0)||tickN%3===0)tick(false)},3000);
+loadProjects().then(()=>setView(cur?'jobs':'newproj')).catch(e=>toast(e.message));
+</script>
+</body>
+</html>
