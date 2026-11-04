@@ -14,3 +14,9 @@ chmod +x /opt/agent-harness-src/update.sh
 ```bash
 /opt/agent-harness-src/update.sh
 ```
+
+## 코드 저장소 연동 (예: 마이마)
+1. 새 프로젝트 → 프리셋 "코드 저장소 수정" 선택
+2. 설정 → 코드 저장소: `배포 키 보기` → GitHub 저장소 Settings → Deploy keys 에 붙여넣기 (Allow write access 체크)
+3. 저장소 주소(`git@github.com:아이디/저장소.git`), 빌드 명령 입력 후 저장 → `내려받기`
+4. 작업 요청 → 에이전트가 `harness/작업ID` 브랜치에서 코드 수정 → 하네스가 빌드 확인·커밋 → 코드리뷰 → 최종 승인 시 main 병합·푸시 (GitHub Actions 빌드)

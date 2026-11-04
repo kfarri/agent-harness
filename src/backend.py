@@ -217,6 +217,20 @@ PRESETS_RAW = [
      "stages": [S("설계", "architect", "work", "요구사항을 분석해 구조, 주요 함수·클래스, 예외 처리 방침을 간결하게 설계한다."),
                 S("구현", "developer", "work", "설계에 따라 코드를 작성해 마크다운 코드 블록으로 출력한다.", ["설계"]),
                 S("코드리뷰", "codereviewer", "review", "코드를 설계와 대조해 버그, 보안, 가독성을 점검한다.", ["설계"], "구현", True)]},
+    {"key": "repo", "label": "코드 저장소 수정 (구현 → 코드리뷰 → 승인 시 GitHub 반영)",
+     "desc": "설정 > 코드 저장소에서 GitHub 저장소를 연결하면 실제 코드 파일을 고치고, 빌드 확인 후 승인하면 푸시합니다.",
+     "agents": [A("developer", "개발자",
+                 "실무 경험이 많은 소프트웨어 엔지니어다. 연결된 저장소의 기존 코드 스타일·구조·라이브러리를 먼저 파악하고 "
+                 "그 방식을 그대로 따라 요청을 구현한다. 변경은 요청 범위로 최소화하고, 관련 없는 파일은 건드리지 않는다. "
+                 "필요한 파일만 Grep/Glob으로 찾아 읽어 탐색 비용을 줄이며, 빌드가 깨지지 않도록 문법과 참조를 꼼꼼히 확인한다. "
+                 "작업이 끝나면 바꾼 파일과 이유, 사용자가 확인할 점을 짧게 정리한다."),
+                A("codereviewer", "코드리뷰어",
+                 "코드 리뷰를 전문으로 하는 시니어 엔지니어다. 변경 내용(diff)을 요청과 대조해 요구사항 누락, 버그, 보안 "
+                 "취약점, 기존 기능 회귀, 불필요한 변경을 찾아낸다. 지적할 때는 파일과 위치, 문제와 이유, 고치는 방법을 "
+                 "구체적으로 적는다. 사소한 취향 차이로 반려하지 않고, 실제로 문제가 되는 것만 수정요청한다. "
+                 "저장소 파일은 읽기만 하고 직접 고치지 않는다.")],
+     "stages": [S("구현", "developer", "work", "요청을 연결된 저장소 코드에 직접 반영하고, 출력 파일에는 변경 요약만 적는다."),
+                S("코드리뷰", "codereviewer", "review", "변경 내용(diff)을 요청과 대조해 버그, 보안, 회귀, 불필요한 변경을 점검한다.", [], "구현")]},
     {"key": "translate", "label": "번역·현지화 (번역 → 감수)",
      "desc": "두 단계뿐이라 토큰이 적게 듭니다.",
      "agents": [A("translator", "번역가",
@@ -421,7 +435,23 @@ def build_settings(proj, perms):
         deny += ["WebSearch", "WebFetch"]
     if perms.get("bash"):
         allow.append("Bash")
-    return {"permissions": {"additionalDirectories": [str(proj_dirs(proj)["shared"])], "allow": allow, "deny": deny}}
+    dirs = [str(proj_dirs(proj)["shared"])]
+    deny.append("Read(/%s/**)" % (Path.home() / ".ssh"))   # 저장소 접근 키는 에이전트가 읽지 못한다
+    if repo_on(proj):
+        rd = str(repo_dir(proj))
+        dirs.append(rd)
+        allow += ["Glob", "Grep"]
+        deny += ["Write(/%s/.git/**)" % rd, "Edit(/%s/.git/**)" % rd, "Bash(git push:*)", "Bash(git commit:*)"]
+    return {"permissions": {"additionalDirectories": dirs, "allow": allow, "deny": deny}}
+
+
+def refresh_agent_settings(proj):
+    """저장소 연결이 바뀌면 각 에이전트의 접근 폴더·권한을 다시 쓴다(기존 웹/Bash 권한은 유지)."""
+    root = proj_dirs(proj)["root"]
+    for a in proj["agents"]:
+        sp = root / a["workspace"] / ".claude" / "settings.json"
+        if sp.parent.is_dir():
+            sp.write_text(json.dumps(build_settings(proj, parse_perms(sp)), ensure_ascii=False, indent=2))
 
 
 def read_allow(path):
@@ -846,6 +876,309 @@ def run_step(job, proj, stage, prompt, remove_kinds=()):
                        % (stage["name"], who, agent["workspace"], reply.strip()[-500:] or "(응답 없음)"))
 
 
+# ---------------------------------------------------------------- 코드 저장소 연동 (git·빌드는 하네스가 직접 실행해 토큰을 쓰지 않는다)
+
+REPO_URL_RE = re.compile(r"^(git@[\w.-]+:[\w./-]+|https://[\w.-]+/[\w./-]+|ssh://[\w@.:/-]+)$")
+REPO_PATH_RE = re.compile(r"^/[\w./-]+$")
+BRANCH_RE = re.compile(r"^[\w][\w./-]{0,59}$")
+REPO_KEY = Path(os.environ.get("REPO_SSH_KEY") or (Path.home() / ".ssh" / "id_ed25519_harness"))
+BUILD_TIMEOUT = int(os.environ.get("BUILD_TIMEOUT", "900"))
+BUILD_FIX_TRIES = int(os.environ.get("BUILD_FIX_TRIES", "2"))
+REPO_LOCKS = {}
+GIT_ID = ["-c", "user.name=agent-harness", "-c", "user.email=agent-harness@localhost"]
+
+
+def repo_cfg(proj):
+    return proj.get("repo") or {}
+
+
+def repo_on(proj):
+    r = repo_cfg(proj)
+    return bool(r.get("url") and r.get("path"))
+
+
+def repo_dir(proj):
+    return Path(repo_cfg(proj)["path"])
+
+
+def repo_base(proj):
+    return repo_cfg(proj).get("branch") or "main"
+
+
+def job_branch(jid):
+    return "harness/" + jid
+
+
+def repo_lock(pid):
+    with LOCK:
+        return REPO_LOCKS.setdefault(pid, threading.Lock())
+
+
+def git_env():
+    e = child_env()
+    e["GIT_TERMINAL_PROMPT"] = "0"
+    key = "-i %s -o IdentitiesOnly=yes " % shlex.quote(str(REPO_KEY)) if REPO_KEY.exists() else ""
+    e["GIT_SSH_COMMAND"] = "ssh %s-o StrictHostKeyChecking=accept-new -o BatchMode=yes" % key
+    return e
+
+
+def git(cwd, *args, timeout=120, check=True):
+    try:
+        r = subprocess.run(["git", *GIT_ID, *args], cwd=str(cwd), env=git_env(), capture_output=True, text=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("git %s 시간 초과" % args[0])
+    if check and r.returncode:
+        raise RuntimeError("git %s 실패: %s" % (args[0], (r.stderr or r.stdout).strip()[-500:]))
+    return r.stdout if check else r
+
+
+def web_url(url):
+    m = re.match(r"^(?:git@([\w.-]+):|https://([\w.-]+)/|ssh://git@([\w.-]+)/)([\w.-]+/[\w.-]+?)(?:\.git)?/?$", url or "")
+    return "https://%s/%s" % (m.group(1) or m.group(2) or m.group(3), m.group(4)) if m else ""
+
+
+def repo_status(proj):
+    r = dict(repo_cfg(proj))
+    out = {"repo": r, "cloned": False, "key": "", "default_path": str(BASE / "repos" / proj["id"])}
+    if REPO_KEY.with_suffix(".pub").exists():
+        out["key"] = REPO_KEY.with_suffix(".pub").read_text().strip()
+    if r.get("path") and (Path(r["path"]) / ".git").is_dir():
+        out["cloned"] = True
+        res = git(r["path"], "log", "-1", "--format=%h %s (%cr)", check=False)
+        out["head"] = res.stdout.strip() if res.returncode == 0 else ""
+    out["web"] = web_url(r.get("url"))
+    return out
+
+
+def repo_save(proj, b):
+    if any(j["status"] in ("queued", "running", "deploying") for (pid, _), j in JOBS.items() if pid == proj["id"]):
+        raise ApiError(409, "진행 중인 작업이 끝난 뒤 바꿔주세요")
+    url = str(b.get("url") or "").strip()
+    if not url:
+        proj.pop("repo", None)
+        save_cfg()
+        refresh_agent_settings(proj)
+        return repo_status(proj)
+    if not REPO_URL_RE.match(url):
+        raise ApiError(400, "저장소 주소 형식이 올바르지 않습니다 (예: git@github.com:아이디/저장소.git)")
+    path = str(b.get("path") or "").strip() or str(BASE / "repos" / proj["id"])
+    if not REPO_PATH_RE.match(path) or ".." in path:
+        raise ApiError(400, "로컬 폴더 경로는 /로 시작하는 절대 경로여야 합니다")
+    if Path(path).resolve() in (BASE.resolve(), Path.home().resolve()):
+        raise ApiError(400, "작업 폴더 전체가 아니라 저장소 전용 폴더를 지정하세요")
+    branch = str(b.get("branch") or "main").strip()
+    if not BRANCH_RE.match(branch) or ".." in branch:
+        raise ApiError(400, "브랜치 이름이 올바르지 않습니다")
+    mode = b.get("merge") if b.get("merge") in ("merge", "branch") else "merge"
+    proj["repo"] = {"url": url, "path": path, "branch": branch, "merge": mode,
+                    "build": str(b.get("build") or "").strip()[:500], "deploy": str(b.get("deploy") or "").strip()[:500]}
+    save_cfg()
+    refresh_agent_settings(proj)
+    return repo_status(proj)
+
+
+def repo_clone(proj):
+    if not repo_on(proj):
+        raise ApiError(400, "먼저 저장소 주소를 저장하세요")
+    d, url = repo_dir(proj), repo_cfg(proj)["url"]
+    with repo_lock(proj["id"]):
+        try:
+            if (d / ".git").is_dir():
+                git(d, "remote", "set-url", "origin", url)
+                git(d, "fetch", "origin", repo_base(proj), timeout=300)
+                msg = "이미 내려받은 저장소입니다. 최신 내용을 가져왔습니다"
+            else:
+                if d.exists() and any(d.iterdir()):
+                    raise ApiError(409, "폴더가 비어 있지 않습니다: %s" % d)
+                d.parent.mkdir(parents=True, exist_ok=True)
+                git(d.parent, "clone", url, str(d), timeout=600)
+                msg = "저장소를 내려받았습니다"
+            git(d, "rev-parse", "--verify", "origin/" + repo_base(proj))
+        except RuntimeError as e:
+            raise ApiError(502, "%s\n(GitHub에 배포 키를 등록했는지, 쓰기 권한을 켰는지 확인하세요)" % e)
+    refresh_agent_settings(proj)
+    return dict(repo_status(proj), msg=msg)
+
+
+def repo_key():
+    if not REPO_KEY.exists():
+        REPO_KEY.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "agent-harness", "-f", str(REPO_KEY)],
+                       check=True, capture_output=True, timeout=30)
+    return {"key": REPO_KEY.with_suffix(".pub").read_text().strip()}
+
+
+def repo_prepare(job, proj):
+    """작업마다 기준 브랜치에서 harness/<작업ID> 브랜치를 만든다. 다시 작업할 때는 그 브랜치를 이어서 쓴다."""
+    d, base, br = repo_dir(proj), repo_base(proj), job_branch(job["id"])
+    if not (d / ".git").is_dir():
+        raise RuntimeError("저장소를 아직 내려받지 않았습니다. 설정 > 코드 저장소에서 '내려받기'를 누르세요")
+    git(d, "fetch", "origin", base, timeout=300)
+    git(d, "reset", "--hard", "-q")
+    git(d, "clean", "-fdq")
+    if git(d, "rev-parse", "--verify", "--quiet", "refs/heads/" + br, check=False).returncode == 0:
+        git(d, "checkout", "-q", br)
+        if git(d, "rebase", "-q", "origin/" + base, check=False).returncode:
+            git(d, "rebase", "--abort", check=False)
+            git(d, "checkout", "-q", "-B", br, "origin/" + base)
+            event(job, "system", "저장소: %s 이 그사이 바뀌어 충돌이 나서, 최신 %s 기준으로 새로 작업합니다" % (base, base), "warn")
+        else:
+            event(job, "system", "저장소: %s 브랜치에서 이어서 작업 (최신 %s 반영)" % (br, base))
+    else:
+        git(d, "checkout", "-q", "-B", br, "origin/" + base)
+        event(job, "system", "저장소: %s 기준으로 %s 브랜치 생성" % (base, br))
+    set_state(job, branch=br)
+
+
+def repo_files(proj, limit=250):
+    try:
+        names = git(repo_dir(proj), "ls-files").splitlines()
+    except RuntimeError:
+        return ""
+    head = names[:limit]
+    more = "\n... 외 %d개 (필요하면 Glob으로 찾는다)" % (len(names) - limit) if len(names) > limit else ""
+    return "\n".join(head) + more
+
+
+def repo_block(proj, jid, kind):
+    if not repo_on(proj):
+        return ""
+    d = repo_dir(proj)
+    if kind == "work":
+        return ("[코드 저장소] 경로: %s (브랜치 %s, 기준 %s)\n"
+                "이 저장소의 파일을 Edit/Write로 직접 수정해 요청을 구현한다. git(커밋·푸시·브랜치)과 빌드는 하네스가 "
+                "처리하므로 하지 않는다. 아래 파일 목록을 보고 필요한 파일만 Grep/Glob/Read로 확인하고, 관련 없는 파일은 "
+                "열지 않는다. 변경은 요청 범위로 최소화하고 기존 코드 스타일을 따른다.\n"
+                "출력 파일에는 변경 요약만 적는다: 바꾼 파일 목록, 무엇을 왜 바꿨는지, 사용자가 확인할 점.\n"
+                "[파일 목록]\n%s\n" % (d, job_branch(jid), repo_base(proj), repo_files(proj)))
+    return ("[코드 저장소] 경로: %s\n변경 내용(diff): %s\n이 diff를 기준으로 검토하고, 필요할 때만 저장소 파일을 읽어 "
+            "확인한다. 저장소 파일은 절대 수정하지 않는다.\n" % (d, rel(proj, "diff", jid)))
+
+
+def run_shell(job, proj, cmd, what):
+    d = proj_dirs(proj)
+    d["logs"].mkdir(parents=True, exist_ok=True)
+    log = d["logs"] / ("%s_%s_%s.log" % (job["id"], what, time.strftime("%H%M%S")))
+    key = (proj["id"], job["id"])
+    with open(log, "wb") as lf:
+        p = subprocess.Popen(["bash", "-lc", cmd], cwd=str(repo_dir(proj)), env=git_env(), stdout=lf,
+                             stderr=subprocess.STDOUT, start_new_session=True)
+        PROCS[key] = p
+        try:
+            rc = p.wait(timeout=BUILD_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            kill_proc(p)
+            rc = -1
+        finally:
+            PROCS.pop(key, None)
+    if job.get("cancel"):
+        raise Cancelled()
+    return rc == 0, (read_text(log) or "")[-3000:]
+
+
+def repo_changed(proj):
+    return bool(git(repo_dir(proj), "status", "--porcelain").strip())
+
+
+def repo_after_work(job, proj, stages, st):
+    """작업 단계가 끝나면: 변경 확인 → 빌드(실패 시 오류를 돌려줘 자동 수정) → 커밋 → diff 저장."""
+    jid, d = job["id"], repo_dir(proj)
+    if not repo_changed(proj):
+        event(job, "system", "%s: 저장소에 바뀐 파일이 없습니다" % st["name"], "warn")
+        return
+    cmd = repo_cfg(proj).get("build")
+    tries = 0
+    while cmd:
+        event(job, "system", "빌드 확인: %s" % cmd)
+        ok, tail = run_shell(job, proj, cmd, "build")
+        if ok:
+            event(job, "system", "빌드 통과", "ok")
+            break
+        if tries >= BUILD_FIX_TRIES:
+            raise RuntimeError("빌드 실패 (자동 수정 %d회 후에도 실패)\n%s" % (tries, tail[-800:]))
+        tries += 1
+        event(job, "system", "빌드 실패 - 오류 내용을 %s 단계로 돌려보내 자동 수정 (%d/%d)" % (st["name"], tries, BUILD_FIX_TRIES), "warn")
+        fb = ("빌드 명령 `%s` 이 실패했다. 아래 오류의 원인을 찾아 저장소 코드를 고친다. 요청과 관계없는 부분은 건드리지 않는다.\n"
+              "```\n%s\n```" % (cmd, tail[-2500:]))
+        run_step(job, proj, st, prompt_work(proj, stages, st, jid, fb))
+    git(d, "add", "-A")
+    title = re.sub(r"\s+", " ", job["title"])[:60]
+    git(d, "commit", "-q", "-m", "%s\n\nagent-harness 작업 %s · %s 단계" % (title, jid, st["name"]))
+    write_diff(proj, jid)
+    event(job, "system", "커밋 완료: %s" % git(d, "log", "-1", "--format=%h").strip(), "ok")
+
+
+def write_diff(proj, jid, limit=40000):
+    d, base = repo_dir(proj), "origin/" + repo_base(proj)
+    stat = git(d, "diff", "--stat", base + "...HEAD")
+    diff = git(d, "diff", base + "...HEAD")
+    cut = "\n... (diff가 길어 %d자에서 잘림)" % limit if len(diff) > limit else ""
+    fpath(proj, "diff", jid).write_text("## 변경 파일\n```\n%s```\n\n## 변경 내용\n```diff\n%s%s\n```\n"
+                                        % (stat, diff[:limit], cut))
+
+
+def repo_discard(proj):
+    """검토 단계에서 에이전트가 실수로 고친 파일은 되돌린다(커밋된 작업 결과만 남긴다)."""
+    if repo_changed(proj):
+        git(repo_dir(proj), "reset", "--hard", "-q")
+        git(repo_dir(proj), "clean", "-fdq")
+        return True
+    return False
+
+
+def repo_deliver(proj, j, summary_src):
+    """최종 승인 후: 기준 브랜치에 병합해 푸시(또는 작업 브랜치만 푸시) → 배포 명령 실행."""
+    jid, d, base, br = j["id"], repo_dir(proj), repo_base(proj), job_branch(j["id"])
+    mode, web = repo_cfg(proj).get("merge", "merge"), web_url(repo_cfg(proj).get("url"))
+    lines = []
+    try:
+        with repo_lock(proj["id"]):
+            git(d, "fetch", "origin", base, timeout=300)
+            git(d, "reset", "--hard", "-q")
+            git(d, "checkout", "-q", br)
+            ahead = int(git(d, "rev-list", "--count", "origin/%s..%s" % (base, br)).strip() or 0)
+            if not ahead:
+                lines.append("- 바뀐 코드가 없어 저장소에는 반영하지 않았습니다")
+            elif mode == "branch":
+                git(d, "push", "-q", "-f", "origin", "%s:%s" % (br, br), timeout=300)
+                lines.append("- `%s` 브랜치로 푸시했습니다 (커밋 %d개)" % (br, ahead))
+                if web:
+                    lines.append("- PR 만들기: %s/compare/%s...%s?expand=1" % (web, base, br))
+            else:
+                git(d, "checkout", "-q", "-B", base, "origin/" + base)
+                r = git(d, "merge", "--no-ff", "-m", "Merge %s: %s" % (br, j["title"][:60]), br, check=False)
+                if r.returncode:
+                    git(d, "merge", "--abort", check=False)
+                    git(d, "checkout", "-q", br)
+                    raise RuntimeError("%s 에 그사이 다른 변경이 있어 자동 병합 중 충돌이 났습니다. "
+                                       "반려하고 다시 작업하면 최신 %s 기준으로 다시 맞춥니다" % (base, base))
+                git(d, "push", "-q", "origin", "%s:%s" % (base, base), timeout=300)
+                sha = git(d, "log", "-1", "--format=%h").strip()
+                lines.append("- `%s`에 병합하고 푸시했습니다 (커밋 %s, 변경 커밋 %d개)" % (base, sha, ahead))
+                if web:
+                    lines.append("- 커밋: %s/commit/%s\n- 빌드 상태(GitHub Actions): %s/actions" % (web, sha, web))
+                dep = repo_cfg(proj).get("deploy")
+                if dep:
+                    event(j, "system", "배포 명령 실행: %s" % dep)
+                    ok, tail = run_shell(j, proj, dep, "deploy")
+                    lines.append("- 배포 명령 %s" % ("성공" if ok else "실패"))
+                    if not ok:
+                        lines.append("```\n%s\n```" % tail[-1500:])
+                        event(j, "system", "배포 명령 실패 (코드는 이미 푸시됨)", "err")
+    except Exception as e:  # noqa: BLE001
+        set_state(j, status="awaiting_user", error="저장소 반영 실패: %s" % e)
+        event(j, "system", "저장소 반영 실패: %s" % e, "err")
+        notify("[%s] %s\n저장소 반영 실패: %s" % (proj["name"], j["title"], str(e)[:300]),
+               [[("다시 승인", "ap:%s:%s" % (proj["id"], jid))]], j.get("chat") or None)
+        return
+    body = (read_text(summary_src) or "").rstrip()
+    fpath(proj, "approved", jid).write_text(body + "\n\n## 저장소 반영\n" + "\n".join(lines) + "\n")
+    set_state(j, status="approved", error="")
+    event(j, "user", "최종 승인 · 저장소 반영 완료", "ok")
+    notify_job(j, "approved")
+
+
 # ---------------------------------------------------------------- 파이프라인
 
 CONCISE = ("위에 적힌 입력 파일과 참고 자료 외에는 폴더를 탐색하지 않는다. 그런 다음 반드시 Write 도구로 출력 파일 경로에 결과를 저장한다. "
@@ -928,8 +1261,8 @@ CLARIFY_RULE = (
 
 
 def prompt_work(proj, stages, stage, jid, fb):
-    return ("STEP: %s\n작업ID: %s\n%s\n%s지시: %s\n출력 파일: %s\n%s%s%s"
-            % (stage["id"], jid, inputs_block(proj, stages, stage, jid), sources_block(proj),
+    return ("STEP: %s\n작업ID: %s\n%s\n%s%s지시: %s\n출력 파일: %s\n%s%s%s"
+            % (stage["id"], jid, inputs_block(proj, stages, stage, jid), sources_block(proj), repo_block(proj, jid, "work"),
                stage["instruction"] or "요청을 수행한다.",
                rel(proj, stage["id"], jid), feedback_block(fb), CLARIFY_RULE, CONCISE))
 
@@ -937,10 +1270,11 @@ def prompt_work(proj, stages, stage, jid, fb):
 def prompt_review(proj, stages, stage, jid):
     by_id = {s["id"]: s for s in stages}
     tgt = by_id[stage["target"]]
-    p = ("STEP: %s\n작업ID: %s\n%s\n%s검토 대상(%s): %s\n지시: %s\n검수 결과 파일: %s\n"
+    p = ("STEP: %s\n작업ID: %s\n%s\n%s%s검토 대상(%s): %s\n지시: %s\n검수 결과 파일: %s\n"
          "형식: 첫 줄은 정확히 `VERDICT: APPROVE` 또는 `VERDICT: REVISE` 한 줄만 쓴다. 둘째 줄부터 이유를 적고, "
          "REVISE이면 대상 단계에 줄 구체적인 수정 요청을 적는다.\n"
          % (stage["id"], jid, inputs_block(proj, stages, stage, jid), sources_block(proj),
+            repo_block(proj, jid, "review") if fpath(proj, "diff", jid).exists() else "",
             tgt["name"], rel(proj, tgt["id"], jid),
             stage["instruction"] or "검토 대상이 요청에 맞는지 판단한다.", rel(proj, stage["id"], jid)))
     if stage.get("polish"):
@@ -982,10 +1316,14 @@ def pipeline(job, start):
                     event(job, who, "%s: 질문 - %s" % (st["name"], q.splitlines()[0][:200]), "warn")
                     notify_job(job, "question")
                     return
+                if repo_on(proj):
+                    repo_after_work(job, proj, stages, st)
                 i += 1
                 continue
             run_step(job, proj, st, prompt_review(proj, stages, st, jid),
                      remove_kinds=("final",) if st.get("polish") else ())
+            if repo_on(proj) and repo_discard(proj):
+                event(job, "system", "%s: 검토 중 바뀐 저장소 파일은 되돌렸습니다" % st["name"], "warn")
             v, text = verdict(proj, st, jid)
             if v == "APPROVE":
                 event(job, who, "%s: 승인" % st["name"], "ok")
@@ -1043,7 +1381,12 @@ def worker():
                 proj = next((p for p in CFG["projects"] if p["id"] == pid), None)
                 if proj and start == "first" and not job.get("stages") and proj.get("stage_mode") == "auto":
                     plan_job(proj, job)
-                pipeline(job, start)
+                if proj and repo_on(proj):
+                    with repo_lock(pid):   # 같은 저장소를 쓰는 작업은 한 번에 하나씩
+                        repo_prepare(job, proj)
+                        pipeline(job, start)
+                else:
+                    pipeline(job, start)
         except Exception as e:  # noqa: BLE001
             set_state(job, status="failed", error=str(e))
             event(job, "system", "실패: %s" % e, "err")
@@ -1208,7 +1551,7 @@ def plan_job(proj, job):
 def psummary(p):
     js = [j for (pid, _), j in JOBS.items() if pid == p["id"]]
     return {"id": p["id"], "name": p["name"], "description": p.get("description", ""),
-            "active": sum(1 for j in js if j["status"] in ("queued", "running")),
+            "active": sum(1 for j in js if j["status"] in ("queued", "running", "deploying")),
             "awaiting": sum(1 for j in js if j["status"] == "awaiting_user"),
             "jobs": len(js), "tokens": sum(new_tokens(j.get("usage") or {}) for j in js),
             "cost": round(sum((j.get("usage") or {}).get("cost", 0) for j in js), 4),
@@ -1221,7 +1564,7 @@ def project_detail(proj):
     return {"id": proj["id"], "name": proj["name"], "description": proj.get("description", ""),
             "max_rounds": proj.get("max_rounds", 1), "root": proj["root"],
             "stage_mode": proj.get("stage_mode", "fixed"), "use_sources": proj.get("use_sources", "prefer"),
-            "sources": len(src_list(proj)),
+            "sources": len(src_list(proj)), "repo": repo_cfg(proj),
             "agents": [agent_info(proj, a) for a in proj["agents"]], "stages": proj["stages"],
             "schedules": proj.get("schedules", []), "summary": psummary(proj)}
 
@@ -1238,7 +1581,9 @@ def job_detail(proj, j):
              "approved": read_text(fpath(proj, "approved", j["id"]))}
     for s in src:
         files[s["id"]] = read_text(fpath(proj, s["id"], j["id"]))
-    return {"job": j, "files": files, "limit": S_().get("job_token_limit", 0), "max_rounds": proj.get("max_rounds", 1),
+    files["diff"] = read_text(fpath(proj, "diff", j["id"]))
+    rp = {"on": True, "mode": repo_cfg(proj).get("merge", "merge"), "base": repo_base(proj)} if repo_on(proj) else None
+    return {"job": j, "files": files, "repo": rp, "limit": S_().get("job_token_limit", 0), "max_rounds": proj.get("max_rounds", 1),
             "auto_planned": bool(j.get("stages")),
             "stages": [{"id": s["id"], "name": s["name"], "kind": s["kind"], "enabled": s.get("enabled", True),
                         "agent": agent_name(proj, s["agent"])} for s in src]}
@@ -1306,6 +1651,11 @@ def job_approve(proj, j):
     if not src.exists():
         raise ApiError(409, "승인할 결과 파일이 없습니다")
     proj_dirs(proj)["outbox"].mkdir(parents=True, exist_ok=True)
+    if repo_on(proj):
+        set_state(j, status="deploying", error="")
+        event(j, "user", "최종 승인 - 저장소에 반영하는 중")
+        threading.Thread(target=repo_deliver, args=(proj, j, src), daemon=True).start()
+        return job_summary(j)
     shutil.copy2(src, fpath(proj, "approved", j["id"]))
     set_state(j, status="approved")
     event(j, "user", "최종 승인 -> outbox/approved_%s.md" % j["id"], "ok")
@@ -1564,7 +1914,7 @@ def tg_jobs_text(proj):
     js = sorted((j for (pid, _), j in JOBS.items() if pid == proj["id"]), key=lambda j: j["created"], reverse=True)[:5]
     if not js:
         return "아직 작업이 없습니다.", None
-    st = {"queued": "대기", "running": "진행 중", "awaiting_user": "승인 대기", "approved": "완료",
+    st = {"queued": "대기", "running": "진행 중", "awaiting_user": "승인 대기", "approved": "완료", "deploying": "반영 중",
           "failed": "실패", "cancelled": "중단"}
     lines, btns = ["[%s] 최근 작업" % proj["name"]], []
     for j in js:
@@ -1634,7 +1984,7 @@ def tg_button(chat, data):
         try:
             if act == "ap":
                 job_approve(proj, job)
-                notify("승인했습니다: %s" % job["title"], None, chat)
+                notify("승인했습니다: %s%s" % (job["title"], " (저장소에 반영하는 중)" if repo_on(proj) else ""), None, chat)
             elif act == "rt":
                 job_restart(proj, job, {"start": cheap_start(proj, job)})
                 notify("다시 시작합니다: %s" % job["title"], None, chat)
@@ -2207,6 +2557,31 @@ def r_tg_test(m, b):
     return {"sent": len(chats)}
 
 
+@route("GET", r"/api/projects/([^/]+)/repo")
+def r_repo(m, b):
+    return repo_status(proj_of(m[1]))
+
+
+@route("POST", r"/api/projects/([^/]+)/repo")
+def r_repo_save(m, b):
+    return repo_save(proj_of(m[1]), b)
+
+
+@route("POST", r"/api/projects/([^/]+)/repo/clone", lock=False)
+def r_repo_clone(m, b):
+    with LOCK:
+        proj = proj_of(m[1])
+    return repo_clone(proj)
+
+
+@route("POST", r"/api/repo/key", lock=False)
+def r_repo_key(m, b):
+    try:
+        return repo_key()
+    except Exception as e:  # noqa: BLE001
+        raise ApiError(500, "키 생성 실패: %s" % str(e)[:200])
+
+
 @route("POST", r"/api/settings")
 def r_settings(m, b):
     return settings_update(b)
@@ -2398,6 +2773,9 @@ def recover():
             j.setdefault("usage", {})
             j.setdefault("needs_input", False)
             j.setdefault("question", "")
+            if j.get("status") == "deploying":
+                j["status"], j["error"] = "awaiting_user", "서버 재시작으로 저장소 반영이 중단됨. 다시 승인하세요"
+                write_json(p, j)
             if j.get("status") in ("queued", "running"):
                 j["status"] = "failed"
                 j["error"] = "서버가 재시작되어 중단됨"

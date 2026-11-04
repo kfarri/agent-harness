@@ -46,6 +46,7 @@ button:disabled{opacity:.5;cursor:default}
 .chip{display:inline-block;padding:1px 9px;border-radius:99px;font-size:12px;background:var(--chip);color:var(--mute);font-weight:600}
 .chip.running{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
 .chip.awaiting_user{background:color-mix(in srgb,var(--warn) 22%,transparent);color:var(--warn)}
+.chip.deploying{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
 .chip.approved{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok)}
 .chip.failed,.chip.cancelled{background:color-mix(in srgb,var(--err) 18%,transparent);color:var(--err)}
 .empty{color:var(--mute);text-align:center;padding:60px 10px}
@@ -158,7 +159,7 @@ table.ut{border-collapse:collapse;width:100%;font-size:13px}.ut td,.ut th{paddin
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const STATUS={queued:'대기',running:'진행 중',awaiting_user:'승인 대기',approved:'승인 완료',failed:'실패',cancelled:'중단'};
+const STATUS={queued:'대기',running:'진행 중',awaiting_user:'승인 대기',approved:'승인 완료',deploying:'반영 중',failed:'실패',cancelled:'중단'};
 const AG={system:'시스템',user:'나'};
 let P=[],cur=null,view='jobs',settings={},flags={},presets=[],pj=null;
 let sel=null,tab=null,tabPinned=false,last={},busy=false,tickN=0;
@@ -253,15 +254,15 @@ async function loadDetail(force){
   const j=d.job,f=d.files,stg=d.stages.filter(s=>s.enabled);
   const steps=stg.map(s=>[s.id,s.name,s.agent]).concat([['user','최종 승인','나']]);
   const keys=steps.map(s=>s[0]);
-  if(!tabPinned){const w=d.stages.slice().reverse().find(s=>s.kind==='work'&&f[s.id]!=null);tab=f.final?'final':(w?w.id:'request')}
+  if(!tabPinned&&f.approved!=null&&d.repo){tab='approved'}else if(!tabPinned){const w=d.stages.slice().reverse().find(s=>s.kind==='work'&&f[s.id]!=null);tab=f.final?'final':(w?w.id:'request')}
   const nS=stg.length;
-  const ci=j.needs_input?Math.max(0,keys.indexOf(j.step)):j.status==='awaiting_user'?nS:j.status==='approved'?nS+1:Math.max(0,keys.indexOf(j.step));
-  const st=i=>i<ci?'done':i===ci?((j.status==='failed'||j.status==='cancelled')?'err':(j.status==='running'||j.status==='awaiting_user')?'active':'wait'):'wait';
+  const ci=j.needs_input?Math.max(0,keys.indexOf(j.step)):(j.status==='awaiting_user'||j.status==='deploying')?nS:j.status==='approved'?nS+1:Math.max(0,keys.indexOf(j.step));
+  const st=i=>i<ci?'done':i===ci?((j.status==='failed'||j.status==='cancelled')?'err':(j.status==='running'||j.status==='awaiting_user'||j.status==='deploying')?'active':'wait'):'wait';
   const u=j.usage||{};
   const bys=Object.entries(u.by_stage||{}).map(([k,v])=>{const s=d.stages.find(x=>x.id===k);return esc(s?s.name:(k==='plan'?'자동 구성':k))+' '+fmtN(newTok(v))}).join(' · ');
   const srcL={telegram:'텔레그램',schedule:'예약 실행'}[j.source];
   const head='<div class="title"><h2>'+esc(j.title)+'</h2><span class="chip '+j.status+'">'+(j.needs_input?'질문 대기':STATUS[j.status])+'</span>'+(srcL?'<span class="chip">'+srcL+'</span>':'')+(j.auto_approve?'<span class="chip">자동 승인</span>':'')+(d.auto_planned?'<span class="chip approved">자동 구성</span>':'')+'</div>'
-    +'<div class="usage">'+esc(usageLine(u))+(d.limit?' · 작업 한도 '+fmtN(d.limit)+' 중 새 토큰 '+fmtN(newTok(u)):'')+'</div>'
+    +(j.branch?'<div class="usage">브랜치: '+esc(j.branch)+'</div>':'')+'<div class="usage">'+esc(usageLine(u))+(d.limit?' · 작업 한도 '+fmtN(d.limit)+' 중 새 토큰 '+fmtN(newTok(u)):'')+'</div>'
     +(bys?'<div class="usage">단계별 새 토큰: '+bys+'</div>':'')
     +'<div class="steps">'+steps.map((s,i)=>'<div class="step '+st(i)+'"><b>'+esc(s[1])+'</b><span>'+esc(s[2])+'</span></div>').join('')+'</div>'
     +(j.error?'<div class="err-box">'+esc(j.error)+'</div>':'');
@@ -280,7 +281,7 @@ async function loadDetail(force){
     }else if(j.status==='awaiting_user'){
       const lastRev=stg.slice().reverse().find(s=>s.kind==='review'&&f[s.id]!=null);
       const rv=lastRev?verdictOf(f[lastRev.id]):'APPROVE';
-      act='<div class="card approve"><h3>최종 승인이 필요합니다</h3><div class="sub">'+(rv==='APPROVE'?'검토를 통과한 결과물입니다.':'검토 단계의 수정요청이 남은 상태입니다. 해당 탭에서 내용을 확인하세요.')+' 승인하면 outbox에 approved 파일로 저장됩니다.</div>'
+      act='<div class="card approve"><h3>최종 승인이 필요합니다</h3><div class="sub">'+(rv==='APPROVE'?'검토를 통과한 결과물입니다.':'검토 단계의 수정요청이 남은 상태입니다. 해당 탭에서 내용을 확인하세요.')+(d.repo?(d.repo.mode==='branch'?' 승인하면 작업 브랜치를 GitHub에 푸시합니다(PR은 직접 병합).':' 승인하면 '+esc(d.repo.base)+'에 병합해 GitHub에 푸시합니다. 푸시되면 GitHub Actions 빌드가 시작됩니다.')+' \'변경 내용\' 탭에서 diff를 먼저 확인하세요.':' 승인하면 outbox에 approved 파일로 저장됩니다.')+'</div>'
         +'<div class="row"><button class="pri" id="ap">최종 승인</button></div><hr style="border:0;border-top:1px solid var(--line);margin:12px 0">'
         +'<textarea id="fb" placeholder="수정이 필요하면 요청 내용을 적어주세요"></textarea>'
         +'<div class="row" style="margin-top:8px"><select id="st" style="width:auto">'+opts+'</select><button id="rj">반려하고 다시 작업</button></div></div>';
@@ -288,12 +289,14 @@ async function loadDetail(force){
       act='<div class="row" style="margin:10px 0"><button class="dng" id="cn">작업 중단</button></div>';
     }else if(j.status==='failed'||j.status==='cancelled'){
       act='<div class="row" style="margin:10px 0"><select id="st" style="width:auto">'+opts.replace(' selected','')+'</select><button class="pri" id="rt">다시 시도</button></div>';
+    }else if(j.status==='deploying'){
+      act='<div class="vd">승인됨 - GitHub 저장소에 반영하는 중입니다…</div>';
     }else if(j.status==='approved'){
-      act='<div class="vd">승인 완료: shared/outbox/approved_'+esc(j.id)+'.md</div>';
+      act='<div class="vd">승인 완료: shared/outbox/approved_'+esc(j.id)+'.md'+(d.repo?' · 반영 결과는 \'승인본\' 탭에서 확인':'')+'</div>';
     }
     $('#act').innerHTML=act;bindJob(j);
   }
-  const tdef=[['final','최종본']].concat(d.stages.slice().reverse().map(s=>[s.id,s.name+(s.kind==='review'?' (검토)':'')+(s.enabled?'':' ·꺼짐')])).concat([['request','요청']]);
+  const tdef=(f.approved!=null&&d.repo?[['approved','승인본']]:[]).concat(f.diff!=null?[['diff','변경 내용']]:[]).concat([['final','최종본']]).concat(d.stages.slice().reverse().map(s=>[s.id,s.name+(s.kind==='review'?' (검토)':'')+(s.enabled?'':' ·꺼짐')])).concat([['request','요청']]);
   const tabsH='<div class="tabs">'+tdef.map(t=>'<button class="tab'+(tab===t[0]?' on':'')+(f[t[0]]!=null?'':' none')+'" data-t="'+esc(t[0])+'">'+esc(t[1])+'</button>').join('')+'</div>';
   const txt=f[tab];const ts=d.stages.find(s=>s.id===tab);const isRev=ts&&ts.kind==='review';
   let vd='';if(isRev){const v=verdictOf(txt);if(v)vd='<div class="vd">판정: <b>'+(v==='APPROVE'?'승인':'수정요청')+'</b></div>'}
@@ -622,6 +625,7 @@ async function loadSettings(){
   pj=await api(base());
   const tg=await api('/api/telegram');
   const sec=await api('/api/security');
+  const rp=await api(base()+'/repo');
   const fl=Object.keys(flags).map(k=>'<span class="chip '+(flags[k]?'approved':'')+'">'+esc(k)+' '+(flags[k]?'사용':'미지원')+'</span>').join(' ');
   $('#v-settings').innerHTML='<div class="card"><h2>프로젝트 설정</h2>'
     +'<label class="lb">이름<input type="text" id="sn" maxlength="40" value="'+esc(pj.name)+'"></label>'
@@ -643,7 +647,7 @@ async function loadSettings(){
     +'<div class="row" style="margin-top:8px"><button class="pri" id="gsave">저장</button></div></div>'
     +'<div class="card"><h2>토큰 절감 옵션 (설치된 claude가 지원하면 자동 적용)</h2><div class="row">'+fl+'</div>'
     +'<ul class="tip"><li><b>--tools</b>: 에이전트가 쓰는 도구만 모델에 알려 매 호출의 고정 토큰을 줄입니다.</li><li><b>--strict-mcp-config, --disable-slash-commands, --no-session-persistence</b>: 불필요한 도구·스킬 목록과 세션 파일 저장을 끕니다.</li><li>단계마다 최대 턴이 제한되고, 에이전트에게 설명 없이 파일만 저장하도록 지시합니다.</li></ul></div>'
-    +tgCard(tg)+secCard(sec)
+    +repoCard(rp)+tgCard(tg)+secCard(sec)
     +'<div class="card"><h2>프로젝트별 사용량 (새 토큰 = 입력 + 출력 + 캐시 쓰기)</h2><table class="ut"><tr><th>프로젝트</th><th>작업</th><th>새 토큰</th><th>추정 비용</th></tr>'
     +P.map(p=>'<tr><td>'+esc(p.name)+'</td><td>'+p.jobs+'</td><td>'+fmtN(p.tokens)+'</td><td>'+(p.cost?'$'+p.cost.toFixed(3):'-')+'</td></tr>').join('')+'</table></div>'
     +'<div class="card"><h2>토큰 아끼는 방법</h2><ul class="tip"><li>꼭 필요한 단계만 두세요. 단계 1개 = 호출 1회입니다. 필요 없는 단계는 \'사용\'을 끄세요.</li>'
@@ -651,6 +655,7 @@ async function loadSettings(){
     +'<li>요청에 분량과 범위를 구체적으로 적으면 불필요한 장문 생성을 줄입니다.</li><li>작업 상세 화면의 단계별 새 토큰 수치로 가장 비싼 단계를 찾아 조정하세요.</li></ul></div>';
   $('#ssave').onclick=async()=>{try{await post(base()+'/update',{name:$('#sn').value,description:$('#sd').value,max_rounds:+$('#sr').value,stage_mode:$('#smode').value});toast('저장했습니다');await loadProjects();await loadSettings()}catch(e){toast(e.message)}};
   $('#sdel').onclick=async()=>{if(!confirm('이 프로젝트를 목록에서 제거할까요? 폴더와 파일은 지워지지 않습니다.'))return;try{await post(base()+'/delete');toast('제거했습니다');cur=null;await loadProjects();setView('jobs')}catch(e){toast(e.message)}};
+  bindRepo();
   $('#gsave').onclick=async()=>{try{await post('/api/settings',{parallel:+$('#gp').value,job_token_limit:parseInt($('#gt').value)||0,planner_model:$('#gm').value});toast('저장했습니다');await loadProjects()}catch(e){toast(e.message)}};
   $('#slog').onclick=async()=>{if(!confirm('모든 기기의 로그인을 끊을까요? 이 화면도 다시 로그인해야 합니다.'))return;
     try{await post('/api/security/logout-all');location.href='/login'}catch(e){toast(e.message)}};
@@ -659,6 +664,29 @@ async function loadSettings(){
   document.querySelectorAll('[data-unpair]').forEach(b=>b.onclick=async()=>{
     if(!confirm('이 대화의 연결을 해제할까요?'))return;
     try{await post('/api/telegram/update',{unpair:b.dataset.unpair});toast('해제했습니다');await loadSettings()}catch(e){toast(e.message)}});
+}
+
+function repoCard(st){
+  const r=st.repo||{};const on=!!r.url;
+  return '<div class="card"><h2>코드 저장소 (GitHub 연동)</h2>'
+    +'<div class="vd">연결하면 이 프로젝트의 에이전트가 저장소 폴더의 실제 코드를 고칩니다. 작업마다 <b>harness/작업ID</b> 브랜치를 만들고, 하네스가 빌드 확인과 커밋을 대신 처리합니다(토큰 사용 없음). 최종 승인하면 GitHub에 푸시합니다.</div>'
+    +'<label class="lb">저장소 주소 (SSH 권장)<input type="text" id="rurl" value="'+esc(r.url||'')+'" placeholder="git@github.com:kfarri/myma.git"></label>'
+    +'<div class="g2"><label class="lb">로컬 폴더<input type="text" id="rpath" value="'+esc(r.path||st.default_path)+'"></label>'
+    +'<label class="lb">기준 브랜치<input type="text" id="rbr" value="'+esc(r.branch||'main')+'"></label></div>'
+    +'<label class="lb">빌드 확인 명령 (비우면 생략 · 실패하면 오류를 에이전트에게 돌려줘 자동 수정)<input type="text" id="rbuild" value="'+esc(r.build||'')+'" placeholder="예: npm ci && npm run build"></label>'
+    +'<label class="lb">승인 시 반영 방식<select id="rmode" style="width:auto"><option value="merge"'+(r.merge!=='branch'?' selected':'')+'>기준 브랜치에 병합 후 푸시 (GitHub Actions 자동 빌드)</option><option value="branch"'+(r.merge==='branch'?' selected':'')+'>작업 브랜치만 푸시 (PR은 GitHub에서 직접 병합)</option></select></label>'
+    +'<label class="lb">푸시 후 실행할 배포 명령 (선택)<input type="text" id="rdep" value="'+esc(r.deploy||'')+'" placeholder="비워두면 GitHub Actions에 맡김"></label>'
+    +'<div class="row" style="margin-top:8px"><button class="pri" id="rsave">저장</button>'+(on?'<button id="rclone">'+(st.cloned?'최신 내용 가져오기':'내려받기')+'</button>':'')+'<button id="rkey">배포 키 보기</button>'+(on?'<button class="dng" id="roff">연결 해제</button>':'')+'</div>'
+    +'<div class="vd">상태: '+(on?(st.cloned?'내려받음 · 최근 커밋 '+esc(st.head||'-'):'아직 내려받지 않음'):'연결 안 됨')+(st.web?' · <a href="'+esc(st.web)+'" target="_blank" rel="noopener">GitHub 열기</a>':'')+'</div>'
+    +'<pre id="rkeyv" class="vd" style="white-space:pre-wrap;word-break:break-all'+(st.key?'':';display:none')+'">'+esc(st.key||'')+'</pre>'
+    +'<ul class="tip"><li>배포 키는 GitHub 저장소 → Settings → Deploy keys → Add deploy key에 붙여넣고 <b>Allow write access</b>를 켜세요.</li><li>빌드 산출물 폴더(dist, node_modules 등)는 저장소의 .gitignore에 있어야 커밋에 섞이지 않습니다.</li></ul></div>';
+}
+function bindRepo(){
+  const v=id=>$('#'+id).value.trim();
+  $('#rsave').onclick=async()=>{try{await post(base()+'/repo',{url:v('rurl'),path:v('rpath'),branch:v('rbr'),build:v('rbuild'),merge:$('#rmode').value,deploy:v('rdep')});toast('저장했습니다');await loadSettings()}catch(e){toast(e.message)}};
+  if($('#rclone'))$('#rclone').onclick=async e=>{e.target.disabled=true;toast('저장소와 통신 중…');try{const r=await post(base()+'/repo/clone');toast(r.msg);await loadSettings()}catch(err){alert(err.message);e.target.disabled=false}};
+  $('#rkey').onclick=async()=>{try{const r=await post('/api/repo/key');const p=$('#rkeyv');p.textContent=r.key;p.style.display='';try{await navigator.clipboard.writeText(r.key);toast('공개 키를 복사했습니다')}catch(_){toast('아래 공개 키를 복사하세요')}}catch(e){toast(e.message)}};
+  if($('#roff'))$('#roff').onclick=async()=>{if(!confirm('저장소 연결을 해제할까요? 로컬 폴더는 지워지지 않습니다.'))return;try{await post(base()+'/repo',{url:''});toast('해제했습니다');await loadSettings()}catch(e){toast(e.message)}};
 }
 
 /* ---------- 새 프로젝트 ---------- */
