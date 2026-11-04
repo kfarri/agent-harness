@@ -881,7 +881,12 @@ def run_step(job, proj, stage, prompt, remove_kinds=()):
 REPO_URL_RE = re.compile(r"^(git@[\w.-]+:[\w./-]+|https://[\w.-]+/[\w./-]+|ssh://[\w@.:/-]+)$")
 REPO_PATH_RE = re.compile(r"^/[\w./-]+$")
 BRANCH_RE = re.compile(r"^[\w][\w./-]{0,59}$")
-REPO_KEY = Path(os.environ.get("REPO_SSH_KEY") or (Path.home() / ".ssh" / "id_ed25519_harness"))
+KEY_DIR = Path.home() / ".ssh"
+
+
+def key_path(proj):
+    """GitHub 배포 키는 저장소 하나에만 등록되므로 프로젝트마다 따로 만든다."""
+    return KEY_DIR / ("harness_%s" % proj["id"])
 BUILD_TIMEOUT = int(os.environ.get("BUILD_TIMEOUT", "900"))
 BUILD_FIX_TRIES = int(os.environ.get("BUILD_FIX_TRIES", "2"))
 REPO_LOCKS = {}
@@ -914,17 +919,17 @@ def repo_lock(pid):
         return REPO_LOCKS.setdefault(pid, threading.Lock())
 
 
-def git_env():
+def git_env(keyfile=None):
     e = child_env()
     e["GIT_TERMINAL_PROMPT"] = "0"
-    key = "-i %s -o IdentitiesOnly=yes " % shlex.quote(str(REPO_KEY)) if REPO_KEY.exists() else ""
+    key = "-i %s -o IdentitiesOnly=yes " % shlex.quote(str(keyfile)) if keyfile and keyfile.exists() else ""
     e["GIT_SSH_COMMAND"] = "ssh %s-o StrictHostKeyChecking=accept-new -o BatchMode=yes" % key
     return e
 
 
-def git(cwd, *args, timeout=120, check=True):
+def git(cwd, *args, timeout=120, check=True, proj=None):
     try:
-        r = subprocess.run(["git", *GIT_ID, *args], cwd=str(cwd), env=git_env(), capture_output=True, text=True,
+        r = subprocess.run(["git", *GIT_ID, *args], cwd=str(cwd), env=git_env(key_path(proj) if proj else None), capture_output=True, text=True,
                            timeout=timeout)
     except subprocess.TimeoutExpired:
         raise RuntimeError("git %s 시간 초과" % args[0])
@@ -941,11 +946,12 @@ def web_url(url):
 def repo_status(proj):
     r = dict(repo_cfg(proj))
     out = {"repo": r, "cloned": False, "key": "", "default_path": str(BASE / "repos" / proj["id"])}
-    if REPO_KEY.with_suffix(".pub").exists():
-        out["key"] = REPO_KEY.with_suffix(".pub").read_text().strip()
+    pub = key_path(proj).with_suffix(".pub")
+    if pub.exists():
+        out["key"] = pub.read_text().strip()
     if r.get("path") and (Path(r["path"]) / ".git").is_dir():
         out["cloned"] = True
-        res = git(r["path"], "log", "-1", "--format=%h %s (%cr)", check=False)
+        res = git(r["path"], "log", "-1", "--format=%h %s (%cr)", check=False, proj=proj)
         out["head"] = res.stdout.strip() if res.returncode == 0 else ""
     out["web"] = web_url(r.get("url"))
     return out
@@ -985,28 +991,29 @@ def repo_clone(proj):
     with repo_lock(proj["id"]):
         try:
             if (d / ".git").is_dir():
-                git(d, "remote", "set-url", "origin", url)
-                git(d, "fetch", "origin", repo_base(proj), timeout=300)
+                git(d, "remote", "set-url", "origin", url, proj=proj)
+                git(d, "fetch", "origin", repo_base(proj), timeout=300, proj=proj)
                 msg = "이미 내려받은 저장소입니다. 최신 내용을 가져왔습니다"
             else:
                 if d.exists() and any(d.iterdir()):
                     raise ApiError(409, "폴더가 비어 있지 않습니다: %s" % d)
                 d.parent.mkdir(parents=True, exist_ok=True)
-                git(d.parent, "clone", url, str(d), timeout=600)
+                git(d.parent, "clone", url, str(d), timeout=600, proj=proj)
                 msg = "저장소를 내려받았습니다"
-            git(d, "rev-parse", "--verify", "origin/" + repo_base(proj))
+            git(d, "rev-parse", "--verify", "origin/" + repo_base(proj), proj=proj)
         except RuntimeError as e:
             raise ApiError(502, "%s\n(GitHub에 배포 키를 등록했는지, 쓰기 권한을 켰는지 확인하세요)" % e)
     refresh_agent_settings(proj)
     return dict(repo_status(proj), msg=msg)
 
 
-def repo_key():
-    if not REPO_KEY.exists():
-        REPO_KEY.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "agent-harness", "-f", str(REPO_KEY)],
+def repo_key(proj):
+    k = key_path(proj)
+    if not k.exists():
+        k.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "agent-harness-%s" % proj["id"], "-f", str(k)],
                        check=True, capture_output=True, timeout=30)
-    return {"key": REPO_KEY.with_suffix(".pub").read_text().strip()}
+    return {"key": k.with_suffix(".pub").read_text().strip()}
 
 
 def repo_prepare(job, proj):
@@ -1014,26 +1021,26 @@ def repo_prepare(job, proj):
     d, base, br = repo_dir(proj), repo_base(proj), job_branch(job["id"])
     if not (d / ".git").is_dir():
         raise RuntimeError("저장소를 아직 내려받지 않았습니다. 설정 > 코드 저장소에서 '내려받기'를 누르세요")
-    git(d, "fetch", "origin", base, timeout=300)
-    git(d, "reset", "--hard", "-q")
-    git(d, "clean", "-fdq")
-    if git(d, "rev-parse", "--verify", "--quiet", "refs/heads/" + br, check=False).returncode == 0:
-        git(d, "checkout", "-q", br)
-        if git(d, "rebase", "-q", "origin/" + base, check=False).returncode:
-            git(d, "rebase", "--abort", check=False)
-            git(d, "checkout", "-q", "-B", br, "origin/" + base)
+    git(d, "fetch", "origin", base, timeout=300, proj=proj)
+    git(d, "reset", "--hard", "-q", proj=proj)
+    git(d, "clean", "-fdq", proj=proj)
+    if git(d, "rev-parse", "--verify", "--quiet", "refs/heads/" + br, check=False, proj=proj).returncode == 0:
+        git(d, "checkout", "-q", br, proj=proj)
+        if git(d, "rebase", "-q", "origin/" + base, check=False, proj=proj).returncode:
+            git(d, "rebase", "--abort", check=False, proj=proj)
+            git(d, "checkout", "-q", "-B", br, "origin/" + base, proj=proj)
             event(job, "system", "저장소: %s 이 그사이 바뀌어 충돌이 나서, 최신 %s 기준으로 새로 작업합니다" % (base, base), "warn")
         else:
             event(job, "system", "저장소: %s 브랜치에서 이어서 작업 (최신 %s 반영)" % (br, base))
     else:
-        git(d, "checkout", "-q", "-B", br, "origin/" + base)
+        git(d, "checkout", "-q", "-B", br, "origin/" + base, proj=proj)
         event(job, "system", "저장소: %s 기준으로 %s 브랜치 생성" % (base, br))
     set_state(job, branch=br)
 
 
 def repo_files(proj, limit=250):
     try:
-        names = git(repo_dir(proj), "ls-files").splitlines()
+        names = git(repo_dir(proj), "ls-files", proj=proj).splitlines()
     except RuntimeError:
         return ""
     head = names[:limit]
@@ -1062,7 +1069,7 @@ def run_shell(job, proj, cmd, what):
     log = d["logs"] / ("%s_%s_%s.log" % (job["id"], what, time.strftime("%H%M%S")))
     key = (proj["id"], job["id"])
     with open(log, "wb") as lf:
-        p = subprocess.Popen(["bash", "-lc", cmd], cwd=str(repo_dir(proj)), env=git_env(), stdout=lf,
+        p = subprocess.Popen(["bash", "-lc", cmd], cwd=str(repo_dir(proj)), env=git_env(key_path(proj)), stdout=lf,
                              stderr=subprocess.STDOUT, start_new_session=True)
         PROCS[key] = p
         try:
@@ -1078,7 +1085,7 @@ def run_shell(job, proj, cmd, what):
 
 
 def repo_changed(proj):
-    return bool(git(repo_dir(proj), "status", "--porcelain").strip())
+    return bool(git(repo_dir(proj), "status", "--porcelain", proj=proj).strip())
 
 
 def repo_after_work(job, proj, stages, st):
@@ -1102,17 +1109,17 @@ def repo_after_work(job, proj, stages, st):
         fb = ("빌드 명령 `%s` 이 실패했다. 아래 오류의 원인을 찾아 저장소 코드를 고친다. 요청과 관계없는 부분은 건드리지 않는다.\n"
               "```\n%s\n```" % (cmd, tail[-2500:]))
         run_step(job, proj, st, prompt_work(proj, stages, st, jid, fb))
-    git(d, "add", "-A")
+    git(d, "add", "-A", proj=proj)
     title = re.sub(r"\s+", " ", job["title"])[:60]
-    git(d, "commit", "-q", "-m", "%s\n\nagent-harness 작업 %s · %s 단계" % (title, jid, st["name"]))
+    git(d, "commit", "-q", "-m", "%s\n\nagent-harness 작업 %s · %s 단계" % (title, jid, st["name"]), proj=proj)
     write_diff(proj, jid)
-    event(job, "system", "커밋 완료: %s" % git(d, "log", "-1", "--format=%h").strip(), "ok")
+    event(job, "system", "커밋 완료: %s" % git(d, "log", "-1", "--format=%h", proj=proj).strip(), "ok")
 
 
 def write_diff(proj, jid, limit=40000):
     d, base = repo_dir(proj), "origin/" + repo_base(proj)
-    stat = git(d, "diff", "--stat", base + "...HEAD")
-    diff = git(d, "diff", base + "...HEAD")
+    stat = git(d, "diff", "--stat", base + "...HEAD", proj=proj)
+    diff = git(d, "diff", base + "...HEAD", proj=proj)
     cut = "\n... (diff가 길어 %d자에서 잘림)" % limit if len(diff) > limit else ""
     fpath(proj, "diff", jid).write_text("## 변경 파일\n```\n%s```\n\n## 변경 내용\n```diff\n%s%s\n```\n"
                                         % (stat, diff[:limit], cut))
@@ -1121,8 +1128,8 @@ def write_diff(proj, jid, limit=40000):
 def repo_discard(proj):
     """검토 단계에서 에이전트가 실수로 고친 파일은 되돌린다(커밋된 작업 결과만 남긴다)."""
     if repo_changed(proj):
-        git(repo_dir(proj), "reset", "--hard", "-q")
-        git(repo_dir(proj), "clean", "-fdq")
+        git(repo_dir(proj), "reset", "--hard", "-q", proj=proj)
+        git(repo_dir(proj), "clean", "-fdq", proj=proj)
         return True
     return False
 
@@ -1134,27 +1141,27 @@ def repo_deliver(proj, j, summary_src):
     lines = []
     try:
         with repo_lock(proj["id"]):
-            git(d, "fetch", "origin", base, timeout=300)
-            git(d, "reset", "--hard", "-q")
-            git(d, "checkout", "-q", br)
-            ahead = int(git(d, "rev-list", "--count", "origin/%s..%s" % (base, br)).strip() or 0)
+            git(d, "fetch", "origin", base, timeout=300, proj=proj)
+            git(d, "reset", "--hard", "-q", proj=proj)
+            git(d, "checkout", "-q", br, proj=proj)
+            ahead = int(git(d, "rev-list", "--count", "origin/%s..%s" % (base, br), proj=proj).strip() or 0)
             if not ahead:
                 lines.append("- 바뀐 코드가 없어 저장소에는 반영하지 않았습니다")
             elif mode == "branch":
-                git(d, "push", "-q", "-f", "origin", "%s:%s" % (br, br), timeout=300)
+                git(d, "push", "-q", "-f", "origin", "%s:%s" % (br, br), timeout=300, proj=proj)
                 lines.append("- `%s` 브랜치로 푸시했습니다 (커밋 %d개)" % (br, ahead))
                 if web:
                     lines.append("- PR 만들기: %s/compare/%s...%s?expand=1" % (web, base, br))
             else:
-                git(d, "checkout", "-q", "-B", base, "origin/" + base)
-                r = git(d, "merge", "--no-ff", "-m", "Merge %s: %s" % (br, j["title"][:60]), br, check=False)
+                git(d, "checkout", "-q", "-B", base, "origin/" + base, proj=proj)
+                r = git(d, "merge", "--no-ff", "-m", "Merge %s: %s" % (br, j["title"][:60]), br, check=False, proj=proj)
                 if r.returncode:
-                    git(d, "merge", "--abort", check=False)
-                    git(d, "checkout", "-q", br)
+                    git(d, "merge", "--abort", check=False, proj=proj)
+                    git(d, "checkout", "-q", br, proj=proj)
                     raise RuntimeError("%s 에 그사이 다른 변경이 있어 자동 병합 중 충돌이 났습니다. "
                                        "반려하고 다시 작업하면 최신 %s 기준으로 다시 맞춥니다" % (base, base))
-                git(d, "push", "-q", "origin", "%s:%s" % (base, base), timeout=300)
-                sha = git(d, "log", "-1", "--format=%h").strip()
+                git(d, "push", "-q", "origin", "%s:%s" % (base, base), timeout=300, proj=proj)
+                sha = git(d, "log", "-1", "--format=%h", proj=proj).strip()
                 lines.append("- `%s`에 병합하고 푸시했습니다 (커밋 %s, 변경 커밋 %d개)" % (base, sha, ahead))
                 if web:
                     lines.append("- 커밋: %s/commit/%s\n- 빌드 상태(GitHub Actions): %s/actions" % (web, sha, web))
@@ -2574,10 +2581,12 @@ def r_repo_clone(m, b):
     return repo_clone(proj)
 
 
-@route("POST", r"/api/repo/key", lock=False)
+@route("POST", r"/api/projects/([^/]+)/repo/key", lock=False)
 def r_repo_key(m, b):
+    with LOCK:
+        proj = proj_of(m[1])
     try:
-        return repo_key()
+        return repo_key(proj)
     except Exception as e:  # noqa: BLE001
         raise ApiError(500, "키 생성 실패: %s" % str(e)[:200])
 
@@ -3506,7 +3515,7 @@ function bindRepo(){
   const v=id=>$('#'+id).value.trim();
   $('#rsave').onclick=async()=>{try{await post(base()+'/repo',{url:v('rurl'),path:v('rpath'),branch:v('rbr'),build:v('rbuild'),merge:$('#rmode').value,deploy:v('rdep')});toast('저장했습니다');await loadSettings()}catch(e){toast(e.message)}};
   if($('#rclone'))$('#rclone').onclick=async e=>{e.target.disabled=true;toast('저장소와 통신 중…');try{const r=await post(base()+'/repo/clone');toast(r.msg);await loadSettings()}catch(err){alert(err.message);e.target.disabled=false}};
-  $('#rkey').onclick=async()=>{try{const r=await post('/api/repo/key');const p=$('#rkeyv');p.textContent=r.key;p.style.display='';try{await navigator.clipboard.writeText(r.key);toast('공개 키를 복사했습니다')}catch(_){toast('아래 공개 키를 복사하세요')}}catch(e){toast(e.message)}};
+  $('#rkey').onclick=async()=>{try{const r=await post(base()+'/repo/key');const p=$('#rkeyv');p.textContent=r.key;p.style.display='';try{await navigator.clipboard.writeText(r.key);toast('공개 키를 복사했습니다')}catch(_){toast('아래 공개 키를 복사하세요')}}catch(e){toast(e.message)}};
   if($('#roff'))$('#roff').onclick=async()=>{if(!confirm('저장소 연결을 해제할까요? 로컬 폴더는 지워지지 않습니다.'))return;try{await post(base()+'/repo',{url:''});toast('해제했습니다');await loadSettings()}catch(e){toast(e.message)}};
 }
 

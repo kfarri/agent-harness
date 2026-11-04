@@ -685,7 +685,7 @@ function bindRepo(){
   const v=id=>$('#'+id).value.trim();
   $('#rsave').onclick=async()=>{try{await post(base()+'/repo',{url:v('rurl'),path:v('rpath'),branch:v('rbr'),build:v('rbuild'),merge:$('#rmode').value,deploy:v('rdep')});toast('저장했습니다');await loadSettings()}catch(e){toast(e.message)}};
   if($('#rclone'))$('#rclone').onclick=async e=>{e.target.disabled=true;toast('저장소와 통신 중…');try{const r=await post(base()+'/repo/clone');toast(r.msg);await loadSettings()}catch(err){alert(err.message);e.target.disabled=false}};
-  $('#rkey').onclick=async()=>{try{const r=await post('/api/repo/key');const p=$('#rkeyv');p.textContent=r.key;p.style.display='';try{await navigator.clipboard.writeText(r.key);toast('공개 키를 복사했습니다')}catch(_){toast('아래 공개 키를 복사하세요')}}catch(e){toast(e.message)}};
+  $('#rkey').onclick=async()=>{try{const r=await post(base()+'/repo/key');const p=$('#rkeyv');p.textContent=r.key;p.style.display='';try{await navigator.clipboard.writeText(r.key);toast('공개 키를 복사했습니다')}catch(_){toast('아래 공개 키를 복사하세요')}}catch(e){toast(e.message)}};
   if($('#roff'))$('#roff').onclick=async()=>{if(!confirm('저장소 연결을 해제할까요? 로컬 폴더는 지워지지 않습니다.'))return;try{await post(base()+'/repo',{url:''});toast('해제했습니다');await loadSettings()}catch(e){toast(e.message)}};
 }
 
