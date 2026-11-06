@@ -132,6 +132,7 @@ table.ut{border-collapse:collapse;width:100%;font-size:13px}.ut td,.ut th{paddin
       <textarea id="req" placeholder="요청 내용을 입력하세요"></textarea>
       <div class="row" style="margin-top:8px"><button class="pri" id="go">작업 시작</button></div>
     </div>
+    <div id="relcard"></div>
     <div class="jobs" id="jobs"></div>
     <div class="row" style="margin-top:8px;justify-content:center"><button id="jclean" style="font-size:12px;padding:5px 10px">끝난 작업 정리</button></div>
   </aside>
@@ -243,8 +244,25 @@ $('#ptabs').onclick=e=>{
 document.querySelectorAll('#subnav .nv').forEach(b=>b.onclick=()=>setView(b.dataset.v));
 
 /* ---------- 작업 ---------- */
+let relAt=0,relKey='';
+async function loadRel(force){
+  const c=(P||[]).find(p=>p.id===cur);const el=$('#relcard');
+  if(!c||!c.repo||!c.repo.release){if(el.innerHTML)el.innerHTML='';return}
+  if(!force&&Date.now()-relAt<15000&&relKey===cur)return;relAt=Date.now();relKey=cur;
+  let st;try{st=await api(base()+'/repo')}catch(e){return}
+  const n=st.pending.length;
+  el.innerHTML='<div class="card" style="margin-top:10px"><h2>테스트 → 운영</h2>'
+    +'<div class="vd">테스트('+esc(c.repo.branch)+')에만 있는 변경: <b>'+n+'개</b>'+(st.release_head?'<br>운영('+esc(c.repo.release)+'): '+esc(st.release_head):'')+'</div>'
+    +(n?'<ul class="tip" style="margin:6px 0">'+st.pending.slice(0,6).map(x=>'<li>'+esc(x.msg)+' <span style="color:var(--mute)">'+esc(x.when)+'</span></li>').join('')+(n>6?'<li>… 외 '+(n-6)+'개</li>':'')+'</ul>'
+      +'<div class="row"><button class="pri" id="relgo">운영 반영</button></div>':'<div class="vd">운영과 테스트가 같은 상태입니다.</div>')+'</div>';
+  if($('#relgo'))$('#relgo').onclick=async e=>{
+    if(!confirm('테스트 서버에서 확인을 마쳤나요?\n변경 '+n+'개를 운영에 올리면 1분 안에 실서버에 배포됩니다.'))return;
+    e.target.disabled=true;toast('운영에 반영하는 중…');
+    try{await post(base()+'/repo/release');toast('운영 반영 완료 - 1분 안에 실서버에 배포됩니다');await loadRel(true)}catch(err){alert(err.message);e.target.disabled=false}};
+}
 async function loadList(){
   if(!cur)return;
+  loadRel();
   const d=await api(base()+'/jobs');
   const h=d.jobs.map(j=>'<div class="job'+(j.id===sel?' sel':'')+'" data-id="'+esc(j.id)+'"><div class="t">'+esc(j.title)+'</div><div class="m"><span class="chip '+j.status+'">'+(j.needs_input?'질문 대기':STATUS[j.status])+'</span><span>'+esc(j.created.slice(5,16))+'</span>'+(j.tokens?'<span>토큰 '+fmtN(j.tokens)+'</span>':'')+'</div></div>').join('');
   if(h!==last.list){last.list=h;$('#jobs').innerHTML=h||'<div class="empty" style="padding:20px">아직 작업이 없습니다</div>'}
@@ -696,19 +714,27 @@ function repoCard(st){
     +'<label class="lb">저장소 주소 (SSH 권장)<input type="text" id="rurl" value="'+esc(r.url||'')+'" placeholder="git@github.com:kfarri/myma.git"></label>'
     +'<div class="g2"><label class="lb">로컬 폴더<input type="text" id="rpath" value="'+esc(r.path||st.default_path)+'"></label>'
     +'<label class="lb">기준 브랜치<input type="text" id="rbr" value="'+esc(r.branch||'main')+'"></label></div>'
+    +'<label class="lb">운영 브랜치 (테스트 단계를 쓰려면 입력 · 비우면 승인 즉시 운영)<input type="text" id="rrel" value="'+esc(r.release||'')+'" placeholder="예: main  (이때 기준 브랜치는 develop)"></label>'
+    +(r.release?'<div class="vd">승인하면 <b>'+esc(r.branch||'main')+'</b>(테스트)에 올라가고, 작업 화면의 \'운영 반영\'을 눌러야 <b>'+esc(r.release)+'</b>(운영)으로 올라갑니다.</div>':'')
     +'<label class="lb">빌드 확인 명령 (비우면 생략 · 실패하면 오류를 에이전트에게 돌려줘 자동 수정)<input type="text" id="rbuild" value="'+esc(r.build||'')+'" placeholder="예: npm ci && npm run build"></label>'
     +'<label class="lb">승인 시 반영 방식<select id="rmode" style="width:auto"><option value="merge"'+(r.merge!=='branch'?' selected':'')+'>기준 브랜치에 병합 후 푸시 (GitHub Actions 자동 빌드)</option><option value="branch"'+(r.merge==='branch'?' selected':'')+'>작업 브랜치만 푸시 (PR은 GitHub에서 직접 병합)</option></select></label>'
     +'<label class="lb">푸시 후 실행할 배포 명령 (선택)<input type="text" id="rdep" value="'+esc(r.deploy||'')+'" placeholder="비워두면 GitHub Actions에 맡김"></label>'
     +'<div class="row" style="margin-top:8px"><button class="pri" id="rsave">저장</button>'+(on?'<button id="rclone">'+(st.cloned?'최신 내용 가져오기':'내려받기')+'</button>':'')+'<button id="rkey">배포 키 보기</button>'+(on?'<button class="dng" id="roff">연결 해제</button>':'')+'</div>'
     +'<div class="vd">상태: '+(on?(st.cloned?'내려받음 · 최근 커밋 '+esc(st.head||'-'):'아직 내려받지 않음'):'연결 안 됨')+(st.web?' · <a href="'+esc(st.web)+'" target="_blank" rel="noopener">GitHub 열기</a>':'')+'</div>'
     +'<pre id="rkeyv" class="vd" style="white-space:pre-wrap;word-break:break-all'+(st.key?'':';display:none')+'">'+esc(st.key||'')+'</pre>'
+    +((st.releases||[]).length?'<div class="vd" style="margin-top:10px">운영 반영 이력</div><table class="ut"><tr><th>시각</th><th>버전</th><th>내용</th><th></th></tr>'
+      +st.releases.map((x,i)=>'<tr><td>'+esc(x.ts.slice(5,16))+'</td><td>'+esc(x.sha.slice(0,7))+'</td><td>'+(x.rollback?'<b>되돌리기</b>':'변경 '+x.n+'개 · '+esc((x.msgs||[]).slice(0,2).join(', ')))+' <span style="color:var(--mute)">('+esc(x.by||'')+')</span></td><td>'
+        +(i===0?'<span class="chip approved">현재 운영</span>':'<button data-rb="'+esc(x.sha)+'" style="font-size:12px;padding:3px 8px">이 버전으로 되돌리기</button>')+'</td></tr>').join('')
+      +(st.releases[0].prev&&!st.releases[0].rollback?'<tr><td colspan="3">반영 직전 버전 '+esc(st.releases[0].prev.slice(0,7))+'</td><td><button data-rb="'+esc(st.releases[0].prev)+'" class="dng" style="font-size:12px;padding:3px 8px">직전 버전으로 되돌리기</button></td></tr>':'')+'</table>':'')
     +'<ul class="tip"><li>배포 키는 GitHub 저장소 → Settings → Deploy keys → Add deploy key에 붙여넣고 <b>Allow write access</b>를 켜세요.</li><li>빌드 산출물 폴더(dist, node_modules 등)는 저장소의 .gitignore에 있어야 커밋에 섞이지 않습니다.</li></ul></div>';
 }
 function bindRepo(){
   const v=id=>$('#'+id).value.trim();
-  $('#rsave').onclick=async()=>{try{await post(base()+'/repo',{url:v('rurl'),path:v('rpath'),branch:v('rbr'),build:v('rbuild'),merge:$('#rmode').value,deploy:v('rdep')});toast('저장했습니다');await loadSettings()}catch(e){toast(e.message)}};
+  $('#rsave').onclick=async()=>{try{await post(base()+'/repo',{url:v('rurl'),path:v('rpath'),branch:v('rbr'),release:v('rrel'),build:v('rbuild'),merge:$('#rmode').value,deploy:v('rdep')});toast('저장했습니다');await loadSettings()}catch(e){toast(e.message)}};
   if($('#rclone'))$('#rclone').onclick=async e=>{e.target.disabled=true;toast('저장소와 통신 중…');try{const r=await post(base()+'/repo/clone');toast(r.msg);await loadSettings()}catch(err){alert(err.message);e.target.disabled=false}};
   $('#rkey').onclick=async()=>{try{const r=await post(base()+'/repo/key');const p=$('#rkeyv');p.textContent=r.key;p.style.display='';try{await navigator.clipboard.writeText(r.key);toast('공개 키를 복사했습니다')}catch(_){toast('아래 공개 키를 복사하세요')}}catch(e){toast(e.message)}};
+  document.querySelectorAll('[data-rb]').forEach(b=>b.onclick=async()=>{if(!confirm('운영을 '+b.dataset.rb.slice(0,7)+' 버전으로 되돌릴까요?\n1분 안에 실서버가 이 버전으로 다시 배포됩니다. 테스트 브랜치는 그대로입니다.'))return;
+    b.disabled=true;try{await post(base()+'/repo/rollback',{sha:b.dataset.rb});toast('되돌렸습니다 - 1분 안에 실서버에 배포됩니다');await loadSettings()}catch(e){alert(e.message);b.disabled=false}});
   if($('#roff'))$('#roff').onclick=async()=>{if(!confirm('저장소 연결을 해제할까요? 로컬 폴더는 지워지지 않습니다.'))return;try{await post(base()+'/repo',{url:''});toast('해제했습니다');await loadSettings()}catch(e){toast(e.message)}};
 }
 

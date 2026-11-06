@@ -82,6 +82,7 @@ TG_HELP = ("사용법\n"
            "/status  지금 실행 중인 작업\n"
            "/sched  예약 목록\n"
            "/cancel  입력 대기 취소\n"
+           "/release  테스트에서 확인한 변경을 운영에 반영\n"
            "/security  차단 현황 · /unban IP  차단 해제 · /unlock  외부 로그인 잠금 해제\n\n"
            "명령 없이 그냥 메시지를 보내면 고른 프로젝트에 새 작업으로 요청됩니다.\n"
            "작업이 끝나면 승인/반려 버튼이 도착합니다.")
@@ -912,6 +913,11 @@ def repo_base(proj):
     return repo_cfg(proj).get("branch") or "main"
 
 
+def repo_release(proj):
+    """운영 브랜치. 비어 있으면 테스트 단계 없이 기준 브랜치가 곧 운영이다."""
+    return repo_cfg(proj).get("release") or ""
+
+
 def job_branch(jid):
     return "harness/" + jid
 
@@ -956,7 +962,82 @@ def repo_status(proj):
         res = git(r["path"], "log", "-1", "--format=%h %s (%cr)", check=False, proj=proj)
         out["head"] = res.stdout.strip() if res.returncode == 0 else ""
     out["web"] = web_url(r.get("url"))
+    out["pending"], out["releases"] = [], r.get("releases", [])[:15]
+    rel = r.get("release")
+    if out["cloned"] and rel:
+        res = git(r["path"], "log", "--no-merges", "--format=%h\t%s\t%cr", "origin/%s..origin/%s" % (rel, r.get("branch") or "main"),
+                  check=False, proj=proj)
+        if res.returncode == 0:
+            out["pending"] = [dict(zip(("sha", "msg", "when"), l.split("\t", 2))) for l in res.stdout.splitlines()[:30]]
+        res = git(r["path"], "log", "-1", "--format=%h %s (%cr)", "origin/" + rel, check=False, proj=proj)
+        out["release_head"] = res.stdout.strip() if res.returncode == 0 else ""
     return out
+
+
+def repo_promote(proj, who="GUI"):
+    """테스트 브랜치에서 확인된 변경을 운영 브랜치로 올린다. NAS 운영 서버는 1분 안에 이를 받아 재배포한다."""
+    rel, base, d = repo_release(proj), repo_base(proj), repo_dir(proj)
+    if not rel:
+        raise ApiError(400, "운영 브랜치가 설정되지 않았습니다")
+    with repo_lock(proj["id"]):
+        try:
+            git(d, "fetch", "origin", base, rel, timeout=300, proj=proj)
+            n = int(git(d, "rev-list", "--count", "--no-merges", "origin/%s..origin/%s" % (rel, base), proj=proj).strip() or 0)
+            if not n:
+                raise ApiError(409, "운영에 올릴 새 변경이 없습니다")
+            prev = git(d, "rev-parse", "origin/" + rel, proj=proj).strip()
+            ff = git(d, "merge-base", "--is-ancestor", "origin/" + rel, "origin/" + base, check=False, proj=proj).returncode == 0
+            git(d, "reset", "--hard", "-q", proj=proj)
+            if ff:
+                git(d, "push", "-q", "origin", "refs/remotes/origin/%s:refs/heads/%s" % (base, rel), timeout=300, proj=proj)
+            else:   # 운영 브랜치에 직접 들어간 수정이 있으면 병합 커밋을 만든다
+                git(d, "checkout", "-q", "-B", "_release", "origin/" + rel, proj=proj)
+                r = git(d, "merge", "--no-ff", "-m", "운영 반영: %s → %s" % (base, rel), "origin/" + base, check=False, proj=proj)
+                if r.returncode:
+                    git(d, "merge", "--abort", check=False, proj=proj)
+                    raise ApiError(409, "운영 브랜치와 충돌이 나서 자동으로 올릴 수 없습니다. GitHub에서 직접 병합하세요")
+                git(d, "push", "-q", "origin", "HEAD:refs/heads/" + rel, timeout=300, proj=proj)
+            git(d, "fetch", "origin", rel, timeout=300, proj=proj)
+            new = git(d, "rev-parse", "origin/" + rel, proj=proj).strip()
+            msgs = git(d, "log", "--no-merges", "--format=%s", "%s..%s" % (prev, new), proj=proj).splitlines()
+        except RuntimeError as e:
+            raise ApiError(502, "운영 반영 실패: %s" % e)
+    with LOCK:
+        rs = proj["repo"].setdefault("releases", [])
+        rs.insert(0, {"sha": new[:12], "prev": prev[:12], "ts": now(), "n": n, "by": who, "msgs": msgs[:10]})
+        del rs[30:]
+        save_cfg()
+    notify("[%s] 운영 반영 완료 (변경 %d개) - 1분 안에 운영 서버에 배포됩니다.\n%s"
+           % (proj["name"], n, "\n".join("- " + m[:60] for m in msgs[:8])))
+    return repo_status(proj)
+
+
+def repo_rollback(proj, sha, who="GUI"):
+    """운영 브랜치를 이전에 반영했던 버전으로 되돌린다(테스트 브랜치는 그대로)."""
+    rel, d = repo_release(proj), repo_dir(proj)
+    known = {x for r in repo_cfg(proj).get("releases", []) for x in (r["sha"], r["prev"])}
+    if not rel or not re.match(r"^[0-9a-f]{7,40}$", sha or "") or sha not in known:
+        raise ApiError(400, "되돌릴 수 있는 버전이 아닙니다")
+    with repo_lock(proj["id"]):
+        try:
+            git(d, "fetch", "origin", rel, timeout=300, proj=proj)
+            cur = git(d, "rev-parse", "origin/" + rel, proj=proj).strip()
+            full = git(d, "rev-parse", sha, proj=proj).strip()
+            if full == cur:
+                raise ApiError(409, "운영이 이미 이 버전입니다")
+            git(d, "push", "-q", "--force-with-lease=%s:%s" % (rel, cur), "origin", "%s:refs/heads/%s" % (full, rel),
+                timeout=300, proj=proj)
+            git(d, "fetch", "origin", rel, timeout=300, proj=proj)
+        except RuntimeError as e:
+            raise ApiError(502, "되돌리기 실패: %s" % e)
+    with LOCK:
+        rs = proj["repo"].setdefault("releases", [])
+        rs.insert(0, {"sha": full[:12], "prev": cur[:12], "ts": now(), "n": 0, "by": who, "rollback": True, "msgs": []})
+        del rs[30:]
+        save_cfg()
+    notify("[%s] 운영을 이전 버전(%s)으로 되돌렸습니다 - 1분 안에 운영 서버에 배포됩니다.\n"
+           "테스트 브랜치에는 문제의 변경이 남아 있으니, 고친 뒤 다시 운영 반영하세요." % (proj["name"], full[:7]))
+    return repo_status(proj)
 
 
 def repo_save(proj, b):
@@ -979,7 +1060,14 @@ def repo_save(proj, b):
     if not BRANCH_RE.match(branch) or ".." in branch:
         raise ApiError(400, "브랜치 이름이 올바르지 않습니다")
     mode = b.get("merge") if b.get("merge") in ("merge", "branch") else "merge"
-    proj["repo"] = {"url": url, "path": path, "branch": branch, "merge": mode,
+    release = str(b.get("release") or "").strip()
+    if release and (not BRANCH_RE.match(release) or ".." in release):
+        raise ApiError(400, "운영 브랜치 이름이 올바르지 않습니다")
+    if release and release == branch:
+        raise ApiError(400, "테스트 브랜치와 운영 브랜치는 달라야 합니다 (예: develop / main)")
+    old = repo_cfg(proj)
+    proj["repo"] = {"url": url, "path": path, "branch": branch, "merge": mode, "release": release,
+                    "releases": old.get("releases", []) if old.get("url") == url else [],
                     "build": str(b.get("build") or "").strip()[:500], "deploy": str(b.get("deploy") or "").strip()[:500]}
     save_cfg()
     refresh_agent_settings(proj)
@@ -994,7 +1082,7 @@ def repo_clone(proj):
         try:
             if (d / ".git").is_dir():
                 git(d, "remote", "set-url", "origin", url, proj=proj)
-                git(d, "fetch", "origin", repo_base(proj), timeout=300, proj=proj)
+                git(d, "fetch", "origin", timeout=300, proj=proj)
                 msg = "이미 내려받은 저장소입니다. 최신 내용을 가져왔습니다"
             else:
                 if d.exists() and any(d.iterdir()):
@@ -1002,7 +1090,15 @@ def repo_clone(proj):
                 d.parent.mkdir(parents=True, exist_ok=True)
                 git(d.parent, "clone", url, str(d), timeout=600, proj=proj)
                 msg = "저장소를 내려받았습니다"
-            git(d, "rev-parse", "--verify", "origin/" + repo_base(proj), proj=proj)
+            rel, base = repo_release(proj), repo_base(proj)
+            if rel:
+                git(d, "rev-parse", "--verify", "origin/" + rel, proj=proj)
+                if git(d, "rev-parse", "--verify", "--quiet", "origin/" + base, check=False, proj=proj).returncode:
+                    # 테스트 브랜치가 아직 없으면 운영 브랜치에서 만들어 올린다
+                    git(d, "push", "-q", "origin", "refs/remotes/origin/%s:refs/heads/%s" % (rel, base), timeout=300, proj=proj)
+                    git(d, "fetch", "origin", timeout=300, proj=proj)
+                    msg += " · 운영(%s)에서 테스트 브랜치 %s를 만들었습니다" % (rel, base)
+            git(d, "rev-parse", "--verify", "origin/" + base, proj=proj)
         except RuntimeError as e:
             raise ApiError(502, "%s\n(GitHub에 배포 키를 등록했는지, 쓰기 권한을 켰는지 확인하세요)" % e)
     refresh_agent_settings(proj)
@@ -1165,6 +1261,9 @@ def repo_deliver(proj, j, summary_src):
                 git(d, "push", "-q", "origin", "%s:%s" % (base, base), timeout=300, proj=proj)
                 sha = git(d, "log", "-1", "--format=%h", proj=proj).strip()
                 lines.append("- `%s`에 병합하고 푸시했습니다 (커밋 %s, 변경 커밋 %d개)" % (base, sha, ahead))
+                if repo_release(proj):
+                    lines.append("- **테스트 서버**에 1분 안에 배포됩니다. 확인한 뒤 '운영 반영'을 누르면 `%s`(운영)으로 올라갑니다"
+                                 % repo_release(proj))
                 if web:
                     lines.append("- 커밋: %s/commit/%s\n- 빌드 상태(GitHub Actions): %s/actions" % (web, sha, web))
                 dep = repo_cfg(proj).get("deploy")
@@ -1573,7 +1672,7 @@ def project_detail(proj):
     return {"id": proj["id"], "name": proj["name"], "description": proj.get("description", ""),
             "max_rounds": proj.get("max_rounds", 1), "root": proj["root"],
             "stage_mode": proj.get("stage_mode", "fixed"), "use_sources": proj.get("use_sources", "prefer"),
-            "sources": len(src_list(proj)), "repo": repo_cfg(proj),
+            "sources": len(src_list(proj)), "repo": {"on": repo_on(proj), "release": repo_release(proj), "branch": repo_base(proj)} if repo_on(proj) else None,
             "agents": [agent_info(proj, a) for a in proj["agents"]], "stages": proj["stages"],
             "schedules": proj.get("schedules", []), "summary": psummary(proj)}
 
@@ -1938,7 +2037,8 @@ def notify_job(job, kind):
         notify("[%s] %s\n실패: %s" % (pname, job["title"], str(job.get("error"))[:300]),
                [[("다시 시도", "rt:" + ref)]], chat)
     elif kind == "approved":
-        notify("[%s] %s · 완료 (새 토큰 %s)\n\n%s" % (pname, job["title"], tok, body), None, chat)
+        rb = [[("운영 반영", "rl:%s:-" % job["pid"])]] if proj and repo_on(proj) and repo_release(proj) else None
+        notify("[%s] %s · 완료 (새 토큰 %s)\n\n%s" % (pname, job["title"], tok, body), rb, chat)
     elif kind == "question":
         notify("[%s] %s\n에이전트가 질문이 있습니다:\n\n%s" % (pname, job["title"], str(job.get("question"))[:1500]),
                [[("답변하기", "aw:" + ref)]], chat)
@@ -2024,6 +2124,21 @@ def tg_button(chat, data):
             proj = proj_of(pid)
         except ApiError as e:
             return notify(e.msg, None, chat)
+        if act == "rl":
+            st = repo_status(proj) if repo_on(proj) else {"pending": []}
+            if not st["pending"]:
+                return notify("[%s] 운영에 올릴 새 변경이 없습니다." % proj["name"], None, chat)
+            return notify("[%s] 테스트 서버에서 확인을 마쳤나요? 아래 변경 %d개를 운영에 올립니다.\n%s"
+                          % (proj["name"], len(st["pending"]), "\n".join("- " + c["msg"][:60] for c in st["pending"][:10])),
+                          [[("예, 운영 반영", "rly:%s:-" % pid)]], chat)
+        if act == "rly":
+            def go():
+                try:
+                    repo_promote(proj, "텔레그램")
+                except ApiError as e:
+                    notify("[%s] %s" % (proj["name"], e.msg), None, chat)
+            threading.Thread(target=go, daemon=True).start()
+            return notify("운영 반영을 시작합니다…", None, chat)
         if act == "pu":
             tg_cfg()["cur"][str(chat)] = proj["id"]
             save_cfg()
@@ -2096,6 +2211,8 @@ def tg_message(chat, text):
                           % (proj["name"], TG_HELP), btns[:8], chat)
         if cmd == "/cancel":
             return notify("대기 중인 입력이 없습니다.", None, chat)
+        if cmd == "/release":
+            return tg_button(chat, "rl:%s:-" % proj["id"])
         if cmd == "/projects":
             t, btns = tg_projects(chat)
             return notify(t, btns, chat)
@@ -2864,6 +2981,20 @@ def r_repo_clone(m, b):
     return repo_clone(proj)
 
 
+@route("POST", r"/api/projects/([^/]+)/repo/release", lock=False)
+def r_repo_release(m, b):
+    with LOCK:
+        proj = proj_of(m[1])
+    return repo_promote(proj)
+
+
+@route("POST", r"/api/projects/([^/]+)/repo/rollback", lock=False)
+def r_repo_rollback(m, b):
+    with LOCK:
+        proj = proj_of(m[1])
+    return repo_rollback(proj, str(b.get("sha") or ""))
+
+
 @route("POST", r"/api/projects/([^/]+)/repo/key", lock=False)
 def r_repo_key(m, b):
     with LOCK:
@@ -3354,6 +3485,7 @@ table.ut{border-collapse:collapse;width:100%;font-size:13px}.ut td,.ut th{paddin
       <textarea id="req" placeholder="요청 내용을 입력하세요"></textarea>
       <div class="row" style="margin-top:8px"><button class="pri" id="go">작업 시작</button></div>
     </div>
+    <div id="relcard"></div>
     <div class="jobs" id="jobs"></div>
     <div class="row" style="margin-top:8px;justify-content:center"><button id="jclean" style="font-size:12px;padding:5px 10px">끝난 작업 정리</button></div>
   </aside>
@@ -3465,8 +3597,25 @@ $('#ptabs').onclick=e=>{
 document.querySelectorAll('#subnav .nv').forEach(b=>b.onclick=()=>setView(b.dataset.v));
 
 /* ---------- 작업 ---------- */
+let relAt=0,relKey='';
+async function loadRel(force){
+  const c=(P||[]).find(p=>p.id===cur);const el=$('#relcard');
+  if(!c||!c.repo||!c.repo.release){if(el.innerHTML)el.innerHTML='';return}
+  if(!force&&Date.now()-relAt<15000&&relKey===cur)return;relAt=Date.now();relKey=cur;
+  let st;try{st=await api(base()+'/repo')}catch(e){return}
+  const n=st.pending.length;
+  el.innerHTML='<div class="card" style="margin-top:10px"><h2>테스트 → 운영</h2>'
+    +'<div class="vd">테스트('+esc(c.repo.branch)+')에만 있는 변경: <b>'+n+'개</b>'+(st.release_head?'<br>운영('+esc(c.repo.release)+'): '+esc(st.release_head):'')+'</div>'
+    +(n?'<ul class="tip" style="margin:6px 0">'+st.pending.slice(0,6).map(x=>'<li>'+esc(x.msg)+' <span style="color:var(--mute)">'+esc(x.when)+'</span></li>').join('')+(n>6?'<li>… 외 '+(n-6)+'개</li>':'')+'</ul>'
+      +'<div class="row"><button class="pri" id="relgo">운영 반영</button></div>':'<div class="vd">운영과 테스트가 같은 상태입니다.</div>')+'</div>';
+  if($('#relgo'))$('#relgo').onclick=async e=>{
+    if(!confirm('테스트 서버에서 확인을 마쳤나요?\n변경 '+n+'개를 운영에 올리면 1분 안에 실서버에 배포됩니다.'))return;
+    e.target.disabled=true;toast('운영에 반영하는 중…');
+    try{await post(base()+'/repo/release');toast('운영 반영 완료 - 1분 안에 실서버에 배포됩니다');await loadRel(true)}catch(err){alert(err.message);e.target.disabled=false}};
+}
 async function loadList(){
   if(!cur)return;
+  loadRel();
   const d=await api(base()+'/jobs');
   const h=d.jobs.map(j=>'<div class="job'+(j.id===sel?' sel':'')+'" data-id="'+esc(j.id)+'"><div class="t">'+esc(j.title)+'</div><div class="m"><span class="chip '+j.status+'">'+(j.needs_input?'질문 대기':STATUS[j.status])+'</span><span>'+esc(j.created.slice(5,16))+'</span>'+(j.tokens?'<span>토큰 '+fmtN(j.tokens)+'</span>':'')+'</div></div>').join('');
   if(h!==last.list){last.list=h;$('#jobs').innerHTML=h||'<div class="empty" style="padding:20px">아직 작업이 없습니다</div>'}
@@ -3918,19 +4067,27 @@ function repoCard(st){
     +'<label class="lb">저장소 주소 (SSH 권장)<input type="text" id="rurl" value="'+esc(r.url||'')+'" placeholder="git@github.com:kfarri/myma.git"></label>'
     +'<div class="g2"><label class="lb">로컬 폴더<input type="text" id="rpath" value="'+esc(r.path||st.default_path)+'"></label>'
     +'<label class="lb">기준 브랜치<input type="text" id="rbr" value="'+esc(r.branch||'main')+'"></label></div>'
+    +'<label class="lb">운영 브랜치 (테스트 단계를 쓰려면 입력 · 비우면 승인 즉시 운영)<input type="text" id="rrel" value="'+esc(r.release||'')+'" placeholder="예: main  (이때 기준 브랜치는 develop)"></label>'
+    +(r.release?'<div class="vd">승인하면 <b>'+esc(r.branch||'main')+'</b>(테스트)에 올라가고, 작업 화면의 \'운영 반영\'을 눌러야 <b>'+esc(r.release)+'</b>(운영)으로 올라갑니다.</div>':'')
     +'<label class="lb">빌드 확인 명령 (비우면 생략 · 실패하면 오류를 에이전트에게 돌려줘 자동 수정)<input type="text" id="rbuild" value="'+esc(r.build||'')+'" placeholder="예: npm ci && npm run build"></label>'
     +'<label class="lb">승인 시 반영 방식<select id="rmode" style="width:auto"><option value="merge"'+(r.merge!=='branch'?' selected':'')+'>기준 브랜치에 병합 후 푸시 (GitHub Actions 자동 빌드)</option><option value="branch"'+(r.merge==='branch'?' selected':'')+'>작업 브랜치만 푸시 (PR은 GitHub에서 직접 병합)</option></select></label>'
     +'<label class="lb">푸시 후 실행할 배포 명령 (선택)<input type="text" id="rdep" value="'+esc(r.deploy||'')+'" placeholder="비워두면 GitHub Actions에 맡김"></label>'
     +'<div class="row" style="margin-top:8px"><button class="pri" id="rsave">저장</button>'+(on?'<button id="rclone">'+(st.cloned?'최신 내용 가져오기':'내려받기')+'</button>':'')+'<button id="rkey">배포 키 보기</button>'+(on?'<button class="dng" id="roff">연결 해제</button>':'')+'</div>'
     +'<div class="vd">상태: '+(on?(st.cloned?'내려받음 · 최근 커밋 '+esc(st.head||'-'):'아직 내려받지 않음'):'연결 안 됨')+(st.web?' · <a href="'+esc(st.web)+'" target="_blank" rel="noopener">GitHub 열기</a>':'')+'</div>'
     +'<pre id="rkeyv" class="vd" style="white-space:pre-wrap;word-break:break-all'+(st.key?'':';display:none')+'">'+esc(st.key||'')+'</pre>'
+    +((st.releases||[]).length?'<div class="vd" style="margin-top:10px">운영 반영 이력</div><table class="ut"><tr><th>시각</th><th>버전</th><th>내용</th><th></th></tr>'
+      +st.releases.map((x,i)=>'<tr><td>'+esc(x.ts.slice(5,16))+'</td><td>'+esc(x.sha.slice(0,7))+'</td><td>'+(x.rollback?'<b>되돌리기</b>':'변경 '+x.n+'개 · '+esc((x.msgs||[]).slice(0,2).join(', ')))+' <span style="color:var(--mute)">('+esc(x.by||'')+')</span></td><td>'
+        +(i===0?'<span class="chip approved">현재 운영</span>':'<button data-rb="'+esc(x.sha)+'" style="font-size:12px;padding:3px 8px">이 버전으로 되돌리기</button>')+'</td></tr>').join('')
+      +(st.releases[0].prev&&!st.releases[0].rollback?'<tr><td colspan="3">반영 직전 버전 '+esc(st.releases[0].prev.slice(0,7))+'</td><td><button data-rb="'+esc(st.releases[0].prev)+'" class="dng" style="font-size:12px;padding:3px 8px">직전 버전으로 되돌리기</button></td></tr>':'')+'</table>':'')
     +'<ul class="tip"><li>배포 키는 GitHub 저장소 → Settings → Deploy keys → Add deploy key에 붙여넣고 <b>Allow write access</b>를 켜세요.</li><li>빌드 산출물 폴더(dist, node_modules 등)는 저장소의 .gitignore에 있어야 커밋에 섞이지 않습니다.</li></ul></div>';
 }
 function bindRepo(){
   const v=id=>$('#'+id).value.trim();
-  $('#rsave').onclick=async()=>{try{await post(base()+'/repo',{url:v('rurl'),path:v('rpath'),branch:v('rbr'),build:v('rbuild'),merge:$('#rmode').value,deploy:v('rdep')});toast('저장했습니다');await loadSettings()}catch(e){toast(e.message)}};
+  $('#rsave').onclick=async()=>{try{await post(base()+'/repo',{url:v('rurl'),path:v('rpath'),branch:v('rbr'),release:v('rrel'),build:v('rbuild'),merge:$('#rmode').value,deploy:v('rdep')});toast('저장했습니다');await loadSettings()}catch(e){toast(e.message)}};
   if($('#rclone'))$('#rclone').onclick=async e=>{e.target.disabled=true;toast('저장소와 통신 중…');try{const r=await post(base()+'/repo/clone');toast(r.msg);await loadSettings()}catch(err){alert(err.message);e.target.disabled=false}};
   $('#rkey').onclick=async()=>{try{const r=await post(base()+'/repo/key');const p=$('#rkeyv');p.textContent=r.key;p.style.display='';try{await navigator.clipboard.writeText(r.key);toast('공개 키를 복사했습니다')}catch(_){toast('아래 공개 키를 복사하세요')}}catch(e){toast(e.message)}};
+  document.querySelectorAll('[data-rb]').forEach(b=>b.onclick=async()=>{if(!confirm('운영을 '+b.dataset.rb.slice(0,7)+' 버전으로 되돌릴까요?\n1분 안에 실서버가 이 버전으로 다시 배포됩니다. 테스트 브랜치는 그대로입니다.'))return;
+    b.disabled=true;try{await post(base()+'/repo/rollback',{sha:b.dataset.rb});toast('되돌렸습니다 - 1분 안에 실서버에 배포됩니다');await loadSettings()}catch(e){alert(e.message);b.disabled=false}});
   if($('#roff'))$('#roff').onclick=async()=>{if(!confirm('저장소 연결을 해제할까요? 로컬 폴더는 지워지지 않습니다.'))return;try{await post(base()+'/repo',{url:''});toast('해제했습니다');await loadSettings()}catch(e){toast(e.message)}};
 }
 
