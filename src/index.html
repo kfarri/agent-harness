@@ -133,6 +133,7 @@ table.ut{border-collapse:collapse;width:100%;font-size:13px}.ut td,.ut th{paddin
       <div class="row" style="margin-top:8px"><button class="pri" id="go">작업 시작</button></div>
     </div>
     <div class="jobs" id="jobs"></div>
+    <div class="row" style="margin-top:8px;justify-content:center"><button id="jclean" style="font-size:12px;padding:5px 10px">끝난 작업 정리</button></div>
   </aside>
   <main class="card" id="main"><div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div></main>
 </div>
@@ -294,6 +295,7 @@ async function loadDetail(force){
     }else if(j.status==='approved'){
       act='<div class="vd">승인 완료: shared/outbox/approved_'+esc(j.id)+'.md'+(d.repo?' · 반영 결과는 \'승인본\' 탭에서 확인':'')+'</div>';
     }
+    if(['awaiting_user','approved','failed','cancelled'].includes(j.status))act+='<div class="row" style="margin:6px 0 10px;justify-content:flex-end"><button class="dng" id="jdel" style="font-size:12px;padding:5px 10px">작업 삭제</button></div>';
     $('#act').innerHTML=act;bindJob(j);
   }
   const tdef=(f.approved!=null&&d.repo?[['approved','승인본']]:[]).concat(f.diff!=null?[['diff','변경 내용']]:[]).concat([['final','최종본']]).concat(d.stages.slice().reverse().map(s=>[s.id,s.name+(s.kind==='review'?' (검토)':'')+(s.enabled?'':' ·꺼짐')])).concat([['request','요청']]);
@@ -317,6 +319,7 @@ function bindJob(j){
   if(q('#rj'))q('#rj').onclick=()=>{const fb=q('#fb').value.trim();if(!fb){toast('수정 요청 내용을 적어주세요');return}run(()=>post(url+'/restart',{feedback:fb,start:q('#st').value}),'다시 작업을 시작합니다')};
   if(q('#rt'))q('#rt').onclick=()=>run(()=>post(url+'/restart',{start:q('#st').value}),'다시 시작합니다');
   if(q('#cn'))q('#cn').onclick=()=>{if(confirm('작업을 중단할까요?'))run(()=>post(url+'/cancel'),'중단 요청')};
+  if(q('#jdel'))q('#jdel').onclick=async()=>{if(!confirm('이 작업을 삭제할까요?\n요청·중간 결과·최종본·로그가 모두 지워지고 되돌릴 수 없습니다.'+(j.status==='approved'?'\n(이미 GitHub에 반영된 코드는 그대로 남습니다)':'')))return;try{await post(url+'/delete');toast('삭제했습니다');sel=null;last={};$('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>';await loadList()}catch(e){toast(e.message)}};
   if(q('#qago'))q('#qago').onclick=()=>{const a=q('#qa').value.trim();if(!a){toast('답변을 적어주세요');return}run(()=>post(url+'/restart',{feedback:a,start:j.step}),'답변을 반영해 이어서 진행합니다')};
 }
 function selectJob(id){
@@ -325,6 +328,7 @@ function selectJob(id){
   $('#tb').onclick=e=>{const b=e.target.closest('.tab');if(b){tab=b.dataset.t;tabPinned=true;loadDetail(true)}};
   tick(true);
 }
+$('#jclean').onclick=async()=>{const d=prompt('승인 완료·실패·중단된 작업을 삭제합니다.\n며칠 지난 작업만 지울까요? (0 = 전부)','7');if(d===null)return;const n=parseInt(d);if(isNaN(n)||n<0){toast('숫자를 입력하세요');return}try{const r=await post(base()+'/jobs/delete-many',{older_days:n});toast(r.deleted+'개 작업을 삭제했습니다');if(sel&&!(await api(base()+'/jobs')).jobs.some(x=>x.id===sel)){sel=null;$('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>'}last={};await loadList()}catch(e){toast(e.message)}};
 $('#jobs').onclick=e=>{const j=e.target.closest('.job');if(j)selectJob(j.dataset.id)};
 $('#go').onclick=async()=>{
   const t=$('#req').value.trim();if(!t){toast('요청 내용을 입력하세요');return}
@@ -605,21 +609,40 @@ function tgCard(t){
     +'<label class="chk"><input type="checkbox" id="tgn"'+(t.notify?' checked':'')+'><span>완료·실패 알림 보내기<small>GUI에서 시작한 작업의 알림도 연결된 모든 대화로 보냅니다</small></span></label>'
     +'<div class="row" style="margin-top:8px"><button class="pri" id="tgsave">저장</button><button id="tgtest">테스트 메시지 보내기</button></div></div>';
 }
+function fmtLeft(x){if(x<0)return '영구';if(x>=86400)return Math.ceil(x/86400)+'일';if(x>=3600)return Math.ceil(x/3600)+'시간';return Math.ceil(x/60)+'분'}
 function secCard(s){
   const bad=[];
-  if(s.weak_password)bad.push('비밀번호가 12자 미만입니다. 인터넷에 공개한다면 더 길게 바꾸세요.');
-  if(s.host!=='127.0.0.1'&&!s.https)bad.push('암호화 없이 외부에 열려 있습니다. HTTPS 리버스 프록시를 두고 GUI_HOST는 127.0.0.1로 되돌리세요.');
-  if(s.https&&!s.proxy)bad.push('HTTPS는 켜져 있지만 TRUST_PROXY가 꺼져 있어 접속 IP가 프록시 주소로 기록됩니다.');
-  return '<div class="card"><h2>보안 상태</h2>'
+  if(s.weak_password)bad.push('비밀번호가 12자 미만입니다. 외부에 열려 있으니 16자 이상으로 바꾸세요 (.env의 GUI_PASSWORD).');
+  if(s.host!=='127.0.0.1'&&!s.https)bad.push('암호화 없이 외부에 열려 있습니다. HTTPS 리버스 프록시를 두세요.');
+  if(s.https&&!s.proxy)bad.push('TRUST_PROXY가 꺼져 있어 실제 접속 IP를 알 수 없습니다. 차단이 동작하지 않습니다.');
+  if(s.proxy_seen&&s.proxy_seen.ts&&!s.proxy_seen.xff)bad.push('NAS 리버스 프록시가 실제 접속 IP(X-Forwarded-For)를 넘겨주지 않습니다. 이 상태에서는 IP 차단을 하지 않습니다(NAS 전체가 막히므로).');
+  if(s.two_factor&&!s.two_factor_ready)bad.push('2단계 인증이 켜져 있지만 텔레그램이 연결되지 않아 적용되지 않고 있습니다.');
+  const ev=s.events||[];
+  return '<div class="card"><h2>보안</h2>'
     +'<div class="row" style="margin-bottom:8px"><span class="chip '+(s.https?'approved':'failed')+'">HTTPS '+(s.https?'사용':'미설정')+'</span>'
-    +'<span class="chip '+(s.proxy?'approved':'')+'">프록시 IP 인식 '+(s.proxy?'켜짐':'꺼짐')+'</span>'
-    +'<span class="chip">바인딩 '+esc(s.host)+'</span>'+(s.public_host?'<span class="chip">'+esc(s.public_host)+'</span>':'')
-    +'<span class="chip">로그인 세션 '+s.sessions+'</span></div>'
+    +'<span class="chip '+(s.proxy_seen&&s.proxy_seen.xff?'approved':'')+'">실제 IP 인식 '+(s.proxy_seen&&s.proxy_seen.ts?(s.proxy_seen.xff?'정상':'안 됨'):'확인 전')+'</span>'
+    +'<span class="chip '+(s.two_factor&&s.two_factor_ready?'approved':'failed')+'">외부 로그인 2단계 인증 '+(s.two_factor&&s.two_factor_ready?'적용':'미적용')+'</span>'
+    +'<span class="chip">차단 중 IP '+s.blocked_total+'</span><span class="chip">로그인 세션 '+s.sessions+'</span>'
+    +(s.lockdown?'<span class="chip failed">외부 로그인 잠김 '+fmtLeft(s.lockdown)+'</span>':'')+'</div>'
     +(bad.length?'<div class="warnbox"><b>확인이 필요합니다</b><ul>'+bad.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul></div>':'')
-    +(s.blocked.length?'<div class="vd">차단 중: '+s.blocked.map(b=>esc(b.ip)+' ('+b.left+'초, 실패 '+b.fails+'회)').join(', ')+'</div>':'')
-    +'<div class="vd" style="margin-top:6px">최근 로그인</div><table class="ut"><tr><th>시각</th><th>IP</th><th>결과</th></tr>'
-    +(s.recent.length?s.recent.map(r=>'<tr><td>'+esc(r.ts.slice(5,16))+'</td><td>'+esc(r.ip)+'</td><td>'+(r.ok?'성공':'<b style="color:var(--err)">실패</b>')+'</td></tr>').join(''):'<tr><td colspan="3">기록 없음</td></tr>')
-    +'</table><div class="row" style="margin-top:10px"><button class="dng" id="slog">모든 기기에서 로그아웃</button></div></div>';
+    +'<ul class="tip"><li>비밀번호 '+s.max_fails+'회 실패 → 1일 차단, 다시 걸리면 7일, 세 번째는 영구 차단</li><li>.env·.git·wp-admin·phpmyadmin 같은 해킹 경로 접근 → 즉시 7일 이상 차단</li><li>로그인 없이 없는 주소를 10분에 8번 이상 요청 → 차단 · 1분에 600회 넘는 요청 → 차단</li><li>1시간에 로그인 실패가 20번을 넘으면(여러 IP 동시 공격) 외부 로그인 전체를 1시간 잠금. 내부망은 계속 가능</li><li>외부에서는 기본 인증(Authorization 헤더)을 받지 않고, 차단된 IP에는 화면 없이 연결을 끊습니다</li></ul>'
+    +'<label class="lb"><input type="checkbox" id="s2fa"'+(s.two_factor?' checked':'')+'> 외부 로그인 시 텔레그램 확인 코드 요구 (2단계 인증)</label>'
+    +'<div class="g2"><label class="lb">외부 로그인 유지 시간 (시간)<input type="number" id="sexh" min="1" max="720" value="'+s.ext_session_hours+'"></label><span></span></div>'
+    +'<label class="lb">외부 접속 허용 IP/대역 (비우면 모두 허용 · 쉼표나 줄바꿈으로 구분 · 넣으면 목록 밖은 전부 거부)<textarea id="sallow" style="min-height:48px" placeholder="예: 211.234.0.0/16, 58.228.63.106">'+esc((s.allow||[]).join('\n'))+'</textarea></label>'
+    +'<div class="row" style="margin-top:4px"><button class="pri" id="ssec">보안 설정 저장</button>'+(s.lockdown?'<button id="sunlock">외부 로그인 잠금 해제</button>':'')+'<button class="dng" id="slog">모든 기기에서 로그아웃</button></div>'
+    +'<div class="vd" style="margin-top:12px">차단 중인 IP</div><table class="ut"><tr><th>IP</th><th>남은 시간</th><th>이유</th><th></th></tr>'
+    +(s.blocked.length?s.blocked.map(b=>'<tr><td>'+esc(b.ip)+'</td><td>'+fmtLeft(b.left)+'</td><td>'+esc(b.reason)+'</td><td><button data-unban="'+esc(b.ip)+'" style="font-size:12px;padding:3px 8px">해제</button></td></tr>').join(''):'<tr><td colspan="4">없음</td></tr>')
+    +'</table>'+(s.blocked.length>1?'<div class="row" style="margin-top:6px"><button id="sunall" style="font-size:12px">전체 해제</button></div>':'')
+    +'<div class="vd" style="margin-top:12px">최근 보안 기록</div><table class="ut"><tr><th>시각</th><th>IP</th><th>내용</th></tr>'
+    +(ev.length?ev.slice(0,15).map(e=>'<tr><td>'+esc(e.ts.slice(5,16))+'</td><td>'+esc(e.ip)+'</td><td'+(e.kind==='err'?' style="color:var(--err)"':'')+'>'+esc(e.msg)+'</td></tr>').join(''):'<tr><td colspan="3">기록 없음</td></tr>')
+    +'</table></div>';
+}
+function bindSec(){
+  const p=async(b,msg)=>{try{await post('/api/security',b);toast(msg);await loadSettings()}catch(e){toast(e.message)}};
+  $('#ssec').onclick=()=>p({two_factor:$('#s2fa').checked,ext_session_hours:+$('#sexh').value,allow:$('#sallow').value},'저장했습니다');
+  if($('#sunlock'))$('#sunlock').onclick=()=>p({unlock:true},'잠금을 해제했습니다');
+  if($('#sunall'))$('#sunall').onclick=()=>{if(confirm('차단을 모두 해제할까요?'))p({unban_all:true},'모두 해제했습니다')};
+  document.querySelectorAll('[data-unban]').forEach(b=>b.onclick=()=>{if(confirm(b.dataset.unban+' 차단을 해제할까요?'))p({unban:b.dataset.unban},'해제했습니다')});
 }
 async function loadSettings(){
   pj=await api(base());
@@ -655,7 +678,7 @@ async function loadSettings(){
     +'<li>요청에 분량과 범위를 구체적으로 적으면 불필요한 장문 생성을 줄입니다.</li><li>작업 상세 화면의 단계별 새 토큰 수치로 가장 비싼 단계를 찾아 조정하세요.</li></ul></div>';
   $('#ssave').onclick=async()=>{try{await post(base()+'/update',{name:$('#sn').value,description:$('#sd').value,max_rounds:+$('#sr').value,stage_mode:$('#smode').value});toast('저장했습니다');await loadProjects();await loadSettings()}catch(e){toast(e.message)}};
   $('#sdel').onclick=async()=>{if(!confirm('이 프로젝트를 목록에서 제거할까요? 폴더와 파일은 지워지지 않습니다.'))return;try{await post(base()+'/delete');toast('제거했습니다');cur=null;await loadProjects();setView('jobs')}catch(e){toast(e.message)}};
-  bindRepo();
+  bindRepo();bindSec();
   $('#gsave').onclick=async()=>{try{await post('/api/settings',{parallel:+$('#gp').value,job_token_limit:parseInt($('#gt').value)||0,planner_model:$('#gm').value});toast('저장했습니다');await loadProjects()}catch(e){toast(e.message)}};
   $('#slog').onclick=async()=>{if(!confirm('모든 기기의 로그인을 끊을까요? 이 화면도 다시 로그인해야 합니다.'))return;
     try{await post('/api/security/logout-all');location.href='/login'}catch(e){toast(e.message)}};

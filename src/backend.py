@@ -58,6 +58,7 @@ TG_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip
 TG_POLL = int(os.environ.get("TELEGRAM_POLL", "25"))
 PAIR_CODE = secrets.token_hex(3)
 TRUST_PROXY = os.environ.get("TRUST_PROXY", "") not in ("", "0", "false", "no")
+TRUST_PROXY_IPS = {x.strip() for x in os.environ.get("TRUST_PROXY_IPS", "").split(",") if x.strip()}  # 비우면 사설 IP 전부
 PUBLIC_HTTPS = os.environ.get("PUBLIC_HTTPS", "") not in ("", "0", "false", "no")
 PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "")
 SESS_TTL = max(1, int(os.environ.get("SESSION_DAYS", "7"))) * 86400
@@ -80,7 +81,8 @@ TG_HELP = ("사용법\n"
            "/jobs  최근 작업 5건 보기\n"
            "/status  지금 실행 중인 작업\n"
            "/sched  예약 목록\n"
-           "/cancel  입력 대기 취소\n\n"
+           "/cancel  입력 대기 취소\n"
+           "/security  차단 현황 · /unban IP  차단 해제 · /unlock  외부 로그인 잠금 해제\n\n"
            "명령 없이 그냥 메시지를 보내면 고른 프로젝트에 새 작업으로 요청됩니다.\n"
            "작업이 끝나면 승인/반려 버튼이 도착합니다.")
 DEFAULT_TURNS = {"work": 15, "review": 8}
@@ -1680,6 +1682,59 @@ def job_cancel(proj, j):
     return job_summary(j)
 
 
+DELETABLE = ("awaiting_user", "approved", "failed", "cancelled")
+
+
+def job_delete(proj, j):
+    """작업 기록과 그 작업이 만든 파일(요청·중간 결과·최종본·이력·로그·로컬 작업 브랜치)을 지운다."""
+    jid = j["id"]
+    if j["status"] not in DELETABLE:
+        raise ApiError(409, "진행 중인 작업은 먼저 중지한 뒤 삭제하세요")
+    d = proj_dirs(proj)
+    targets = [d["jobs"] / ("%s.json" % jid), fpath(proj, "request", jid), fpath(proj, "final", jid),
+               fpath(proj, "approved", jid)]
+    targets += list(d["handoff"].glob("*_%s.md" % jid)) + list(d["inbox"].glob("%s*" % jid))
+    if d["logs"].is_dir():
+        targets += list(d["logs"].glob("%s_*" % jid))
+    for t in targets:
+        try:
+            t.unlink()
+        except OSError:
+            pass
+    shutil.rmtree(d["hist"] / jid, ignore_errors=True)
+    if repo_on(proj) and (repo_dir(proj) / ".git").is_dir():
+        threading.Thread(target=repo_drop_branch, args=(proj, jid), daemon=True).start()
+    JOBS.pop((proj["id"], jid), None)
+    for chat, v in list(TG_WAIT.items()):
+        if v == (proj["id"], jid):
+            TG_WAIT.pop(chat, None)
+    return {"deleted": jid}
+
+
+def repo_drop_branch(proj, jid):
+    with repo_lock(proj["id"]):
+        d, br = repo_dir(proj), job_branch(jid)
+        try:
+            cur = git(d, "rev-parse", "--abbrev-ref", "HEAD", proj=proj).strip()
+            if cur == br:
+                git(d, "checkout", "-q", "-B", repo_base(proj), "origin/" + repo_base(proj), proj=proj)
+            git(d, "branch", "-D", br, check=False, proj=proj)
+        except RuntimeError:
+            pass
+
+
+def job_delete_many(proj, b):
+    sts = [x for x in (b.get("status") or []) if x in DELETABLE] or ["approved", "failed", "cancelled"]
+    days = max(0, int(b.get("older_days") or 0))
+    cut = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - days * 86400))
+    n = 0
+    for (pid, _), j in list(JOBS.items()):
+        if pid == proj["id"] and j["status"] in sts and (not days or j["created"] < cut):
+            job_delete(proj, j)
+            n += 1
+    return {"deleted": n}
+
+
 def project_create(b):
     name = str(b.get("name") or "").strip()[:40]
     if not name:
@@ -2016,6 +2071,22 @@ def tg_message(chat, text):
                 return notify(e.msg, None, chat)
         cmd = text.split()[0].lower() if text.startswith("/") else ""
         arg = text[len(cmd):].strip()
+        if cmd == "/security":
+            st = security_state()
+            lines = ["보안 상태", "차단 중 IP %d개%s" % (st["blocked_total"], " · 외부 로그인 잠김 %d분" % (st["lockdown"] // 60 + 1) if st["lockdown"] else "")]
+            lines += ["- %s (%s)" % (b["ip"], b["reason"][:40]) for b in st["blocked"][:10]]
+            lines.append("\n해제: /unban IP   잠금 해제: /unlock")
+            return notify("\n".join(lines), None, chat)
+        if cmd == "/unban":
+            if not arg or not ip_ok(arg):
+                return notify("IP를 함께 보내주세요. 예: /unban 211.234.1.2  (목록은 /security)", None, chat)
+            unban(arg)
+            return notify("%s 차단을 해제했습니다." % arg, None, chat)
+        if cmd == "/unlock":
+            SEC["lockdown_until"] = 0
+            sec_event("-", "외부 로그인 잠금 해제(텔레그램)", "ok")
+            sec_save()
+            return notify("외부 로그인 잠금을 해제했습니다.", None, chat)
         proj = tg_cur(chat)
         if not proj:
             return notify("프로젝트가 없습니다. GUI에서 먼저 만들어주세요.", None, chat)
@@ -2224,29 +2295,184 @@ def prune_sessions():
             SESSIONS.pop(k, None)
 
 
-def new_session(ip):
+def new_session(ip, ext=False):
     prune_sessions()
     tok = secrets.token_urlsafe(32)
-    SESSIONS[tok] = {"ip": ip, "exp": time.time() + SESS_TTL, "since": now()}
+    ttl = min(SESS_TTL, sec_cfg()["ext_session_hours"] * 3600) if ext else SESS_TTL
+    SESSIONS[tok] = {"ip": ip, "exp": time.time() + ttl, "since": now(), "ext": ext, "ttl": ttl}
     return tok
 
 
+# ---------------------------------------------------------------- 보안: 차단·스캐너 탐지·2단계 인증
+# 외부 요청은 모두 NAS 리버스 프록시를 거쳐 오므로 NAS 방화벽이 아니라 여기서 실제 IP(X-Forwarded-For) 기준으로 막는다.
+
+SEC_FILE = BASE / "security.json"
+BAN_STEPS = [86400, 7 * 86400, 0]          # 1일 → 7일 → 영구(0)
+LAN_BAN = 900                              # 내부망 기기는 15분만 막는다(본인 기기일 가능성)
+SCAN_RE = re.compile(r"(\.php|\.asp|\.jsp|\.cgi|/\.env|/\.git|/\.aws|/\.ssh|wp-|wordpress|phpmyadmin|/admin|/actuator|"
+                     r"/cgi-bin|/boaform|/vendor/|/console|/manager/|/solr|/HNAP1|/owa/|/autodiscover|/\.well-known/security|"
+                     r"/config\.|/backup|\.sql|\.zip|\.tar|/shell|/setup|/install|/xmlrpc|/server-status|/debug)", re.I)
+OPEN_PATHS = {"/", "/login", "/logout", "/favicon.ico", "/robots.txt"}
+RATE = {}          # ip -> [시각...] (최근 60초)
+MISS = {}          # ip -> [시각...] (비로그인 잘못된 요청, 최근 10분)
+FAILS = {}         # ip -> {n, first}
+GFAILS = {}        # "all" -> 외부 로그인 실패 시각들 (전체 잠금 판단)
+PENDING = {}       # 2단계 인증 대기 토큰 -> {ip, code, exp, tries, ext}
+SEC = {"bans": {}, "events": [], "lockdown_until": 0, "proxy_seen": {}}
+_SEC_NOTE = {"t": 0, "n": 0}
+
+
+def sec_load():
+    try:
+        d = json.loads(SEC_FILE.read_text())
+        SEC.update({k: d[k] for k in ("bans", "events", "lockdown_until") if k in d})
+    except (OSError, ValueError):
+        pass
+
+
+SEC_LOCK = threading.Lock()
+
+
+def sec_save():
+    with SEC_LOCK:
+        try:
+            snap = json.loads(json.dumps({k: SEC[k] for k in ("bans", "events", "lockdown_until")}))
+            write_json(SEC_FILE, snap)
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+
+def send_code(text):
+    """2단계 인증 코드는 알림 끄기 설정과 무관하게 연결된 모든 텔레그램 대화로 보낸다."""
+    for t in list(tg_cfg()["chats"]):
+        NOTIFY.put((t, text, None))
+
+
+def sec_cfg():
+    s = CFG["settings"].setdefault("security", {})
+    s.setdefault("two_factor", True)
+    s.setdefault("allow", [])
+    s.setdefault("ext_session_hours", 12)
+    return s
+
+
+def sec_event(ip, msg, kind="warn"):
+    SEC["events"].insert(0, {"ts": now(), "ip": ip, "msg": msg, "kind": kind})
+    del SEC["events"][200:]
+    print("보안: %s %s" % (ip, msg), flush=True)
+
+
+def sec_alert(text):
+    """텔레그램 경고는 10분에 한 번으로 묶는다(공격이 몰려도 알림 폭탄이 되지 않게)."""
+    t = time.time()
+    _SEC_NOTE["n"] += 1
+    if t - _SEC_NOTE["t"] > 600:
+        extra = " (최근 10분간 보안 이벤트 %d건)" % _SEC_NOTE["n"] if _SEC_NOTE["n"] > 1 else ""
+        _SEC_NOTE.update(t=t, n=0)
+        notify("[보안] " + text + extra)
+
+
+def ip_ok(ip):
+    try:
+        ipaddress.ip_address(ip)
+        return True
+    except ValueError:
+        return False
+
+
+def banned_for(ip):
+    """남은 차단 시간(초). 영구 차단은 -1."""
+    b = SEC["bans"].get(ip)
+    if not b:
+        return 0
+    if b["until"] == 0:
+        return -1
+    left = int(b["until"] - time.time())
+    if left <= 0:
+        return 0
+    return left
+
+
+def ban(ip, reason, lan=False, step=None):
+    if not ip_ok(ip):
+        return
+    b = SEC["bans"].get(ip) or {"n": 0}
+    if banned_for(ip):
+        return
+    if lan:
+        until = time.time() + LAN_BAN
+    else:
+        k = min(len(BAN_STEPS) - 1, max(b["n"], step or 0))
+        until = 0 if BAN_STEPS[k] == 0 else time.time() + BAN_STEPS[k]
+    b.update(until=until, reason=reason, ts=now(), n=b["n"] + (0 if lan else 1))
+    SEC["bans"][ip] = b
+    dur = "15분" if lan else ("영구" if until == 0 else "%d일" % round((until - time.time()) / 86400))
+    sec_event(ip, "차단(%s): %s" % (dur, reason), "err")
+    sec_save()
+    if not lan:
+        sec_alert("%s 차단(%s): %s\n본인이라면 /unban %s" % (ip, dur, reason, ip))
+
+
+def unban(ip):
+    SEC["bans"].pop(ip, None)
+    FAILS.pop(ip, None)
+    MISS.pop(ip, None)
+    sec_event(ip, "차단 해제(수동)", "ok")
+    sec_save()
+
+
+def recent(store, ip, window):
+    t = time.time()
+    lst = [x for x in store.get(ip, []) if t - x < window]
+    lst.append(t)
+    store[ip] = lst
+    if len(store) > 5000:          # 메모리 보호
+        for k in list(store)[:1000]:
+            store.pop(k, None)
+    return len(lst)
+
+
+def allowed_external(ip):
+    allow = sec_cfg()["allow"]
+    if not allow:
+        return True
+    try:
+        a = ipaddress.ip_address(ip)
+        return any(a in ipaddress.ip_network(c, strict=False) for c in allow)
+    except ValueError:
+        return False
+
+
+def lockdown_left():
+    return max(0, int(SEC.get("lockdown_until", 0) - time.time()))
+
+
 def blocked_for(ip):
+    left = banned_for(ip)
+    return 10 ** 9 if left < 0 else left
+
+
+def note_fail(ip, where, ext=True):
+    if not ip_ok(ip):
+        return
+    t = time.time()
     f = FAILS.get(ip)
-    return max(0, int(f["until"] - time.time())) if f else 0
-
-
-def note_fail(ip, where):
-    f = FAILS.setdefault(ip, {"n": 0, "until": 0})
+    if not f or t - f["first"] > 86400:
+        f = FAILS[ip] = {"n": 0, "first": t}
     f["n"] += 1
-    if f["n"] >= MAX_FAILS:
-        wait = min(3600, 60 * 2 ** (f["n"] - MAX_FAILS))
-        f["until"] = time.time() + wait
-        print("로그인 차단: %s (%d회 실패, %d초)" % (ip, f["n"], wait), flush=True)
-        if f["n"] == MAX_FAILS or f["n"] % 10 == 0:
-            notify("경고: %s 에서 로그인 %d회 실패해 %d초 차단했습니다. (%s)" % (ip, f["n"], wait, where))
     LOGINS.insert(0, {"ts": now(), "ip": ip, "ok": False})
     del LOGINS[30:]
+    sec_event(ip, "로그인 실패 %d/%d (%s)" % (f["n"], MAX_FAILS, where))
+    if f["n"] >= MAX_FAILS:
+        FAILS.pop(ip, None)
+        ban(ip, "로그인 %d회 실패" % MAX_FAILS, lan=not ext)
+    if ext:   # 여러 IP에서 동시에 무차별 대입 → 외부 로그인 전체를 1시간 잠근다
+        n = recent(GFAILS, "all", 3600)
+        if n >= 20 and not lockdown_left():
+            SEC["lockdown_until"] = t + 3600
+            sec_event("-", "외부 로그인 1시간 잠금 (1시간 내 실패 %d회)" % n, "err")
+            sec_save()
+            notify("[보안] 1시간 동안 로그인 실패가 %d회라 외부 로그인을 1시간 잠갔습니다. 내부망 접속은 가능합니다." % n)
 
 
 def note_ok(ip):
@@ -2254,8 +2480,13 @@ def note_ok(ip):
     FAILS.pop(ip, None)
     LOGINS.insert(0, {"ts": now(), "ip": ip, "ok": True})
     del LOGINS[30:]
+    sec_event(ip, "로그인 성공", "ok")
     if not known and not is_local(ip):
         notify("새로운 곳에서 하네스에 로그인했습니다: %s" % ip)
+
+
+def two_factor_ready():
+    return bool(BOT_TOKEN and tg_cfg().get("chats"))
 
 
 def check_pw(user, pw):
@@ -2265,11 +2496,49 @@ def check_pw(user, pw):
 
 def security_state():
     prune_sessions()
+    c = sec_cfg()
+    bans = [{"ip": k, "left": banned_for(k), "reason": v.get("reason", ""), "ts": v.get("ts", ""), "n": v.get("n", 0)}
+            for k, v in SEC["bans"].items() if banned_for(k)]
+    bans.sort(key=lambda x: x["ts"], reverse=True)
     return {"https": PUBLIC_HTTPS, "proxy": TRUST_PROXY, "host": HOST, "public_host": PUBLIC_HOST,
-            "sessions": len(SESSIONS), "weak_password": len(PASSWORD) < 12,
-            "blocked": [{"ip": k, "left": blocked_for(k), "fails": v["n"]}
-                        for k, v in FAILS.items() if blocked_for(k) > 0],
-            "recent": LOGINS[:10]}
+            "sessions": len(SESSIONS), "weak_password": len(PASSWORD) < 12, "max_fails": MAX_FAILS,
+            "blocked": bans[:100], "blocked_total": len(bans), "events": SEC["events"][:40],
+            "recent": LOGINS[:10], "two_factor": c["two_factor"], "two_factor_ready": two_factor_ready(),
+            "allow": c["allow"], "ext_session_hours": c["ext_session_hours"], "lockdown": lockdown_left(),
+            "proxy_seen": SEC["proxy_seen"]}
+
+
+def security_update(b):
+    c = sec_cfg()
+    if "two_factor" in b:
+        c["two_factor"] = bool(b["two_factor"])
+    if "allow" in b:
+        out = []
+        for x in re.split(r"[\s,]+", str(b["allow"] or "")):
+            if not x:
+                continue
+            try:
+                out.append(str(ipaddress.ip_network(x, strict=False)))
+            except ValueError:
+                raise ApiError(400, "IP/대역 형식이 올바르지 않습니다: %s" % x[:40])
+        c["allow"] = out[:50]
+    if "ext_session_hours" in b:
+        try:
+            c["ext_session_hours"] = max(1, min(24 * 30, int(b["ext_session_hours"])))
+        except (TypeError, ValueError):
+            raise ApiError(400, "숫자를 입력하세요")
+    if b.get("unban"):
+        unban(str(b["unban"])[:45])
+    if b.get("unban_all"):
+        SEC["bans"].clear()
+        sec_event("-", "전체 차단 해제(수동)", "ok")
+        sec_save()
+    if b.get("unlock"):
+        SEC["lockdown_until"] = 0
+        sec_event("-", "외부 로그인 잠금 해제(수동)", "ok")
+        sec_save()
+    save_cfg()
+    return security_state()
 
 
 LOGIN_HTML = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
@@ -2286,9 +2555,13 @@ button{width:100%;font:inherit;font-weight:600;cursor:pointer;border:0;border-ra
 .e{color:var(--err);font-size:13px;margin:0 0 12px}
 </style></head><body><form method="post" action="/login" autocomplete="on">
 <h1>에이전트 하네스</h1><p class="s">@SUB@</p>@ERR@
-<label>아이디<input name="user" autocomplete="username" autofocus></label>
+@FIELDS@</form></body></html>"""
+LOGIN_FIELDS = """<label>아이디<input name="user" autocomplete="username" autofocus></label>
 <label>비밀번호<input name="password" type="password" autocomplete="current-password"></label>
-<button type="submit">로그인</button></form></body></html>"""
+<button type="submit">로그인</button>"""
+CODE_FIELDS = """<label>텔레그램으로 받은 6자리 확인 코드<input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6"
+autocomplete="one-time-code" autofocus></label><button type="submit">확인</button>
+<p class="s" style="margin-top:12px"><a href="/login" style="color:inherit">처음부터 다시</a></p>"""
 
 # ---------------------------------------------------------------- HTTP
 
@@ -2406,12 +2679,17 @@ def r_job_get(m, b):
     return job_detail(proj, job_of(proj, m[2]))
 
 
-@route("POST", r"/api/projects/([^/]+)/jobs/([^/]+)/(approve|restart|cancel)")
+@route("POST", r"/api/projects/([^/]+)/jobs/delete-many")
+def r_job_delete_many(m, b):
+    return job_delete_many(proj_of(m[1]), b)
+
+
+@route("POST", r"/api/projects/([^/]+)/jobs/([^/]+)/(approve|restart|cancel|delete)")
 def r_job_action(m, b):
     proj = proj_of(m[1])
     j = job_of(proj, m[2])
     return {"approve": lambda: job_approve(proj, j), "restart": lambda: job_restart(proj, j, b),
-            "cancel": lambda: job_cancel(proj, j)}[m[3]]()
+            "cancel": lambda: job_cancel(proj, j), "delete": lambda: job_delete(proj, j)}[m[3]]()
 
 
 @route("POST", r"/api/plan", lock=False)
@@ -2521,6 +2799,11 @@ def r_security(m, b):
     return security_state()
 
 
+@route("POST", r"/api/security")
+def r_security_update(m, b):
+    return security_update(b)
+
+
 @route("POST", r"/api/security/logout-all")
 def r_logout_all(m, b):
     SESSIONS.clear()
@@ -2597,7 +2880,9 @@ def r_settings(m, b):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "AgentHarness"
+    server_version = "-"     # 서버 종류·버전을 드러내지 않는다
+    sys_version = ""
+    timeout = 20             # 느리게 보내며 연결을 붙잡는 공격(slowloris) 방지
 
     def log_message(self, *a):
         pass
@@ -2606,11 +2891,63 @@ class Handler(BaseHTTPRequestHandler):
 
     def ip(self):
         peer = self.client_address[0]
-        if TRUST_PROXY and is_local(peer):
+        if TRUST_PROXY and is_local(peer) and (not TRUST_PROXY_IPS or peer in TRUST_PROXY_IPS):
             xff = self.headers.get("X-Forwarded-For")
             if xff:
-                return xff.split(",")[0].strip()[:45]
+                return xff.split(",")[-1].strip()[:45]   # 프록시가 마지막에 붙인 값이 실제 접속 IP
         return peer
+
+    def is_ext(self):
+        """공개 도메인으로 들어왔거나 사설망 밖 IP면 외부 접속으로 본다."""
+        host = (self.headers.get("Host") or "").split(":")[0]
+        return bool(PUBLIC_HOST and host == PUBLIC_HOST) or not is_local(self.ip())
+
+    def shield(self):
+        """모든 요청의 첫 관문: 차단 IP, 허용 목록, 요청 폭주, 취약점 스캔 경로."""
+        ip, ext, path = self.ip(), self.is_ext(), urlparse(self.path).path
+        host = (self.headers.get("Host") or "").split(":")[0]
+        if PUBLIC_HOST and host == PUBLIC_HOST:
+            SEC["proxy_seen"] = {"ts": now(), "xff": bool(self.headers.get("X-Forwarded-For")), "ip": ip}
+        if ext and is_local(ip):
+            # 프록시가 실제 IP를 넘겨주지 않음: NAS를 막으면 전부 막히므로 차단 대신 경고만
+            self.can_ban = False
+        else:
+            self.can_ban = True
+        if self.can_ban and banned_for(ip):
+            self.close_connection = True
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return False
+        if ext and not allowed_external(ip):
+            self.send(403, "접속이 허용되지 않은 위치입니다.", "text/plain; charset=utf-8")
+            return False
+        n = recent(RATE, ip, 60)
+        if n > 600 and self.can_ban:
+            ban(ip, "요청 폭주 (1분에 %d회)" % n, lan=not ext)
+            return False
+        if n > 300:
+            self.send(429, json.dumps({"error": "요청이 너무 많습니다. 잠시 후 다시 시도하세요"}))
+            return False
+        if SCAN_RE.search(path) and not self.has_session():
+            if self.can_ban:
+                ban(ip, "취약점 스캔 경로 접근: %s" % path[:60], lan=not ext, step=1)
+            self.send(404, "", "text/plain; charset=utf-8")
+            return False
+        return True
+
+    def has_session(self):
+        sess = SESSIONS.get(self.cookie("ah_sess") or "")
+        return bool(sess and sess["exp"] > time.time())
+
+    def miss(self):
+        """로그인 안 된 상태로 없는 경로를 계속 찌르면 스캐너로 보고 차단한다."""
+        ip, ext = self.ip(), self.is_ext()
+        n = recent(MISS, ip, 600)
+        if n >= 8 and self.can_ban:
+            ban(ip, "없는 경로를 반복 요청 (10분에 %d회)" % n, lan=not ext)
+        self.send(404, "", "text/plain; charset=utf-8")
 
     def cookie(self, name):
         raw = self.headers.get("Cookie")
@@ -2634,7 +2971,8 @@ class Handler(BaseHTTPRequestHandler):
         if PUBLIC_HTTPS:
             self.send_header("Strict-Transport-Security", "max-age=31536000")
         for k, v in (extra or {}).items():
-            self.send_header(k, v)
+            for x in (v if isinstance(v, list) else [v]):
+                self.send_header(k, x)
         self.end_headers()
         self.wfile.write(data)
 
@@ -2642,12 +2980,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send(code, json.dumps(obj, ensure_ascii=False))
 
     def gate(self):
-        """세션 쿠키 또는 기본 인증. 공개 호스팅을 고려해 실패는 횟수 제한으로 막는다."""
+        """세션 쿠키 또는 기본 인증(내부망만). 실패는 횟수 제한으로 막는다."""
         ip = self.ip()
-        left = blocked_for(ip)
-        if left:
-            self.send(429, json.dumps({"error": "로그인 시도가 많아 %d초 동안 차단되었습니다" % left}))
-            return False
         tok = self.cookie("ah_sess")
         if tok:
             sess = SESSIONS.get(tok)
@@ -2655,6 +2989,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.auth = "cookie"
                 return True
         a = self.headers.get("Authorization", "")
+        if a.startswith("Basic ") and self.is_ext():
+            # 기본 인증은 2단계 인증을 우회하므로 외부에서는 받지 않는다
+            note_fail(ip, "외부 기본 인증 시도", True)
+            self.send(401, json.dumps({"error": "외부에서는 로그인 화면으로만 접속할 수 있습니다"}))
+            return False
         if a.startswith("Basic "):
             try:
                 u, p = base64.b64decode(a[6:]).decode("utf-8").split(":", 1)
@@ -2663,29 +3002,46 @@ class Handler(BaseHTTPRequestHandler):
             if check_pw(u, p):
                 self.auth = "basic"
                 return True
-            note_fail(ip, "기본 인증")
+            note_fail(ip, "기본 인증", self.is_ext())
             self.send(401, json.dumps({"error": "아이디 또는 비밀번호가 올바르지 않습니다"}))
             return False
-        if urlparse(self.path).path.startswith("/api/"):
+        path = urlparse(self.path).path
+        if path.startswith("/api/"):
             self.send(401, json.dumps({"error": "로그인이 필요합니다"}))
-        else:
+        elif path in OPEN_PATHS:
             self.send(303, "", "text/plain; charset=utf-8", {"Location": "/login"})
+        else:
+            self.miss()
         return False
 
-    def login_page(self, err=""):
-        left = blocked_for(self.ip())
-        if left:
-            err = "로그인 시도가 많아 %d초 동안 차단되었습니다." % left
+    def login_page(self, err="", code=False):
+        ip = self.ip()
+        if self.is_ext() and lockdown_left():
+            err = "외부 로그인이 일시적으로 잠겨 있습니다 (%d분 남음)." % (lockdown_left() // 60 + 1)
         sub = "이 서버는 에이전트를 실행합니다. 본인만 로그인하세요."
-        html = LOGIN_HTML.replace("@SUB@", sub).replace(
+        if code:
+            sub = "2단계 인증: 텔레그램으로 보낸 확인 코드를 입력하세요. (5분 안에)"
+        html = LOGIN_HTML.replace("@SUB@", sub).replace("@FIELDS@", CODE_FIELDS if code else LOGIN_FIELDS).replace(
             "@ERR@", ('<p class="e">%s</p>' % err.replace("<", "&lt;")) if err else "")
         self.send(200, html,
                   "text/html; charset=utf-8",
                   {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"})
 
+    def finish_login(self, ip, ext):
+        note_ok(ip)
+        tok = new_session(ip, ext)
+        # 공개 도메인(https)으로 들어왔을 때만 Secure 쿠키를 쓴다. 내부 IP(http)에 Secure를 붙이면
+        # 브라우저가 쿠키 저장을 거부해 로그인이 계속 풀린다.
+        req_host = (self.headers.get("Host") or "").split(":")[0]
+        flags = "; Secure" if (PUBLIC_HTTPS and PUBLIC_HOST and req_host == PUBLIC_HOST) else ""
+        self.send(303, "", "text/plain; charset=utf-8",
+                  {"Location": "/", "Set-Cookie": ["ah_sess=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d%s"
+                                                   % (tok, SESSIONS[tok]["ttl"], flags),
+                                                   "ah_pend=; Path=/login; HttpOnly; Max-Age=0"]})
+
     def do_login(self):
-        ip = self.ip()
-        if blocked_for(ip):
+        ip, ext = self.ip(), self.is_ext()
+        if ext and lockdown_left():
             return self.login_page()
         origin = self.headers.get("Origin")
         if origin and urlparse(origin).netloc not in {self.headers.get("Host"), PUBLIC_HOST}:
@@ -2695,18 +3051,41 @@ class Handler(BaseHTTPRequestHandler):
             return self.login_page("입력이 너무 깁니다.")
         from urllib.parse import parse_qs
         f = parse_qs(self.rfile.read(n).decode("utf-8", "replace"))
+        if "code" in f:                                   # 2단계: 텔레그램 코드 확인
+            pt = self.cookie("ah_pend") or ""
+            pend = PENDING.get(pt)
+            if not pend or pend["exp"] < time.time() or pend["ip"] != ip:
+                PENDING.pop(pt, None)
+                return self.login_page("확인이 만료됐거나 접속 위치가 바뀌었습니다. 처음부터 다시 로그인하세요.")
+            if not hmac.compare_digest((f.get("code") or [""])[0].strip(), pend["code"]):
+                pend["tries"] += 1
+                if pend["tries"] >= 3:
+                    PENDING.pop(pt, None)
+                    note_fail(ip, "2단계 코드 3회 오류", ext)
+                    return self.login_page("코드가 3번 틀렸습니다. 처음부터 다시 로그인하세요.")
+                return self.login_page("코드가 올바르지 않습니다. (%d/3)" % pend["tries"], code=True)
+            PENDING.pop(pt, None)
+            return self.finish_login(ip, ext)
         if not check_pw((f.get("user") or [""])[0], (f.get("password") or [""])[0]):
-            note_fail(ip, "로그인 화면")
-            return self.login_page("아이디 또는 비밀번호가 올바르지 않습니다.")
-        note_ok(ip)
-        tok = new_session(ip)
-        # 공개 도메인(https)으로 들어왔을 때만 Secure 쿠키를 쓴다. 내부 IP(http)에 Secure를 붙이면
-        # 브라우저가 쿠키 저장을 거부해 로그인이 계속 풀린다.
-        req_host = (self.headers.get("Host") or "").split(":")[0]
-        flags = "; Secure" if (PUBLIC_HTTPS and PUBLIC_HOST and req_host == PUBLIC_HOST) else ""
-        self.send(303, "", "text/plain; charset=utf-8",
-                  {"Location": "/", "Set-Cookie": "ah_sess=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d%s"
-                                                  % (tok, SESS_TTL, flags)})
+            note_fail(ip, "로그인 화면", ext)
+            if banned_for(ip):
+                self.close_connection = True
+                return self.send(403, "", "text/plain; charset=utf-8")
+            left = MAX_FAILS - (FAILS.get(ip) or {"n": 0})["n"]
+            return self.login_page("아이디 또는 비밀번호가 올바르지 않습니다. (%d번 더 틀리면 차단)" % left)
+        if ext and sec_cfg()["two_factor"] and two_factor_ready():
+            for k in [k for k, v in PENDING.items() if v["exp"] < time.time()]:
+                PENDING.pop(k, None)
+            pt, code = secrets.token_urlsafe(24), "%06d" % secrets.randbelow(10 ** 6)
+            PENDING[pt] = {"ip": ip, "code": code, "exp": time.time() + 300, "tries": 0}
+            send_code("[하네스 로그인 확인] 코드: %s\n접속 IP: %s\n본인이 아니면 무시하고 비밀번호를 바꾸세요. (5분간 유효)" % (code, ip))
+            sec_event(ip, "비밀번호 확인, 2단계 코드 발송")
+            self.send(303, "", "text/plain; charset=utf-8",
+                      {"Location": "/login?step=2",
+                       "Set-Cookie": "ah_pend=%s; Path=/login; HttpOnly; SameSite=Strict; Max-Age=300%s"
+                                     % (pt, "; Secure" if PUBLIC_HTTPS else "")})
+            return
+        self.finish_login(ip, ext)
 
     def dispatch(self, method, body):
         path = urlparse(self.path).path
@@ -2731,13 +3110,19 @@ class Handler(BaseHTTPRequestHandler):
         self.js(404, {"error": "없는 경로"})
 
     def do_GET(self):
+        if not self.shield():
+            return
         path = urlparse(self.path).path
         if path == "/login":
-            return self.login_page()
+            q = urlparse(self.path).query
+            return self.login_page(code=(q == "step=2" and bool(self.cookie("ah_pend"))))
+        if path in ("/favicon.ico", "/robots.txt"):
+            return self.send(200 if path == "/robots.txt" else 204, "User-agent: *\nDisallow: /\n" if path == "/robots.txt" else "",
+                             "text/plain; charset=utf-8")
         if path == "/logout":
             SESSIONS.pop(self.cookie("ah_sess") or "", None)
             return self.send(303, "", "text/plain; charset=utf-8",
-                             {"Location": "/login", "Set-Cookie": "ah_sess=; Path=/; HttpOnly; Max-Age=0"})
+                             {"Location": "/login", "Set-Cookie": "ah_sess=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"})
         if not self.gate():
             return
         if path == "/":
@@ -2745,7 +3130,13 @@ class Handler(BaseHTTPRequestHandler):
                              {"Content-Security-Policy": "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'"})
         self.dispatch("GET", {})
 
+    def do_HEAD(self):
+        if self.shield():
+            self.send(405, "", "text/plain; charset=utf-8")
+
     def do_POST(self):
+        if not self.shield():
+            return
         if urlparse(self.path).path == "/login":
             return self.do_login()
         if not self.gate():
@@ -2797,6 +3188,7 @@ def main():
     if not PASSWORD:
         sys.exit("GUI_PASSWORD 가 설정되지 않았습니다. %s/.env 에 GUI_PASSWORD=원하는비밀번호 를 추가하세요." % BASE)
     load_cfg()
+    sec_load()
     recover()
     probe_flags()
     for _ in range(3):
