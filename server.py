@@ -1671,7 +1671,9 @@ def psummary(p):
             "jobs": len(js), "tokens": sum(new_tokens(j.get("usage") or {}) for j in js),
             "cost": round(sum((j.get("usage") or {}).get("cost", 0) for j in js), 4),
             "agents": len(p["agents"]), "stages": len(active_stages(p)),
-            "schedules": sum(1 for s in p.get("schedules", []) if s.get("enabled", True))}
+            "schedules": sum(1 for s in p.get("schedules", []) if s.get("enabled", True)),
+            "repo": {"on": True, "release": repo_release(p), "branch": repo_base(p),
+                     "test_url": repo_cfg(p).get("test_url", "")} if repo_on(p) else None}
 
 
 def project_detail(proj):
