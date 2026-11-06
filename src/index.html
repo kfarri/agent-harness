@@ -47,6 +47,14 @@ button:disabled{opacity:.5;cursor:default}
 .chip.running{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
 .chip.awaiting_user{background:color-mix(in srgb,var(--warn) 22%,transparent);color:var(--warn)}
 .chip.deploying{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
+.attl{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}.attl:empty{display:none}
+.attc{display:flex;align-items:center;gap:6px;font-size:12px;border:1px solid var(--line);border-radius:8px;padding:3px 6px;max-width:100%}
+.attc img{width:34px;height:34px;object-fit:cover;border-radius:4px}.attc b{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:140px}
+.attc button{border:0;background:none;cursor:pointer;color:var(--mute);padding:0 2px;font-size:14px}
+.attb{font-size:13px;cursor:pointer;border:1px solid var(--line);border-radius:8px;padding:7px 12px;color:var(--ink)}
+.req.drag{outline:2px dashed var(--accent)}
+.atts{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}.atts a{font-size:12px;color:var(--ink);text-decoration:none;border:1px solid var(--line);border-radius:8px;padding:4px 8px;display:flex;align-items:center;gap:6px}
+.atts img{max-width:160px;max-height:110px;border-radius:6px;display:block}
 .chip.approved{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok)}
 .chip.failed,.chip.cancelled{background:color-mix(in srgb,var(--err) 18%,transparent);color:var(--err)}
 .empty{color:var(--mute);text-align:center;padding:60px 10px}
@@ -129,8 +137,9 @@ table.ut{border-collapse:collapse;width:100%;font-size:13px}.ut td,.ut th{paddin
   <aside>
     <div class="card">
       <h2>새 작업 요청</h2>
-      <textarea id="req" placeholder="요청 내용을 입력하세요"></textarea>
-      <div class="row" style="margin-top:8px"><button class="pri" id="go">작업 시작</button></div>
+      <textarea id="req" placeholder="요청 내용을 입력하세요 (스크린샷은 Ctrl+V로 붙여넣거나 끌어다 놓을 수 있습니다)"></textarea>
+      <div id="attl" class="attl"></div>
+      <div class="row" style="margin-top:8px"><button class="pri" id="go">작업 시작</button><label class="attb">파일 첨부<input type="file" id="attf" multiple hidden accept="image/*,.pdf,.txt,.md,.csv,.json,.log,.yaml,.yml,.html,.css,.js,.ts,.vue,.py,.sql,.xml,.har"></label></div>
     </div>
     <div id="relcard"></div>
     <div class="jobs" id="jobs"></div>
@@ -252,6 +261,7 @@ async function loadRel(force){
   let st;try{st=await api(base()+'/repo')}catch(e){return}
   const n=st.pending.length;
   el.innerHTML='<div class="card" style="margin-top:10px"><h2>테스트 → 운영</h2>'
+    +(c.repo.test_url?'<div class="row" style="margin-bottom:6px"><a class="attb" style="text-decoration:none" href="'+esc(c.repo.test_url)+'" target="_blank" rel="noopener">테스트 서버 열기 ↗</a></div>':'')
     +'<div class="vd">테스트('+esc(c.repo.branch)+')에만 있는 변경: <b>'+n+'개</b>'+(st.release_head?'<br>운영('+esc(c.repo.release)+'): '+esc(st.release_head):'')+'</div>'
     +(n?'<ul class="tip" style="margin:6px 0">'+st.pending.slice(0,6).map(x=>'<li>'+esc(x.msg)+' <span style="color:var(--mute)">'+esc(x.when)+'</span></li>').join('')+(n>6?'<li>… 외 '+(n-6)+'개</li>':'')+'</ul>'
       +'<div class="row"><button class="pri" id="relgo">운영 반영</button></div>':'<div class="vd">운영과 테스트가 같은 상태입니다.</div>')+'</div>';
@@ -314,6 +324,8 @@ async function loadDetail(force){
       act='<div class="vd">승인 완료: shared/outbox/approved_'+esc(j.id)+'.md'+(d.repo?' · 반영 결과는 \'승인본\' 탭에서 확인':'')+'</div>';
     }
     if(['awaiting_user','approved','failed','cancelled'].includes(j.status))act+='<div class="row" style="margin:6px 0 10px;justify-content:flex-end"><button class="dng" id="jdel" style="font-size:12px;padding:5px 10px">작업 삭제</button></div>';
+    const at=d.attachments||[];
+    if(at.length)act='<div class="atts">'+at.map(a=>{const u=base()+'/jobs/'+encodeURIComponent(j.id)+'/files/'+encodeURIComponent(a.name);return '<a href="'+u+'" target="_blank" rel="noopener">'+(a.img?'<img src="'+u+'" alt="'+esc(a.name)+'">':'📄 '+esc(a.name)+' <span style="color:var(--mute)">'+fmtB(a.size)+'</span>')+'</a>'}).join('')+'</div>'+act;
     $('#act').innerHTML=act;bindJob(j);
   }
   const tdef=(f.approved!=null&&d.repo?[['approved','승인본']]:[]).concat(f.diff!=null?[['diff','변경 내용']]:[]).concat([['final','최종본']]).concat(d.stages.slice().reverse().map(s=>[s.id,s.name+(s.kind==='review'?' (검토)':'')+(s.enabled?'':' ·꺼짐')])).concat([['request','요청']]);
@@ -348,9 +360,35 @@ function selectJob(id){
 }
 $('#jclean').onclick=async()=>{const d=prompt('승인 완료·실패·중단된 작업을 삭제합니다.\n며칠 지난 작업만 지울까요? (0 = 전부)','7');if(d===null)return;const n=parseInt(d);if(isNaN(n)||n<0){toast('숫자를 입력하세요');return}try{const r=await post(base()+'/jobs/delete-many',{older_days:n});toast(r.deleted+'개 작업을 삭제했습니다');if(sel&&!(await api(base()+'/jobs')).jobs.some(x=>x.id===sel)){sel=null;$('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>'}last={};await loadList()}catch(e){toast(e.message)}};
 $('#jobs').onclick=e=>{const j=e.target.closest('.job');if(j)selectJob(j.dataset.id)};
+let ATT=[];
+const fmtB=n=>n>1048576?(n/1048576).toFixed(1)+'MB':Math.ceil(n/1024)+'KB';
+function addFiles(list){
+  for(const f of list){
+    if(ATT.length>=10){toast('첨부는 최대 10개까지입니다');break}
+    if(f.size>10*1024*1024){toast(f.name+': 10MB를 넘습니다');continue}
+    const name=f.name&&f.name!=='image.png'?f.name:'screenshot-'+new Date().toTimeString().slice(0,8).replace(/:/g,'')+'.png';
+    ATT.push({file:f,name,url:f.type.startsWith('image/')?URL.createObjectURL(f):''});
+  }
+  drawAtt();
+}
+function drawAtt(){
+  $('#attl').innerHTML=ATT.map((a,i)=>'<span class="attc">'+(a.url?'<img src="'+a.url+'" alt="">':'📄')+'<b title="'+esc(a.name)+'">'+esc(a.name)+'</b><span style="color:var(--mute)">'+fmtB(a.file.size)+'</span><button data-rm="'+i+'" title="빼기">×</button></span>').join('');
+  $('#attl').querySelectorAll('[data-rm]').forEach(b=>b.onclick=()=>{const a=ATT.splice(+b.dataset.rm,1)[0];if(a&&a.url)URL.revokeObjectURL(a.url);drawAtt()});
+}
+const b64=f=>new Promise((ok,no)=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(',')[1]||'');r.onerror=no;r.readAsDataURL(f)});
+$('#attf').onchange=e=>{addFiles(e.target.files);e.target.value=''};
+$('#req').addEventListener('paste',e=>{const fs=[...(e.clipboardData||{}).items||[]].filter(x=>x.kind==='file').map(x=>x.getAsFile()).filter(Boolean);if(fs.length){e.preventDefault();addFiles(fs)}});
+{const box=$('#req').closest('.card');box.classList.add('req');
+ box.addEventListener('dragover',e=>{e.preventDefault();box.classList.add('drag')});
+ box.addEventListener('dragleave',()=>box.classList.remove('drag'));
+ box.addEventListener('drop',e=>{e.preventDefault();box.classList.remove('drag');if(e.dataTransfer.files.length)addFiles(e.dataTransfer.files)});}
 $('#go').onclick=async()=>{
   const t=$('#req').value.trim();if(!t){toast('요청 내용을 입력하세요');return}
-  try{const j=await post(base()+'/jobs',{request:t});$('#req').value='';await loadList();selectJob(j.id)}catch(e){toast(e.message)}
+  let files=[];
+  if(ATT.length){$('#go').disabled=true;toast('첨부 파일을 올리는 중…');
+    try{files=await Promise.all(ATT.map(async a=>({name:a.name,data:await b64(a.file)})))}catch(e){toast('파일을 읽지 못했습니다');$('#go').disabled=false;return}}
+  try{const j=await post(base()+'/jobs',{request:t,files});$('#req').value='';ATT.forEach(a=>a.url&&URL.revokeObjectURL(a.url));ATT=[];drawAtt();await loadList();selectJob(j.id)}catch(e){toast(e.message)}
+  $('#go').disabled=false;
 };
 
 /* ---------- 에이전트 ---------- */
@@ -716,6 +754,7 @@ function repoCard(st){
     +'<label class="lb">기준 브랜치<input type="text" id="rbr" value="'+esc(r.branch||'main')+'"></label></div>'
     +'<label class="lb">운영 브랜치 (테스트 단계를 쓰려면 입력 · 비우면 승인 즉시 운영)<input type="text" id="rrel" value="'+esc(r.release||'')+'" placeholder="예: main  (이때 기준 브랜치는 develop)"></label>'
     +(r.release?'<div class="vd">승인하면 <b>'+esc(r.branch||'main')+'</b>(테스트)에 올라가고, 작업 화면의 \'운영 반영\'을 눌러야 <b>'+esc(r.release)+'</b>(운영)으로 올라갑니다.</div>':'')
+    +'<label class="lb">테스트 서버 주소 (선택 · 작업 화면에 바로가기 링크로 표시)<input type="text" id="rturl" value="'+esc(r.test_url||'')+'" placeholder="예: http://192.168.0.16:38080"></label>'
     +'<label class="lb">빌드 확인 명령 (비우면 생략 · 실패하면 오류를 에이전트에게 돌려줘 자동 수정)<input type="text" id="rbuild" value="'+esc(r.build||'')+'" placeholder="예: npm ci && npm run build"></label>'
     +'<label class="lb">승인 시 반영 방식<select id="rmode" style="width:auto"><option value="merge"'+(r.merge!=='branch'?' selected':'')+'>기준 브랜치에 병합 후 푸시 (GitHub Actions 자동 빌드)</option><option value="branch"'+(r.merge==='branch'?' selected':'')+'>작업 브랜치만 푸시 (PR은 GitHub에서 직접 병합)</option></select></label>'
     +'<label class="lb">푸시 후 실행할 배포 명령 (선택)<input type="text" id="rdep" value="'+esc(r.deploy||'')+'" placeholder="비워두면 GitHub Actions에 맡김"></label>'
@@ -730,7 +769,7 @@ function repoCard(st){
 }
 function bindRepo(){
   const v=id=>$('#'+id).value.trim();
-  $('#rsave').onclick=async()=>{try{await post(base()+'/repo',{url:v('rurl'),path:v('rpath'),branch:v('rbr'),release:v('rrel'),build:v('rbuild'),merge:$('#rmode').value,deploy:v('rdep')});toast('저장했습니다');await loadSettings()}catch(e){toast(e.message)}};
+  $('#rsave').onclick=async()=>{try{await post(base()+'/repo',{url:v('rurl'),path:v('rpath'),branch:v('rbr'),release:v('rrel'),test_url:v('rturl'),build:v('rbuild'),merge:$('#rmode').value,deploy:v('rdep')});toast('저장했습니다');await loadSettings()}catch(e){toast(e.message)}};
   if($('#rclone'))$('#rclone').onclick=async e=>{e.target.disabled=true;toast('저장소와 통신 중…');try{const r=await post(base()+'/repo/clone');toast(r.msg);await loadSettings()}catch(err){alert(err.message);e.target.disabled=false}};
   $('#rkey').onclick=async()=>{try{const r=await post(base()+'/repo/key');const p=$('#rkeyv');p.textContent=r.key;p.style.display='';try{await navigator.clipboard.writeText(r.key);toast('공개 키를 복사했습니다')}catch(_){toast('아래 공개 키를 복사하세요')}}catch(e){toast(e.message)}};
   document.querySelectorAll('[data-rb]').forEach(b=>b.onclick=async()=>{if(!confirm('운영을 '+b.dataset.rb.slice(0,7)+' 버전으로 되돌릴까요?\n1분 안에 실서버가 이 버전으로 다시 배포됩니다. 테스트 브랜치는 그대로입니다.'))return;

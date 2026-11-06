@@ -1066,7 +1066,10 @@ def repo_save(proj, b):
     if release and release == branch:
         raise ApiError(400, "테스트 브랜치와 운영 브랜치는 달라야 합니다 (예: develop / main)")
     old = repo_cfg(proj)
-    proj["repo"] = {"url": url, "path": path, "branch": branch, "merge": mode, "release": release,
+    test_url = str(b.get("test_url") or "").strip()[:200]
+    if test_url and not re.match(r"^https?://[\w.:\-]+(/[\w./\-]*)?$", test_url):
+        raise ApiError(400, "테스트 서버 주소 형식이 올바르지 않습니다 (예: http://192.168.0.16:38080)")
+    proj["repo"] = {"url": url, "path": path, "branch": branch, "merge": mode, "release": release, "test_url": test_url,
                     "releases": old.get("releases", []) if old.get("url") == url else [],
                     "build": str(b.get("build") or "").strip()[:500], "deploy": str(b.get("deploy") or "").strip()[:500]}
     save_cfg()
@@ -1262,8 +1265,9 @@ def repo_deliver(proj, j, summary_src):
                 sha = git(d, "log", "-1", "--format=%h", proj=proj).strip()
                 lines.append("- `%s`에 병합하고 푸시했습니다 (커밋 %s, 변경 커밋 %d개)" % (base, sha, ahead))
                 if repo_release(proj):
-                    lines.append("- **테스트 서버**에 1분 안에 배포됩니다. 확인한 뒤 '운영 반영'을 누르면 `%s`(운영)으로 올라갑니다"
-                                 % repo_release(proj))
+                    tu = repo_cfg(proj).get("test_url")
+                    lines.append("- **테스트 서버**%s에 1~3분 안에 배포됩니다. 확인한 뒤 '운영 반영'을 누르면 `%s`(운영)으로 올라갑니다"
+                                 % (" (%s)" % tu if tu else "", repo_release(proj)))
                 if web:
                     lines.append("- 커밋: %s/commit/%s\n- 빌드 상태(GitHub Actions): %s/actions" % (web, sha, web))
                 dep = repo_cfg(proj).get("deploy")
@@ -1353,6 +1357,9 @@ def feedback_block(fb):
 
 def inputs_block(proj, stages, stage, jid):
     lines = ["요청 파일: %s" % rel(proj, "request", jid)]
+    ab = att_block(proj, jid)
+    if ab:
+        lines.append(ab.rstrip())
     by_id = {s["id"]: s for s in stages}
     for i in stage.get("inputs", []):
         if i in by_id:
@@ -1672,7 +1679,8 @@ def project_detail(proj):
     return {"id": proj["id"], "name": proj["name"], "description": proj.get("description", ""),
             "max_rounds": proj.get("max_rounds", 1), "root": proj["root"],
             "stage_mode": proj.get("stage_mode", "fixed"), "use_sources": proj.get("use_sources", "prefer"),
-            "sources": len(src_list(proj)), "repo": {"on": repo_on(proj), "release": repo_release(proj), "branch": repo_base(proj)} if repo_on(proj) else None,
+            "sources": len(src_list(proj)), "repo": {"on": repo_on(proj), "release": repo_release(proj), "branch": repo_base(proj),
+                                                   "test_url": repo_cfg(proj).get("test_url", "")} if repo_on(proj) else None,
             "agents": [agent_info(proj, a) for a in proj["agents"]], "stages": proj["stages"],
             "schedules": proj.get("schedules", []), "summary": psummary(proj)}
 
@@ -1690,8 +1698,9 @@ def job_detail(proj, j):
     for s in src:
         files[s["id"]] = read_text(fpath(proj, s["id"], j["id"]))
     files["diff"] = read_text(fpath(proj, "diff", j["id"]))
+    files_att = att_list(proj, j["id"])
     rp = {"on": True, "mode": repo_cfg(proj).get("merge", "merge"), "base": repo_base(proj)} if repo_on(proj) else None
-    return {"job": j, "files": files, "repo": rp, "limit": S_().get("job_token_limit", 0), "max_rounds": proj.get("max_rounds", 1),
+    return {"job": j, "files": files, "repo": rp, "attachments": files_att, "limit": S_().get("job_token_limit", 0), "max_rounds": proj.get("max_rounds", 1),
             "auto_planned": bool(j.get("stages")),
             "stages": [{"id": s["id"], "name": s["name"], "kind": s["kind"], "enabled": s.get("enabled", True),
                         "agent": agent_name(proj, s["agent"])} for s in src]}
@@ -1706,7 +1715,73 @@ def job_of(proj, jid):
     return j
 
 
-def create_job(proj, text, source="gui", auto_approve=False, chat=None, title=None):
+ATT_EXT = {"png", "jpg", "jpeg", "gif", "webp", "pdf", "txt", "md", "csv", "json", "log", "yaml", "yml", "html", "css",
+           "js", "ts", "vue", "py", "sql", "xml", "har"}
+ATT_IMG = {"png", "jpg", "jpeg", "gif", "webp"}
+ATT_MAX, ATT_TOTAL, ATT_COUNT = 10 * 1024 * 1024, 20 * 1024 * 1024, 10
+
+
+def att_dir(proj, jid):
+    return proj_dirs(proj)["inbox"] / ("%s_files" % jid)
+
+
+def att_name(name, used):
+    base = re.sub(r"[^\w.가-힣-]+", "_", Path(str(name or "file")).name).strip("._")[:80] or "file"
+    ext = base.rsplit(".", 1)[-1].lower() if "." in base else ""
+    if ext not in ATT_EXT:
+        raise ApiError(400, "올릴 수 없는 파일 형식입니다: %s (이미지·PDF·텍스트·코드 파일만)" % base[:40])
+    stem, n, out = base[: -len(ext) - 1], 1, base
+    while out in used:
+        n += 1
+        out = "%s_%d.%s" % (stem, n, ext)
+    used.add(out)
+    return out
+
+
+def save_attachments(proj, jid, files):
+    """GUI에서 올린 파일(base64)을 inbox/<작업ID>_files/ 에 저장한다. 에이전트는 필요할 때 Read로 연다."""
+    if not files:
+        return []
+    if not isinstance(files, list) or len(files) > ATT_COUNT:
+        raise ApiError(400, "첨부는 최대 %d개까지입니다" % ATT_COUNT)
+    out, used, total = [], set(), 0
+    blobs = []
+    for f in files:
+        try:
+            data = base64.b64decode(str(f.get("data") or ""), validate=True)
+        except (ValueError, AttributeError):
+            raise ApiError(400, "첨부 파일을 읽지 못했습니다")
+        if len(data) > ATT_MAX:
+            raise ApiError(400, "파일 하나는 10MB까지입니다: %s" % str(f.get("name"))[:40])
+        total += len(data)
+        if total > ATT_TOTAL:
+            raise ApiError(400, "첨부 전체는 20MB까지입니다")
+        blobs.append((att_name(f.get("name"), used), data))
+    d = att_dir(proj, jid)
+    d.mkdir(parents=True, exist_ok=True)
+    for name, data in blobs:
+        (d / name).write_bytes(data)
+        out.append({"name": name, "size": len(data)})
+    return out
+
+
+def att_list(proj, jid):
+    d = att_dir(proj, jid)
+    if not d.is_dir():
+        return []
+    return [{"name": x.name, "size": x.stat().st_size, "img": x.suffix.lower().lstrip(".") in ATT_IMG}
+            for x in sorted(d.iterdir()) if x.is_file()]
+
+
+def att_block(proj, jid):
+    files = att_list(proj, jid)
+    if not files:
+        return ""
+    return ("[첨부 파일] 요청에 함께 올라온 파일이다. 작업에 필요한 것만 Read로 열어 확인한다(이미지는 화면 캡처일 수 있음).\n"
+            + "\n".join("- ../shared/inbox/%s_files/%s" % (jid, f["name"]) for f in files) + "\n")
+
+
+def create_job(proj, text, source="gui", auto_approve=False, chat=None, title=None, files=None):
     text = (text or "").strip()
     if not text:
         raise ApiError(400, "요청 내용을 입력하세요")
@@ -1716,6 +1791,7 @@ def create_job(proj, text, source="gui", auto_approve=False, chat=None, title=No
         raise ApiError(400, "사용 중인 단계가 없습니다")
     ensure_dirs(proj)
     jid = time.strftime("%m%d-%H%M%S") + "-" + secrets.token_hex(1)
+    saved = save_attachments(proj, jid, files)
     fpath(proj, "request", jid).write_text(text + "\n")
     auto = proj.get("stage_mode") == "auto"
     job = {"id": jid, "pid": proj["id"], "title": (title or text.splitlines()[0])[:60], "status": "queued",
@@ -1725,7 +1801,8 @@ def create_job(proj, text, source="gui", auto_approve=False, chat=None, title=No
            "needs_input": False, "question": ""}
     JOBS[(proj["id"], jid)] = job
     jsave(job)
-    event(job, "system", "작업 등록" + {"telegram": " (텔레그램)", "schedule": " (예약 실행)"}.get(source, ""))
+    event(job, "system", "작업 등록" + {"telegram": " (텔레그램)", "schedule": " (예약 실행)"}.get(source, "")
+          + (" · 첨부 %d개" % len(saved) if saved else ""))
     QUEUE.put((proj["id"], jid, "first"))
     return job
 
@@ -1792,7 +1869,8 @@ def job_delete(proj, j):
     d = proj_dirs(proj)
     targets = [d["jobs"] / ("%s.json" % jid), fpath(proj, "request", jid), fpath(proj, "final", jid),
                fpath(proj, "approved", jid)]
-    targets += list(d["handoff"].glob("*_%s.md" % jid)) + list(d["inbox"].glob("%s*" % jid))
+    shutil.rmtree(att_dir(proj, jid), ignore_errors=True)
+    targets += list(d["handoff"].glob("*_%s.md" % jid)) + [x for x in d["inbox"].glob("%s*" % jid) if x.is_file()]
     if d["logs"].is_dir():
         targets += list(d["logs"].glob("%s_*" % jid))
     for t in targets:
@@ -2787,7 +2865,7 @@ def r_jobs(m, b):
 
 @route("POST", r"/api/projects/([^/]+)/jobs")
 def r_job_create(m, b):
-    return job_summary(create_job(proj_of(m[1]), b.get("request")))
+    return job_summary(create_job(proj_of(m[1]), b.get("request"), files=b.get("files")))
 
 
 @route("GET", r"/api/projects/([^/]+)/jobs/([^/]+)")
@@ -3256,10 +3334,33 @@ class Handler(BaseHTTPRequestHandler):
                              {"Location": "/login", "Set-Cookie": "ah_sess=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"})
         if not self.gate():
             return
+        m = re.match(r"^/api/projects/([^/]+)/jobs/([^/]+)/files/([^/]+)$", path)
+        if m:
+            return self.send_attachment(*m.groups())
         if path == "/":
             return self.send(200, INDEX_HTML, "text/html; charset=utf-8",
-                             {"Content-Security-Policy": "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'"})
+                             {"Content-Security-Policy": "default-src 'self'; img-src 'self' blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'"})
         self.dispatch("GET", {})
+
+    def send_attachment(self, pid, jid, name):
+        from urllib.parse import unquote
+        name = unquote(name)
+        try:
+            with LOCK:
+                proj = proj_of(pid)
+                job_of(proj, jid)
+        except ApiError as e:
+            return self.js(e.code, {"error": e.msg})
+        f = att_dir(proj, jid) / Path(name).name
+        if not f.is_file() or f.resolve().parent != att_dir(proj, jid).resolve():
+            return self.js(404, {"error": "파일 없음"})
+        ext = f.suffix.lower().lstrip(".")
+        ctype = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp",
+                 "pdf": "application/pdf"}.get(ext, "text/plain; charset=utf-8")
+        disp = "inline" if ext in ATT_IMG or ext == "pdf" else "attachment"
+        from urllib.parse import quote
+        self.send(200, f.read_bytes(), ctype, {"Content-Disposition": "%s; filename*=UTF-8''%s" % (disp, quote(f.name)),
+                                               "Content-Security-Policy": "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox"})
 
     def do_HEAD(self):
         if self.shield():
@@ -3282,7 +3383,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.js(415, {"error": "JSON만 허용"})
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            if n > 300_000:
+            big = re.match(r"^/api/projects/[^/]+/jobs$", urlparse(self.path).path)
+            if n > (30_000_000 if big else 300_000):
                 return self.js(413, {"error": "요청이 너무 큼"})
             body = json.loads(self.rfile.read(n) or b"{}")
             if not isinstance(body, dict):
@@ -3400,6 +3502,14 @@ button:disabled{opacity:.5;cursor:default}
 .chip.running{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
 .chip.awaiting_user{background:color-mix(in srgb,var(--warn) 22%,transparent);color:var(--warn)}
 .chip.deploying{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
+.attl{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}.attl:empty{display:none}
+.attc{display:flex;align-items:center;gap:6px;font-size:12px;border:1px solid var(--line);border-radius:8px;padding:3px 6px;max-width:100%}
+.attc img{width:34px;height:34px;object-fit:cover;border-radius:4px}.attc b{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:140px}
+.attc button{border:0;background:none;cursor:pointer;color:var(--mute);padding:0 2px;font-size:14px}
+.attb{font-size:13px;cursor:pointer;border:1px solid var(--line);border-radius:8px;padding:7px 12px;color:var(--ink)}
+.req.drag{outline:2px dashed var(--accent)}
+.atts{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}.atts a{font-size:12px;color:var(--ink);text-decoration:none;border:1px solid var(--line);border-radius:8px;padding:4px 8px;display:flex;align-items:center;gap:6px}
+.atts img{max-width:160px;max-height:110px;border-radius:6px;display:block}
 .chip.approved{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok)}
 .chip.failed,.chip.cancelled{background:color-mix(in srgb,var(--err) 18%,transparent);color:var(--err)}
 .empty{color:var(--mute);text-align:center;padding:60px 10px}
@@ -3482,8 +3592,9 @@ table.ut{border-collapse:collapse;width:100%;font-size:13px}.ut td,.ut th{paddin
   <aside>
     <div class="card">
       <h2>새 작업 요청</h2>
-      <textarea id="req" placeholder="요청 내용을 입력하세요"></textarea>
-      <div class="row" style="margin-top:8px"><button class="pri" id="go">작업 시작</button></div>
+      <textarea id="req" placeholder="요청 내용을 입력하세요 (스크린샷은 Ctrl+V로 붙여넣거나 끌어다 놓을 수 있습니다)"></textarea>
+      <div id="attl" class="attl"></div>
+      <div class="row" style="margin-top:8px"><button class="pri" id="go">작업 시작</button><label class="attb">파일 첨부<input type="file" id="attf" multiple hidden accept="image/*,.pdf,.txt,.md,.csv,.json,.log,.yaml,.yml,.html,.css,.js,.ts,.vue,.py,.sql,.xml,.har"></label></div>
     </div>
     <div id="relcard"></div>
     <div class="jobs" id="jobs"></div>
@@ -3605,6 +3716,7 @@ async function loadRel(force){
   let st;try{st=await api(base()+'/repo')}catch(e){return}
   const n=st.pending.length;
   el.innerHTML='<div class="card" style="margin-top:10px"><h2>테스트 → 운영</h2>'
+    +(c.repo.test_url?'<div class="row" style="margin-bottom:6px"><a class="attb" style="text-decoration:none" href="'+esc(c.repo.test_url)+'" target="_blank" rel="noopener">테스트 서버 열기 ↗</a></div>':'')
     +'<div class="vd">테스트('+esc(c.repo.branch)+')에만 있는 변경: <b>'+n+'개</b>'+(st.release_head?'<br>운영('+esc(c.repo.release)+'): '+esc(st.release_head):'')+'</div>'
     +(n?'<ul class="tip" style="margin:6px 0">'+st.pending.slice(0,6).map(x=>'<li>'+esc(x.msg)+' <span style="color:var(--mute)">'+esc(x.when)+'</span></li>').join('')+(n>6?'<li>… 외 '+(n-6)+'개</li>':'')+'</ul>'
       +'<div class="row"><button class="pri" id="relgo">운영 반영</button></div>':'<div class="vd">운영과 테스트가 같은 상태입니다.</div>')+'</div>';
@@ -3667,6 +3779,8 @@ async function loadDetail(force){
       act='<div class="vd">승인 완료: shared/outbox/approved_'+esc(j.id)+'.md'+(d.repo?' · 반영 결과는 \'승인본\' 탭에서 확인':'')+'</div>';
     }
     if(['awaiting_user','approved','failed','cancelled'].includes(j.status))act+='<div class="row" style="margin:6px 0 10px;justify-content:flex-end"><button class="dng" id="jdel" style="font-size:12px;padding:5px 10px">작업 삭제</button></div>';
+    const at=d.attachments||[];
+    if(at.length)act='<div class="atts">'+at.map(a=>{const u=base()+'/jobs/'+encodeURIComponent(j.id)+'/files/'+encodeURIComponent(a.name);return '<a href="'+u+'" target="_blank" rel="noopener">'+(a.img?'<img src="'+u+'" alt="'+esc(a.name)+'">':'📄 '+esc(a.name)+' <span style="color:var(--mute)">'+fmtB(a.size)+'</span>')+'</a>'}).join('')+'</div>'+act;
     $('#act').innerHTML=act;bindJob(j);
   }
   const tdef=(f.approved!=null&&d.repo?[['approved','승인본']]:[]).concat(f.diff!=null?[['diff','변경 내용']]:[]).concat([['final','최종본']]).concat(d.stages.slice().reverse().map(s=>[s.id,s.name+(s.kind==='review'?' (검토)':'')+(s.enabled?'':' ·꺼짐')])).concat([['request','요청']]);
@@ -3701,9 +3815,35 @@ function selectJob(id){
 }
 $('#jclean').onclick=async()=>{const d=prompt('승인 완료·실패·중단된 작업을 삭제합니다.\n며칠 지난 작업만 지울까요? (0 = 전부)','7');if(d===null)return;const n=parseInt(d);if(isNaN(n)||n<0){toast('숫자를 입력하세요');return}try{const r=await post(base()+'/jobs/delete-many',{older_days:n});toast(r.deleted+'개 작업을 삭제했습니다');if(sel&&!(await api(base()+'/jobs')).jobs.some(x=>x.id===sel)){sel=null;$('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>'}last={};await loadList()}catch(e){toast(e.message)}};
 $('#jobs').onclick=e=>{const j=e.target.closest('.job');if(j)selectJob(j.dataset.id)};
+let ATT=[];
+const fmtB=n=>n>1048576?(n/1048576).toFixed(1)+'MB':Math.ceil(n/1024)+'KB';
+function addFiles(list){
+  for(const f of list){
+    if(ATT.length>=10){toast('첨부는 최대 10개까지입니다');break}
+    if(f.size>10*1024*1024){toast(f.name+': 10MB를 넘습니다');continue}
+    const name=f.name&&f.name!=='image.png'?f.name:'screenshot-'+new Date().toTimeString().slice(0,8).replace(/:/g,'')+'.png';
+    ATT.push({file:f,name,url:f.type.startsWith('image/')?URL.createObjectURL(f):''});
+  }
+  drawAtt();
+}
+function drawAtt(){
+  $('#attl').innerHTML=ATT.map((a,i)=>'<span class="attc">'+(a.url?'<img src="'+a.url+'" alt="">':'📄')+'<b title="'+esc(a.name)+'">'+esc(a.name)+'</b><span style="color:var(--mute)">'+fmtB(a.file.size)+'</span><button data-rm="'+i+'" title="빼기">×</button></span>').join('');
+  $('#attl').querySelectorAll('[data-rm]').forEach(b=>b.onclick=()=>{const a=ATT.splice(+b.dataset.rm,1)[0];if(a&&a.url)URL.revokeObjectURL(a.url);drawAtt()});
+}
+const b64=f=>new Promise((ok,no)=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(',')[1]||'');r.onerror=no;r.readAsDataURL(f)});
+$('#attf').onchange=e=>{addFiles(e.target.files);e.target.value=''};
+$('#req').addEventListener('paste',e=>{const fs=[...(e.clipboardData||{}).items||[]].filter(x=>x.kind==='file').map(x=>x.getAsFile()).filter(Boolean);if(fs.length){e.preventDefault();addFiles(fs)}});
+{const box=$('#req').closest('.card');box.classList.add('req');
+ box.addEventListener('dragover',e=>{e.preventDefault();box.classList.add('drag')});
+ box.addEventListener('dragleave',()=>box.classList.remove('drag'));
+ box.addEventListener('drop',e=>{e.preventDefault();box.classList.remove('drag');if(e.dataTransfer.files.length)addFiles(e.dataTransfer.files)});}
 $('#go').onclick=async()=>{
   const t=$('#req').value.trim();if(!t){toast('요청 내용을 입력하세요');return}
-  try{const j=await post(base()+'/jobs',{request:t});$('#req').value='';await loadList();selectJob(j.id)}catch(e){toast(e.message)}
+  let files=[];
+  if(ATT.length){$('#go').disabled=true;toast('첨부 파일을 올리는 중…');
+    try{files=await Promise.all(ATT.map(async a=>({name:a.name,data:await b64(a.file)})))}catch(e){toast('파일을 읽지 못했습니다');$('#go').disabled=false;return}}
+  try{const j=await post(base()+'/jobs',{request:t,files});$('#req').value='';ATT.forEach(a=>a.url&&URL.revokeObjectURL(a.url));ATT=[];drawAtt();await loadList();selectJob(j.id)}catch(e){toast(e.message)}
+  $('#go').disabled=false;
 };
 
 /* ---------- 에이전트 ---------- */
@@ -4069,6 +4209,7 @@ function repoCard(st){
     +'<label class="lb">기준 브랜치<input type="text" id="rbr" value="'+esc(r.branch||'main')+'"></label></div>'
     +'<label class="lb">운영 브랜치 (테스트 단계를 쓰려면 입력 · 비우면 승인 즉시 운영)<input type="text" id="rrel" value="'+esc(r.release||'')+'" placeholder="예: main  (이때 기준 브랜치는 develop)"></label>'
     +(r.release?'<div class="vd">승인하면 <b>'+esc(r.branch||'main')+'</b>(테스트)에 올라가고, 작업 화면의 \'운영 반영\'을 눌러야 <b>'+esc(r.release)+'</b>(운영)으로 올라갑니다.</div>':'')
+    +'<label class="lb">테스트 서버 주소 (선택 · 작업 화면에 바로가기 링크로 표시)<input type="text" id="rturl" value="'+esc(r.test_url||'')+'" placeholder="예: http://192.168.0.16:38080"></label>'
     +'<label class="lb">빌드 확인 명령 (비우면 생략 · 실패하면 오류를 에이전트에게 돌려줘 자동 수정)<input type="text" id="rbuild" value="'+esc(r.build||'')+'" placeholder="예: npm ci && npm run build"></label>'
     +'<label class="lb">승인 시 반영 방식<select id="rmode" style="width:auto"><option value="merge"'+(r.merge!=='branch'?' selected':'')+'>기준 브랜치에 병합 후 푸시 (GitHub Actions 자동 빌드)</option><option value="branch"'+(r.merge==='branch'?' selected':'')+'>작업 브랜치만 푸시 (PR은 GitHub에서 직접 병합)</option></select></label>'
     +'<label class="lb">푸시 후 실행할 배포 명령 (선택)<input type="text" id="rdep" value="'+esc(r.deploy||'')+'" placeholder="비워두면 GitHub Actions에 맡김"></label>'
@@ -4083,7 +4224,7 @@ function repoCard(st){
 }
 function bindRepo(){
   const v=id=>$('#'+id).value.trim();
-  $('#rsave').onclick=async()=>{try{await post(base()+'/repo',{url:v('rurl'),path:v('rpath'),branch:v('rbr'),release:v('rrel'),build:v('rbuild'),merge:$('#rmode').value,deploy:v('rdep')});toast('저장했습니다');await loadSettings()}catch(e){toast(e.message)}};
+  $('#rsave').onclick=async()=>{try{await post(base()+'/repo',{url:v('rurl'),path:v('rpath'),branch:v('rbr'),release:v('rrel'),test_url:v('rturl'),build:v('rbuild'),merge:$('#rmode').value,deploy:v('rdep')});toast('저장했습니다');await loadSettings()}catch(e){toast(e.message)}};
   if($('#rclone'))$('#rclone').onclick=async e=>{e.target.disabled=true;toast('저장소와 통신 중…');try{const r=await post(base()+'/repo/clone');toast(r.msg);await loadSettings()}catch(err){alert(err.message);e.target.disabled=false}};
   $('#rkey').onclick=async()=>{try{const r=await post(base()+'/repo/key');const p=$('#rkeyv');p.textContent=r.key;p.style.display='';try{await navigator.clipboard.writeText(r.key);toast('공개 키를 복사했습니다')}catch(_){toast('아래 공개 키를 복사하세요')}}catch(e){toast(e.message)}};
   document.querySelectorAll('[data-rb]').forEach(b=>b.onclick=async()=>{if(!confirm('운영을 '+b.dataset.rb.slice(0,7)+' 버전으로 되돌릴까요?\n1분 안에 실서버가 이 버전으로 다시 배포됩니다. 테스트 브랜치는 그대로입니다.'))return;

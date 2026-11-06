@@ -1066,7 +1066,10 @@ def repo_save(proj, b):
     if release and release == branch:
         raise ApiError(400, "테스트 브랜치와 운영 브랜치는 달라야 합니다 (예: develop / main)")
     old = repo_cfg(proj)
-    proj["repo"] = {"url": url, "path": path, "branch": branch, "merge": mode, "release": release,
+    test_url = str(b.get("test_url") or "").strip()[:200]
+    if test_url and not re.match(r"^https?://[\w.:\-]+(/[\w./\-]*)?$", test_url):
+        raise ApiError(400, "테스트 서버 주소 형식이 올바르지 않습니다 (예: http://192.168.0.16:38080)")
+    proj["repo"] = {"url": url, "path": path, "branch": branch, "merge": mode, "release": release, "test_url": test_url,
                     "releases": old.get("releases", []) if old.get("url") == url else [],
                     "build": str(b.get("build") or "").strip()[:500], "deploy": str(b.get("deploy") or "").strip()[:500]}
     save_cfg()
@@ -1262,8 +1265,9 @@ def repo_deliver(proj, j, summary_src):
                 sha = git(d, "log", "-1", "--format=%h", proj=proj).strip()
                 lines.append("- `%s`에 병합하고 푸시했습니다 (커밋 %s, 변경 커밋 %d개)" % (base, sha, ahead))
                 if repo_release(proj):
-                    lines.append("- **테스트 서버**에 1분 안에 배포됩니다. 확인한 뒤 '운영 반영'을 누르면 `%s`(운영)으로 올라갑니다"
-                                 % repo_release(proj))
+                    tu = repo_cfg(proj).get("test_url")
+                    lines.append("- **테스트 서버**%s에 1~3분 안에 배포됩니다. 확인한 뒤 '운영 반영'을 누르면 `%s`(운영)으로 올라갑니다"
+                                 % (" (%s)" % tu if tu else "", repo_release(proj)))
                 if web:
                     lines.append("- 커밋: %s/commit/%s\n- 빌드 상태(GitHub Actions): %s/actions" % (web, sha, web))
                 dep = repo_cfg(proj).get("deploy")
@@ -1353,6 +1357,9 @@ def feedback_block(fb):
 
 def inputs_block(proj, stages, stage, jid):
     lines = ["요청 파일: %s" % rel(proj, "request", jid)]
+    ab = att_block(proj, jid)
+    if ab:
+        lines.append(ab.rstrip())
     by_id = {s["id"]: s for s in stages}
     for i in stage.get("inputs", []):
         if i in by_id:
@@ -1672,7 +1679,8 @@ def project_detail(proj):
     return {"id": proj["id"], "name": proj["name"], "description": proj.get("description", ""),
             "max_rounds": proj.get("max_rounds", 1), "root": proj["root"],
             "stage_mode": proj.get("stage_mode", "fixed"), "use_sources": proj.get("use_sources", "prefer"),
-            "sources": len(src_list(proj)), "repo": {"on": repo_on(proj), "release": repo_release(proj), "branch": repo_base(proj)} if repo_on(proj) else None,
+            "sources": len(src_list(proj)), "repo": {"on": repo_on(proj), "release": repo_release(proj), "branch": repo_base(proj),
+                                                   "test_url": repo_cfg(proj).get("test_url", "")} if repo_on(proj) else None,
             "agents": [agent_info(proj, a) for a in proj["agents"]], "stages": proj["stages"],
             "schedules": proj.get("schedules", []), "summary": psummary(proj)}
 
@@ -1690,8 +1698,9 @@ def job_detail(proj, j):
     for s in src:
         files[s["id"]] = read_text(fpath(proj, s["id"], j["id"]))
     files["diff"] = read_text(fpath(proj, "diff", j["id"]))
+    files_att = att_list(proj, j["id"])
     rp = {"on": True, "mode": repo_cfg(proj).get("merge", "merge"), "base": repo_base(proj)} if repo_on(proj) else None
-    return {"job": j, "files": files, "repo": rp, "limit": S_().get("job_token_limit", 0), "max_rounds": proj.get("max_rounds", 1),
+    return {"job": j, "files": files, "repo": rp, "attachments": files_att, "limit": S_().get("job_token_limit", 0), "max_rounds": proj.get("max_rounds", 1),
             "auto_planned": bool(j.get("stages")),
             "stages": [{"id": s["id"], "name": s["name"], "kind": s["kind"], "enabled": s.get("enabled", True),
                         "agent": agent_name(proj, s["agent"])} for s in src]}
@@ -1706,7 +1715,73 @@ def job_of(proj, jid):
     return j
 
 
-def create_job(proj, text, source="gui", auto_approve=False, chat=None, title=None):
+ATT_EXT = {"png", "jpg", "jpeg", "gif", "webp", "pdf", "txt", "md", "csv", "json", "log", "yaml", "yml", "html", "css",
+           "js", "ts", "vue", "py", "sql", "xml", "har"}
+ATT_IMG = {"png", "jpg", "jpeg", "gif", "webp"}
+ATT_MAX, ATT_TOTAL, ATT_COUNT = 10 * 1024 * 1024, 20 * 1024 * 1024, 10
+
+
+def att_dir(proj, jid):
+    return proj_dirs(proj)["inbox"] / ("%s_files" % jid)
+
+
+def att_name(name, used):
+    base = re.sub(r"[^\w.가-힣-]+", "_", Path(str(name or "file")).name).strip("._")[:80] or "file"
+    ext = base.rsplit(".", 1)[-1].lower() if "." in base else ""
+    if ext not in ATT_EXT:
+        raise ApiError(400, "올릴 수 없는 파일 형식입니다: %s (이미지·PDF·텍스트·코드 파일만)" % base[:40])
+    stem, n, out = base[: -len(ext) - 1], 1, base
+    while out in used:
+        n += 1
+        out = "%s_%d.%s" % (stem, n, ext)
+    used.add(out)
+    return out
+
+
+def save_attachments(proj, jid, files):
+    """GUI에서 올린 파일(base64)을 inbox/<작업ID>_files/ 에 저장한다. 에이전트는 필요할 때 Read로 연다."""
+    if not files:
+        return []
+    if not isinstance(files, list) or len(files) > ATT_COUNT:
+        raise ApiError(400, "첨부는 최대 %d개까지입니다" % ATT_COUNT)
+    out, used, total = [], set(), 0
+    blobs = []
+    for f in files:
+        try:
+            data = base64.b64decode(str(f.get("data") or ""), validate=True)
+        except (ValueError, AttributeError):
+            raise ApiError(400, "첨부 파일을 읽지 못했습니다")
+        if len(data) > ATT_MAX:
+            raise ApiError(400, "파일 하나는 10MB까지입니다: %s" % str(f.get("name"))[:40])
+        total += len(data)
+        if total > ATT_TOTAL:
+            raise ApiError(400, "첨부 전체는 20MB까지입니다")
+        blobs.append((att_name(f.get("name"), used), data))
+    d = att_dir(proj, jid)
+    d.mkdir(parents=True, exist_ok=True)
+    for name, data in blobs:
+        (d / name).write_bytes(data)
+        out.append({"name": name, "size": len(data)})
+    return out
+
+
+def att_list(proj, jid):
+    d = att_dir(proj, jid)
+    if not d.is_dir():
+        return []
+    return [{"name": x.name, "size": x.stat().st_size, "img": x.suffix.lower().lstrip(".") in ATT_IMG}
+            for x in sorted(d.iterdir()) if x.is_file()]
+
+
+def att_block(proj, jid):
+    files = att_list(proj, jid)
+    if not files:
+        return ""
+    return ("[첨부 파일] 요청에 함께 올라온 파일이다. 작업에 필요한 것만 Read로 열어 확인한다(이미지는 화면 캡처일 수 있음).\n"
+            + "\n".join("- ../shared/inbox/%s_files/%s" % (jid, f["name"]) for f in files) + "\n")
+
+
+def create_job(proj, text, source="gui", auto_approve=False, chat=None, title=None, files=None):
     text = (text or "").strip()
     if not text:
         raise ApiError(400, "요청 내용을 입력하세요")
@@ -1716,6 +1791,7 @@ def create_job(proj, text, source="gui", auto_approve=False, chat=None, title=No
         raise ApiError(400, "사용 중인 단계가 없습니다")
     ensure_dirs(proj)
     jid = time.strftime("%m%d-%H%M%S") + "-" + secrets.token_hex(1)
+    saved = save_attachments(proj, jid, files)
     fpath(proj, "request", jid).write_text(text + "\n")
     auto = proj.get("stage_mode") == "auto"
     job = {"id": jid, "pid": proj["id"], "title": (title or text.splitlines()[0])[:60], "status": "queued",
@@ -1725,7 +1801,8 @@ def create_job(proj, text, source="gui", auto_approve=False, chat=None, title=No
            "needs_input": False, "question": ""}
     JOBS[(proj["id"], jid)] = job
     jsave(job)
-    event(job, "system", "작업 등록" + {"telegram": " (텔레그램)", "schedule": " (예약 실행)"}.get(source, ""))
+    event(job, "system", "작업 등록" + {"telegram": " (텔레그램)", "schedule": " (예약 실행)"}.get(source, "")
+          + (" · 첨부 %d개" % len(saved) if saved else ""))
     QUEUE.put((proj["id"], jid, "first"))
     return job
 
@@ -1792,7 +1869,8 @@ def job_delete(proj, j):
     d = proj_dirs(proj)
     targets = [d["jobs"] / ("%s.json" % jid), fpath(proj, "request", jid), fpath(proj, "final", jid),
                fpath(proj, "approved", jid)]
-    targets += list(d["handoff"].glob("*_%s.md" % jid)) + list(d["inbox"].glob("%s*" % jid))
+    shutil.rmtree(att_dir(proj, jid), ignore_errors=True)
+    targets += list(d["handoff"].glob("*_%s.md" % jid)) + [x for x in d["inbox"].glob("%s*" % jid) if x.is_file()]
     if d["logs"].is_dir():
         targets += list(d["logs"].glob("%s_*" % jid))
     for t in targets:
@@ -2787,7 +2865,7 @@ def r_jobs(m, b):
 
 @route("POST", r"/api/projects/([^/]+)/jobs")
 def r_job_create(m, b):
-    return job_summary(create_job(proj_of(m[1]), b.get("request")))
+    return job_summary(create_job(proj_of(m[1]), b.get("request"), files=b.get("files")))
 
 
 @route("GET", r"/api/projects/([^/]+)/jobs/([^/]+)")
@@ -3256,10 +3334,33 @@ class Handler(BaseHTTPRequestHandler):
                              {"Location": "/login", "Set-Cookie": "ah_sess=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"})
         if not self.gate():
             return
+        m = re.match(r"^/api/projects/([^/]+)/jobs/([^/]+)/files/([^/]+)$", path)
+        if m:
+            return self.send_attachment(*m.groups())
         if path == "/":
             return self.send(200, INDEX_HTML, "text/html; charset=utf-8",
-                             {"Content-Security-Policy": "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'"})
+                             {"Content-Security-Policy": "default-src 'self'; img-src 'self' blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'"})
         self.dispatch("GET", {})
+
+    def send_attachment(self, pid, jid, name):
+        from urllib.parse import unquote
+        name = unquote(name)
+        try:
+            with LOCK:
+                proj = proj_of(pid)
+                job_of(proj, jid)
+        except ApiError as e:
+            return self.js(e.code, {"error": e.msg})
+        f = att_dir(proj, jid) / Path(name).name
+        if not f.is_file() or f.resolve().parent != att_dir(proj, jid).resolve():
+            return self.js(404, {"error": "파일 없음"})
+        ext = f.suffix.lower().lstrip(".")
+        ctype = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp",
+                 "pdf": "application/pdf"}.get(ext, "text/plain; charset=utf-8")
+        disp = "inline" if ext in ATT_IMG or ext == "pdf" else "attachment"
+        from urllib.parse import quote
+        self.send(200, f.read_bytes(), ctype, {"Content-Disposition": "%s; filename*=UTF-8''%s" % (disp, quote(f.name)),
+                                               "Content-Security-Policy": "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox"})
 
     def do_HEAD(self):
         if self.shield():
@@ -3282,7 +3383,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.js(415, {"error": "JSON만 허용"})
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            if n > 300_000:
+            big = re.match(r"^/api/projects/[^/]+/jobs$", urlparse(self.path).path)
+            if n > (30_000_000 if big else 300_000):
                 return self.js(413, {"error": "요청이 너무 큼"})
             body = json.loads(self.rfile.read(n) or b"{}")
             if not isinstance(body, dict):
