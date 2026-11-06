@@ -974,25 +974,67 @@ def repo_status(proj):
     return out
 
 
-def repo_promote(proj, who="GUI"):
-    """테스트 브랜치에서 확인된 변경을 운영 브랜치로 올린다. NAS 운영 서버는 1분 안에 이를 받아 재배포한다."""
+def is_ancestor(proj, a, b):
+    return git(repo_dir(proj), "merge-base", "--is-ancestor", a, b, check=False, proj=proj).returncode == 0
+
+
+def sync_release_states(proj):
+    """운영 브랜치에 들어간 작업은 '운영 반영', 아직이면(되돌리기 포함) '운영 대기'로 맞춘다."""
+    rel = repo_release(proj)
+    if not rel:
+        return
+    for (pid, _), j in list(JOBS.items()):
+        if pid != proj["id"] or not j.get("merge_sha") or j.get("status") != "approved":
+            continue
+        inside = is_ancestor(proj, j["merge_sha"], "origin/" + rel)
+        if inside and j.get("release_state") != "released":
+            set_state(j, release_state="released", released_at=now())
+            event(j, "system", "운영 반영 완료 (main)", "ok")
+        elif not inside and j.get("release_state") == "released":
+            set_state(j, release_state="pending", released_at="")
+            event(j, "system", "운영이 이전 버전으로 되돌려져 다시 운영 대기", "warn")
+
+
+def pending_jobs(proj, upto=None):
+    """운영 대기 중인 작업 목록. upto 를 주면 그 작업까지(먼저 승인된 것 포함) 함께 반영되는 작업."""
+    js = [j for (pid, _), j in JOBS.items() if pid == proj["id"] and j.get("release_state") == "pending"
+          and j.get("status") == "approved" and j.get("merge_sha")]
+    if upto:
+        js = [j for j in js if j["merge_sha"] == upto or is_ancestor(proj, j["merge_sha"], upto)]
+    return sorted(js, key=lambda j: j["updated"])
+
+
+def repo_promote(proj, who="GUI", job=None):
+    """테스트 브랜치에서 확인된 변경을 운영 브랜치로 올린다. job 을 주면 그 작업(과 그 전에 승인된 작업)까지만 올린다.
+    NAS 운영 서버는 1분 안에 이를 받아 재배포한다."""
     rel, base, d = repo_release(proj), repo_base(proj), repo_dir(proj)
     if not rel:
         raise ApiError(400, "운영 브랜치가 설정되지 않았습니다")
     with repo_lock(proj["id"]):
         try:
             git(d, "fetch", "origin", base, rel, timeout=300, proj=proj)
-            n = int(git(d, "rev-list", "--count", "--no-merges", "origin/%s..origin/%s" % (rel, base), proj=proj).strip() or 0)
+            target = "origin/" + base
+            if job is not None:
+                if not job.get("merge_sha"):
+                    raise ApiError(409, "이 작업은 테스트 브랜치에 반영된 기록이 없습니다")
+                if not is_ancestor(proj, job["merge_sha"], "origin/" + base):
+                    raise ApiError(409, "이 작업의 변경이 테스트 브랜치에서 사라졌습니다 (다시 작업이 필요합니다)")
+                if is_ancestor(proj, job["merge_sha"], "origin/" + rel):
+                    sync_release_states(proj)
+                    raise ApiError(409, "이미 운영에 반영된 작업입니다")
+                target = job["merge_sha"]
+            n = int(git(d, "rev-list", "--count", "--no-merges", "origin/%s..%s" % (rel, target), proj=proj).strip() or 0)
             if not n:
                 raise ApiError(409, "운영에 올릴 새 변경이 없습니다")
             prev = git(d, "rev-parse", "origin/" + rel, proj=proj).strip()
-            ff = git(d, "merge-base", "--is-ancestor", "origin/" + rel, "origin/" + base, check=False, proj=proj).returncode == 0
+            ff = is_ancestor(proj, "origin/" + rel, target)
             git(d, "reset", "--hard", "-q", proj=proj)
             if ff:
-                git(d, "push", "-q", "origin", "refs/remotes/origin/%s:refs/heads/%s" % (base, rel), timeout=300, proj=proj)
+                git(d, "push", "-q", "origin", "%s:refs/heads/%s" % (git(d, "rev-parse", target, proj=proj).strip(), rel),
+                    timeout=300, proj=proj)
             else:   # 운영 브랜치에 직접 들어간 수정이 있으면 병합 커밋을 만든다
                 git(d, "checkout", "-q", "-B", "_release", "origin/" + rel, proj=proj)
-                r = git(d, "merge", "--no-ff", "-m", "운영 반영: %s → %s" % (base, rel), "origin/" + base, check=False, proj=proj)
+                r = git(d, "merge", "--no-ff", "-m", "운영 반영: %s → %s" % (base, rel), target, check=False, proj=proj)
                 if r.returncode:
                     git(d, "merge", "--abort", check=False, proj=proj)
                     raise ApiError(409, "운영 브랜치와 충돌이 나서 자동으로 올릴 수 없습니다. GitHub에서 직접 병합하세요")
@@ -1000,6 +1042,8 @@ def repo_promote(proj, who="GUI"):
             git(d, "fetch", "origin", rel, timeout=300, proj=proj)
             new = git(d, "rev-parse", "origin/" + rel, proj=proj).strip()
             msgs = git(d, "log", "--no-merges", "--format=%s", "%s..%s" % (prev, new), proj=proj).splitlines()
+            with LOCK:
+                sync_release_states(proj)
         except RuntimeError as e:
             raise ApiError(502, "운영 반영 실패: %s" % e)
     with LOCK:
@@ -1028,6 +1072,8 @@ def repo_rollback(proj, sha, who="GUI"):
             git(d, "push", "-q", "--force-with-lease=%s:%s" % (rel, cur), "origin", "%s:refs/heads/%s" % (full, rel),
                 timeout=300, proj=proj)
             git(d, "fetch", "origin", rel, timeout=300, proj=proj)
+            with LOCK:
+                sync_release_states(proj)
         except RuntimeError as e:
             raise ApiError(502, "되돌리기 실패: %s" % e)
     with LOCK:
@@ -1263,10 +1309,12 @@ def repo_deliver(proj, j, summary_src):
                                        "반려하고 다시 작업하면 최신 %s 기준으로 다시 맞춥니다" % (base, base))
                 git(d, "push", "-q", "origin", "%s:%s" % (base, base), timeout=300, proj=proj)
                 sha = git(d, "log", "-1", "--format=%h", proj=proj).strip()
+                if repo_release(proj):
+                    set_state(j, merge_sha=git(d, "rev-parse", "HEAD", proj=proj).strip(), release_state="pending")
                 lines.append("- `%s`에 병합하고 푸시했습니다 (커밋 %s, 변경 커밋 %d개)" % (base, sha, ahead))
                 if repo_release(proj):
                     tu = repo_cfg(proj).get("test_url")
-                    lines.append("- **테스트 서버**%s에 1~3분 안에 배포됩니다. 확인한 뒤 '운영 반영'을 누르면 `%s`(운영)으로 올라갑니다"
+                    lines.append("- **테스트 서버**%s에 1~3분 안에 배포됩니다. 확인한 뒤 이 작업 화면의 '운영 반영'을 누르면 `%s`(운영)으로 올라갑니다"
                                  % (" (%s)" % tu if tu else "", repo_release(proj)))
                 if web:
                     lines.append("- 커밋: %s/commit/%s\n- 빌드 상태(GitHub Actions): %s/actions" % (web, sha, web))
@@ -1689,7 +1737,8 @@ def project_detail(proj):
 
 def job_summary(j):
     return {k: j[k] for k in ("id", "title", "status", "step", "created", "updated")} | \
-        {"tokens": new_tokens(j.get("usage") or {}), "needs_input": bool(j.get("needs_input"))}
+        {"tokens": new_tokens(j.get("usage") or {}), "needs_input": bool(j.get("needs_input")),
+         "release_state": j.get("release_state", ""), "released_at": j.get("released_at", "")}
 
 
 def job_detail(proj, j):
@@ -1701,7 +1750,13 @@ def job_detail(proj, j):
         files[s["id"]] = read_text(fpath(proj, s["id"], j["id"]))
     files["diff"] = read_text(fpath(proj, "diff", j["id"]))
     files_att = att_list(proj, j["id"])
-    rp = {"on": True, "mode": repo_cfg(proj).get("merge", "merge"), "base": repo_base(proj)} if repo_on(proj) else None
+    rp = {"on": True, "mode": repo_cfg(proj).get("merge", "merge"), "base": repo_base(proj), "release": repo_release(proj),
+          "test_url": repo_cfg(proj).get("test_url", "")} if repo_on(proj) else None
+    if rp and j.get("release_state") == "pending":
+        try:
+            rp["with"] = [{"id": x["id"], "title": x["title"]} for x in pending_jobs(proj, j["merge_sha"]) if x["id"] != j["id"]]
+        except Exception:  # noqa: BLE001
+            rp["with"] = []
     return {"job": j, "files": files, "repo": rp, "attachments": files_att, "limit": S_().get("job_token_limit", 0), "max_rounds": proj.get("max_rounds", 1),
             "auto_planned": bool(j.get("stages")),
             "stages": [{"id": s["id"], "name": s["name"], "kind": s["kind"], "enabled": s.get("enabled", True),
@@ -2117,7 +2172,7 @@ def notify_job(job, kind):
         notify("[%s] %s\n실패: %s" % (pname, job["title"], str(job.get("error"))[:300]),
                [[("다시 시도", "rt:" + ref)]], chat)
     elif kind == "approved":
-        rb = [[("운영 반영", "rl:%s:-" % job["pid"])]] if proj and repo_on(proj) and repo_release(proj) else None
+        rb = [[("운영 반영", "rl:%s:%s" % (job["pid"], job["id"]))]] if job.get("release_state") == "pending" else None
         notify("[%s] %s · 완료 (새 토큰 %s)\n\n%s" % (pname, job["title"], tok, body), rb, chat)
     elif kind == "question":
         notify("[%s] %s\n에이전트가 질문이 있습니다:\n\n%s" % (pname, job["title"], str(job.get("question"))[:1500]),
@@ -2205,16 +2260,20 @@ def tg_button(chat, data):
         except ApiError as e:
             return notify(e.msg, None, chat)
         if act == "rl":
-            st = repo_status(proj) if repo_on(proj) else {"pending": []}
-            if not st["pending"]:
-                return notify("[%s] 운영에 올릴 새 변경이 없습니다." % proj["name"], None, chat)
-            return notify("[%s] 테스트 서버에서 확인을 마쳤나요? 아래 변경 %d개를 운영에 올립니다.\n%s"
-                          % (proj["name"], len(st["pending"]), "\n".join("- " + c["msg"][:60] for c in st["pending"][:10])),
-                          [[("예, 운영 반영", "rly:%s:-" % pid)]], chat)
+            if not repo_on(proj):
+                return notify("[%s] 코드 저장소가 연결되지 않았습니다." % proj["name"], None, chat)
+            jb = JOBS.get((pid, jid)) if jid != "-" else None
+            js = pending_jobs(proj, jb["merge_sha"]) if jb and jb.get("merge_sha") else pending_jobs(proj)
+            if not js:
+                return notify("[%s] 운영 대기 중인 작업이 없습니다." % proj["name"], None, chat)
+            return notify("[%s] 테스트 서버에서 확인을 마쳤나요? 아래 작업 %d개를 운영에 올립니다.\n%s"
+                          % (proj["name"], len(js), "\n".join("- " + x["title"][:50] for x in js[:10])),
+                          [[("예, 운영 반영", "rly:%s:%s" % (pid, jid))]], chat)
         if act == "rly":
+            jb = JOBS.get((pid, jid)) if jid != "-" else None
             def go():
                 try:
-                    repo_promote(proj, "텔레그램")
+                    repo_promote(proj, "텔레그램", job=jb)
                 except ApiError as e:
                     notify("[%s] %s" % (proj["name"], e.msg), None, chat)
             threading.Thread(target=go, daemon=True).start()
@@ -3121,7 +3180,8 @@ def r_repo_clone(m, b):
 def r_repo_release(m, b):
     with LOCK:
         proj = proj_of(m[1])
-    return repo_promote(proj)
+        job = job_of(proj, str(b["job"])) if b.get("job") else None
+    return repo_promote(proj, job=job)
 
 
 @route("POST", r"/api/projects/([^/]+)/repo/rollback", lock=False)

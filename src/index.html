@@ -58,6 +58,7 @@ button:disabled{opacity:.5;cursor:default}
 .usagebar{position:fixed;right:10px;bottom:6px;font-size:11px;color:var(--mute);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:3px 8px;opacity:.9;z-index:5}
 .usagebar b{color:var(--ink);font-weight:600}.usagebar .hi{color:var(--err)}
 @media (max-width:700px){.usagebar{left:10px;right:auto}}
+.chip.relwait{background:color-mix(in srgb,#d08a1c 20%,transparent);color:#b0700a}
 .chip.approved{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok)}
 .chip.failed,.chip.cancelled{background:color-mix(in srgb,var(--err) 18%,transparent);color:var(--err)}
 .empty{color:var(--mute);text-align:center;padding:60px 10px}
@@ -144,7 +145,6 @@ table.ut{border-collapse:collapse;width:100%;font-size:13px}.ut td,.ut th{paddin
       <div id="attl" class="attl"></div>
       <div class="row" style="margin-top:8px"><button class="pri" id="go">작업 시작</button><label class="attb">파일 첨부<input type="file" id="attf" multiple hidden accept="image/*,.pdf,.txt,.md,.csv,.json,.log,.yaml,.yml,.html,.css,.js,.ts,.vue,.py,.sql,.xml,.har"></label></div>
     </div>
-    <div id="relcard"></div>
     <div class="jobs" id="jobs"></div>
     <div class="row" style="margin-top:8px;justify-content:center"><button id="jclean" style="font-size:12px;padding:5px 10px">끝난 작업 정리</button></div>
   </aside>
@@ -256,28 +256,12 @@ $('#ptabs').onclick=e=>{
 document.querySelectorAll('#subnav .nv').forEach(b=>b.onclick=()=>setView(b.dataset.v));
 
 /* ---------- 작업 ---------- */
-let relAt=0,relKey='';
-async function loadRel(force){
-  const c=(P||[]).find(p=>p.id===cur);const el=$('#relcard');
-  if(!c||!c.repo||!c.repo.release){if(el.innerHTML)el.innerHTML='';return}
-  if(!force&&Date.now()-relAt<15000&&relKey===cur)return;relAt=Date.now();relKey=cur;
-  let st;try{st=await api(base()+'/repo')}catch(e){return}
-  const n=st.pending.length;
-  el.innerHTML='<div class="card" style="margin-top:10px"><h2>테스트 → 운영</h2>'
-    +(c.repo.test_url?'<div class="row" style="margin-bottom:6px"><a class="attb" style="text-decoration:none" href="'+esc(c.repo.test_url)+'" target="_blank" rel="noopener">테스트 서버 열기 ↗</a></div>':'')
-    +'<div class="vd">테스트('+esc(c.repo.branch)+')에만 있는 변경: <b>'+n+'개</b>'+(st.release_head?'<br>운영('+esc(c.repo.release)+'): '+esc(st.release_head):'')+'</div>'
-    +(n?'<ul class="tip" style="margin:6px 0">'+st.pending.slice(0,6).map(x=>'<li>'+esc(x.msg)+' <span style="color:var(--mute)">'+esc(x.when)+'</span></li>').join('')+(n>6?'<li>… 외 '+(n-6)+'개</li>':'')+'</ul>'
-      +'<div class="row"><button class="pri" id="relgo">운영 반영</button></div>':'<div class="vd">운영과 테스트가 같은 상태입니다.</div>')+'</div>';
-  if($('#relgo'))$('#relgo').onclick=async e=>{
-    if(!confirm('테스트 서버에서 확인을 마쳤나요?\n변경 '+n+'개를 운영에 올리면 1분 안에 실서버에 배포됩니다.'))return;
-    e.target.disabled=true;toast('운영에 반영하는 중…');
-    try{await post(base()+'/repo/release');toast('운영 반영 완료 - 1분 안에 실서버에 배포됩니다');await loadRel(true)}catch(err){alert(err.message);e.target.disabled=false}};
-}
+const chipC=j=>j.release_state==='pending'?'relwait':j.status;
+const chipL=j=>j.needs_input?'질문 대기':j.release_state==='pending'?'운영 대기':j.release_state==='released'?'운영 반영':STATUS[j.status];
 async function loadList(){
   if(!cur)return;
-  loadRel();
   const d=await api(base()+'/jobs');
-  const h=d.jobs.map(j=>'<div class="job'+(j.id===sel?' sel':'')+'" data-id="'+esc(j.id)+'"><div class="t">'+esc(j.title)+'</div><div class="m"><span class="chip '+j.status+'">'+(j.needs_input?'질문 대기':STATUS[j.status])+'</span><span>'+esc(j.created.slice(5,16))+'</span>'+(j.tokens?'<span>토큰 '+fmtN(j.tokens)+'</span>':'')+'</div></div>').join('');
+  const h=d.jobs.map(j=>'<div class="job'+(j.id===sel?' sel':'')+'" data-id="'+esc(j.id)+'"><div class="t">'+esc(j.title)+'</div><div class="m"><span class="chip '+chipC(j)+'">'+chipL(j)+'</span><span>'+esc(j.created.slice(5,16))+'</span>'+(j.tokens?'<span>토큰 '+fmtN(j.tokens)+'</span>':'')+'</div></div>').join('');
   if(h!==last.list){last.list=h;$('#jobs').innerHTML=h||'<div class="empty" style="padding:20px">아직 작업이 없습니다</div>'}
 }
 async function loadDetail(force){
@@ -293,13 +277,13 @@ async function loadDetail(force){
   const u=j.usage||{};
   const bys=Object.entries(u.by_stage||{}).map(([k,v])=>{const s=d.stages.find(x=>x.id===k);return esc(s?s.name:(k==='plan'?'자동 구성':k))+' '+fmtN(newTok(v))}).join(' · ');
   const srcL={telegram:'텔레그램',schedule:'예약 실행'}[j.source];
-  const head='<div class="title"><h2>'+esc(j.title)+'</h2><span class="chip '+j.status+'">'+(j.needs_input?'질문 대기':STATUS[j.status])+'</span>'+(srcL?'<span class="chip">'+srcL+'</span>':'')+(j.auto_approve?'<span class="chip">자동 승인</span>':'')+(d.auto_planned?'<span class="chip approved">자동 구성</span>':'')+'</div>'
+  const head='<div class="title"><h2>'+esc(j.title)+'</h2><span class="chip '+chipC(j)+'">'+chipL(j)+'</span>'+(srcL?'<span class="chip">'+srcL+'</span>':'')+(j.auto_approve?'<span class="chip">자동 승인</span>':'')+(d.auto_planned?'<span class="chip approved">자동 구성</span>':'')+'</div>'
     +(j.branch?'<div class="usage">브랜치: '+esc(j.branch)+'</div>':'')+'<div class="usage">'+esc(usageLine(u))+(d.limit?' · 작업 한도 '+fmtN(d.limit)+' 중 새 토큰 '+fmtN(newTok(u)):'')+'</div>'
     +(bys?'<div class="usage">단계별 새 토큰: '+bys+'</div>':'')
     +'<div class="steps">'+steps.map((s,i)=>'<div class="step '+st(i)+'"><b>'+esc(s[1])+'</b><span>'+esc(s[2])+'</span></div>').join('')+'</div>'
     +(j.error?'<div class="err-box">'+esc(j.error)+'</div>':'');
   const evh='<div class="ev">'+j.events.slice().reverse().map(e=>'<div class="'+e.kind+'"><span class="ts">'+esc((e.ts||'').slice(11,19))+'</span><span class="ag">'+esc(AG[e.agent]||e.agent)+'</span><span class="mg">'+esc(e.msg)+'</span></div>').join('')+'</div>';
-  const actKey=j.id+'|'+j.status;
+  const actKey=j.id+'|'+j.status+'|'+(j.release_state||'');
   if(last.act!==actKey||force){
     last.act=actKey;
     const works=stg.filter(s=>s.kind==='work');
@@ -313,8 +297,8 @@ async function loadDetail(force){
     }else if(j.status==='awaiting_user'){
       const lastRev=stg.slice().reverse().find(s=>s.kind==='review'&&f[s.id]!=null);
       const rv=lastRev?verdictOf(f[lastRev.id]):'APPROVE';
-      act='<div class="card approve"><h3>최종 승인이 필요합니다</h3><div class="sub">'+(rv==='APPROVE'?'검토를 통과한 결과물입니다.':'검토 단계의 수정요청이 남은 상태입니다. 해당 탭에서 내용을 확인하세요.')+(d.repo?(d.repo.mode==='branch'?' 승인하면 작업 브랜치를 GitHub에 푸시합니다(PR은 직접 병합).':' 승인하면 '+esc(d.repo.base)+'에 병합해 GitHub에 푸시합니다. 푸시되면 GitHub Actions 빌드가 시작됩니다.')+' \'변경 내용\' 탭에서 diff를 먼저 확인하세요.':' 승인하면 outbox에 approved 파일로 저장됩니다.')+'</div>'
-        +'<div class="row"><button class="pri" id="ap">최종 승인</button></div><hr style="border:0;border-top:1px solid var(--line);margin:12px 0">'
+      act='<div class="card approve"><h3>최종 승인이 필요합니다</h3><div class="sub">'+(rv==='APPROVE'?'검토를 통과한 결과물입니다.':'검토 단계의 수정요청이 남은 상태입니다. 해당 탭에서 내용을 확인하세요.')+(d.repo&&d.repo.release?' 승인하면 테스트 서버('+esc(d.repo.base)+')에만 반영됩니다. 운영은 테스트 서버에서 확인한 뒤 이 화면의 \'운영 반영\'으로 따로 올립니다.':d.repo?(d.repo.mode==='branch'?' 승인하면 작업 브랜치를 GitHub에 푸시합니다(PR은 직접 병합).':' 승인하면 '+esc(d.repo.base)+'에 병합해 GitHub에 푸시합니다. 푸시되면 GitHub Actions 빌드가 시작됩니다.')+' \'변경 내용\' 탭에서 diff를 먼저 확인하세요.':' 승인하면 outbox에 approved 파일로 저장됩니다.')+'</div>'
+        +'<div class="row"><button class="pri" id="ap">'+(d.repo&&d.repo.release?'승인 · 테스트 서버 반영':'최종 승인')+'</button></div><hr style="border:0;border-top:1px solid var(--line);margin:12px 0">'
         +'<textarea id="fb" placeholder="수정이 필요하면 요청 내용을 적어주세요"></textarea>'
         +'<div class="row" style="margin-top:8px"><select id="st" style="width:auto">'+opts+'</select><button id="rj">반려하고 다시 작업</button></div></div>';
     }else if(j.status==='running'||j.status==='queued'){
@@ -323,6 +307,15 @@ async function loadDetail(force){
       act='<div class="row" style="margin:10px 0"><select id="st" style="width:auto">'+opts.replace(' selected','')+'</select><button class="pri" id="rt">다시 시도</button></div>';
     }else if(j.status==='deploying'){
       act='<div class="vd">승인됨 - GitHub 저장소에 반영하는 중입니다…</div>';
+    }else if(j.status==='approved'&&j.release_state==='pending'){
+      const w=(d.repo&&d.repo.with)||[];
+      act='<div class="card approve"><h3>테스트 서버에 반영됨 · 운영 반영 대기</h3>'
+        +'<div class="sub">테스트 서버에서 확인을 마쳤으면 운영에 올리세요. 바로 올리지 않아도 됩니다. 이 작업은 운영 대기 상태로 남아 있다가 원할 때 반영할 수 있습니다.'
+        +(w.length?'<br><b>먼저 승인된 운영 대기 작업 '+w.length+'개도 함께 반영됩니다:</b> '+w.map(x=>esc(x.title)).join(', '):'')+'</div>'
+        +'<div class="row">'+(d.repo&&d.repo.test_url?'<a class="attb" style="text-decoration:none" href="'+esc(d.repo.test_url)+'" target="_blank" rel="noopener">테스트 서버 열기 ↗</a>':'')
+        +'<button class="pri" id="rel">운영 반영</button></div></div>';
+    }else if(j.status==='approved'&&j.release_state==='released'){
+      act='<div class="vd">운영 반영 완료'+(j.released_at?' ('+esc(j.released_at.slice(5,16))+')':'')+' · 문제가 있으면 설정 → 코드 저장소 → 운영 반영 이력에서 되돌릴 수 있습니다.</div>';
     }else if(j.status==='approved'){
       act='<div class="vd">승인 완료: shared/outbox/approved_'+esc(j.id)+'.md'+(d.repo?' · 반영 결과는 \'승인본\' 탭에서 확인':'')+'</div>';
     }
@@ -352,6 +345,7 @@ function bindJob(j){
   if(q('#rj'))q('#rj').onclick=()=>{const fb=q('#fb').value.trim();if(!fb){toast('수정 요청 내용을 적어주세요');return}run(()=>post(url+'/restart',{feedback:fb,start:q('#st').value}),'다시 작업을 시작합니다')};
   if(q('#rt'))q('#rt').onclick=()=>run(()=>post(url+'/restart',{start:q('#st').value}),'다시 시작합니다');
   if(q('#cn'))q('#cn').onclick=()=>{if(confirm('작업을 중단할까요?'))run(()=>post(url+'/cancel'),'중단 요청')};
+  if(q('#rel'))q('#rel').onclick=()=>{if(confirm('테스트 서버에서 확인을 마쳤나요?\n운영에 반영하면 1~3분 안에 실서버에 배포됩니다.'))run(()=>post(base()+'/repo/release',{job:j.id}),'운영 반영 완료 - 1~3분 안에 실서버에 배포됩니다')};
   if(q('#jdel'))q('#jdel').onclick=async()=>{if(!confirm('이 작업을 삭제할까요?\n요청·중간 결과·최종본·로그가 모두 지워지고 되돌릴 수 없습니다.'+(j.status==='approved'?'\n(이미 GitHub에 반영된 코드는 그대로 남습니다)':'')))return;try{await post(url+'/delete');toast('삭제했습니다');sel=null;last={};$('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>';await loadList()}catch(e){toast(e.message)}};
   if(q('#qago'))q('#qago').onclick=()=>{const a=q('#qa').value.trim();if(!a){toast('답변을 적어주세요');return}run(()=>post(url+'/restart',{feedback:a,start:j.step}),'답변을 반영해 이어서 진행합니다')};
 }

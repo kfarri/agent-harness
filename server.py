@@ -974,25 +974,67 @@ def repo_status(proj):
     return out
 
 
-def repo_promote(proj, who="GUI"):
-    """테스트 브랜치에서 확인된 변경을 운영 브랜치로 올린다. NAS 운영 서버는 1분 안에 이를 받아 재배포한다."""
+def is_ancestor(proj, a, b):
+    return git(repo_dir(proj), "merge-base", "--is-ancestor", a, b, check=False, proj=proj).returncode == 0
+
+
+def sync_release_states(proj):
+    """운영 브랜치에 들어간 작업은 '운영 반영', 아직이면(되돌리기 포함) '운영 대기'로 맞춘다."""
+    rel = repo_release(proj)
+    if not rel:
+        return
+    for (pid, _), j in list(JOBS.items()):
+        if pid != proj["id"] or not j.get("merge_sha") or j.get("status") != "approved":
+            continue
+        inside = is_ancestor(proj, j["merge_sha"], "origin/" + rel)
+        if inside and j.get("release_state") != "released":
+            set_state(j, release_state="released", released_at=now())
+            event(j, "system", "운영 반영 완료 (main)", "ok")
+        elif not inside and j.get("release_state") == "released":
+            set_state(j, release_state="pending", released_at="")
+            event(j, "system", "운영이 이전 버전으로 되돌려져 다시 운영 대기", "warn")
+
+
+def pending_jobs(proj, upto=None):
+    """운영 대기 중인 작업 목록. upto 를 주면 그 작업까지(먼저 승인된 것 포함) 함께 반영되는 작업."""
+    js = [j for (pid, _), j in JOBS.items() if pid == proj["id"] and j.get("release_state") == "pending"
+          and j.get("status") == "approved" and j.get("merge_sha")]
+    if upto:
+        js = [j for j in js if j["merge_sha"] == upto or is_ancestor(proj, j["merge_sha"], upto)]
+    return sorted(js, key=lambda j: j["updated"])
+
+
+def repo_promote(proj, who="GUI", job=None):
+    """테스트 브랜치에서 확인된 변경을 운영 브랜치로 올린다. job 을 주면 그 작업(과 그 전에 승인된 작업)까지만 올린다.
+    NAS 운영 서버는 1분 안에 이를 받아 재배포한다."""
     rel, base, d = repo_release(proj), repo_base(proj), repo_dir(proj)
     if not rel:
         raise ApiError(400, "운영 브랜치가 설정되지 않았습니다")
     with repo_lock(proj["id"]):
         try:
             git(d, "fetch", "origin", base, rel, timeout=300, proj=proj)
-            n = int(git(d, "rev-list", "--count", "--no-merges", "origin/%s..origin/%s" % (rel, base), proj=proj).strip() or 0)
+            target = "origin/" + base
+            if job is not None:
+                if not job.get("merge_sha"):
+                    raise ApiError(409, "이 작업은 테스트 브랜치에 반영된 기록이 없습니다")
+                if not is_ancestor(proj, job["merge_sha"], "origin/" + base):
+                    raise ApiError(409, "이 작업의 변경이 테스트 브랜치에서 사라졌습니다 (다시 작업이 필요합니다)")
+                if is_ancestor(proj, job["merge_sha"], "origin/" + rel):
+                    sync_release_states(proj)
+                    raise ApiError(409, "이미 운영에 반영된 작업입니다")
+                target = job["merge_sha"]
+            n = int(git(d, "rev-list", "--count", "--no-merges", "origin/%s..%s" % (rel, target), proj=proj).strip() or 0)
             if not n:
                 raise ApiError(409, "운영에 올릴 새 변경이 없습니다")
             prev = git(d, "rev-parse", "origin/" + rel, proj=proj).strip()
-            ff = git(d, "merge-base", "--is-ancestor", "origin/" + rel, "origin/" + base, check=False, proj=proj).returncode == 0
+            ff = is_ancestor(proj, "origin/" + rel, target)
             git(d, "reset", "--hard", "-q", proj=proj)
             if ff:
-                git(d, "push", "-q", "origin", "refs/remotes/origin/%s:refs/heads/%s" % (base, rel), timeout=300, proj=proj)
+                git(d, "push", "-q", "origin", "%s:refs/heads/%s" % (git(d, "rev-parse", target, proj=proj).strip(), rel),
+                    timeout=300, proj=proj)
             else:   # 운영 브랜치에 직접 들어간 수정이 있으면 병합 커밋을 만든다
                 git(d, "checkout", "-q", "-B", "_release", "origin/" + rel, proj=proj)
-                r = git(d, "merge", "--no-ff", "-m", "운영 반영: %s → %s" % (base, rel), "origin/" + base, check=False, proj=proj)
+                r = git(d, "merge", "--no-ff", "-m", "운영 반영: %s → %s" % (base, rel), target, check=False, proj=proj)
                 if r.returncode:
                     git(d, "merge", "--abort", check=False, proj=proj)
                     raise ApiError(409, "운영 브랜치와 충돌이 나서 자동으로 올릴 수 없습니다. GitHub에서 직접 병합하세요")
@@ -1000,6 +1042,8 @@ def repo_promote(proj, who="GUI"):
             git(d, "fetch", "origin", rel, timeout=300, proj=proj)
             new = git(d, "rev-parse", "origin/" + rel, proj=proj).strip()
             msgs = git(d, "log", "--no-merges", "--format=%s", "%s..%s" % (prev, new), proj=proj).splitlines()
+            with LOCK:
+                sync_release_states(proj)
         except RuntimeError as e:
             raise ApiError(502, "운영 반영 실패: %s" % e)
     with LOCK:
@@ -1028,6 +1072,8 @@ def repo_rollback(proj, sha, who="GUI"):
             git(d, "push", "-q", "--force-with-lease=%s:%s" % (rel, cur), "origin", "%s:refs/heads/%s" % (full, rel),
                 timeout=300, proj=proj)
             git(d, "fetch", "origin", rel, timeout=300, proj=proj)
+            with LOCK:
+                sync_release_states(proj)
         except RuntimeError as e:
             raise ApiError(502, "되돌리기 실패: %s" % e)
     with LOCK:
@@ -1263,10 +1309,12 @@ def repo_deliver(proj, j, summary_src):
                                        "반려하고 다시 작업하면 최신 %s 기준으로 다시 맞춥니다" % (base, base))
                 git(d, "push", "-q", "origin", "%s:%s" % (base, base), timeout=300, proj=proj)
                 sha = git(d, "log", "-1", "--format=%h", proj=proj).strip()
+                if repo_release(proj):
+                    set_state(j, merge_sha=git(d, "rev-parse", "HEAD", proj=proj).strip(), release_state="pending")
                 lines.append("- `%s`에 병합하고 푸시했습니다 (커밋 %s, 변경 커밋 %d개)" % (base, sha, ahead))
                 if repo_release(proj):
                     tu = repo_cfg(proj).get("test_url")
-                    lines.append("- **테스트 서버**%s에 1~3분 안에 배포됩니다. 확인한 뒤 '운영 반영'을 누르면 `%s`(운영)으로 올라갑니다"
+                    lines.append("- **테스트 서버**%s에 1~3분 안에 배포됩니다. 확인한 뒤 이 작업 화면의 '운영 반영'을 누르면 `%s`(운영)으로 올라갑니다"
                                  % (" (%s)" % tu if tu else "", repo_release(proj)))
                 if web:
                     lines.append("- 커밋: %s/commit/%s\n- 빌드 상태(GitHub Actions): %s/actions" % (web, sha, web))
@@ -1689,7 +1737,8 @@ def project_detail(proj):
 
 def job_summary(j):
     return {k: j[k] for k in ("id", "title", "status", "step", "created", "updated")} | \
-        {"tokens": new_tokens(j.get("usage") or {}), "needs_input": bool(j.get("needs_input"))}
+        {"tokens": new_tokens(j.get("usage") or {}), "needs_input": bool(j.get("needs_input")),
+         "release_state": j.get("release_state", ""), "released_at": j.get("released_at", "")}
 
 
 def job_detail(proj, j):
@@ -1701,7 +1750,13 @@ def job_detail(proj, j):
         files[s["id"]] = read_text(fpath(proj, s["id"], j["id"]))
     files["diff"] = read_text(fpath(proj, "diff", j["id"]))
     files_att = att_list(proj, j["id"])
-    rp = {"on": True, "mode": repo_cfg(proj).get("merge", "merge"), "base": repo_base(proj)} if repo_on(proj) else None
+    rp = {"on": True, "mode": repo_cfg(proj).get("merge", "merge"), "base": repo_base(proj), "release": repo_release(proj),
+          "test_url": repo_cfg(proj).get("test_url", "")} if repo_on(proj) else None
+    if rp and j.get("release_state") == "pending":
+        try:
+            rp["with"] = [{"id": x["id"], "title": x["title"]} for x in pending_jobs(proj, j["merge_sha"]) if x["id"] != j["id"]]
+        except Exception:  # noqa: BLE001
+            rp["with"] = []
     return {"job": j, "files": files, "repo": rp, "attachments": files_att, "limit": S_().get("job_token_limit", 0), "max_rounds": proj.get("max_rounds", 1),
             "auto_planned": bool(j.get("stages")),
             "stages": [{"id": s["id"], "name": s["name"], "kind": s["kind"], "enabled": s.get("enabled", True),
@@ -2117,7 +2172,7 @@ def notify_job(job, kind):
         notify("[%s] %s\n실패: %s" % (pname, job["title"], str(job.get("error"))[:300]),
                [[("다시 시도", "rt:" + ref)]], chat)
     elif kind == "approved":
-        rb = [[("운영 반영", "rl:%s:-" % job["pid"])]] if proj and repo_on(proj) and repo_release(proj) else None
+        rb = [[("운영 반영", "rl:%s:%s" % (job["pid"], job["id"]))]] if job.get("release_state") == "pending" else None
         notify("[%s] %s · 완료 (새 토큰 %s)\n\n%s" % (pname, job["title"], tok, body), rb, chat)
     elif kind == "question":
         notify("[%s] %s\n에이전트가 질문이 있습니다:\n\n%s" % (pname, job["title"], str(job.get("question"))[:1500]),
@@ -2205,16 +2260,20 @@ def tg_button(chat, data):
         except ApiError as e:
             return notify(e.msg, None, chat)
         if act == "rl":
-            st = repo_status(proj) if repo_on(proj) else {"pending": []}
-            if not st["pending"]:
-                return notify("[%s] 운영에 올릴 새 변경이 없습니다." % proj["name"], None, chat)
-            return notify("[%s] 테스트 서버에서 확인을 마쳤나요? 아래 변경 %d개를 운영에 올립니다.\n%s"
-                          % (proj["name"], len(st["pending"]), "\n".join("- " + c["msg"][:60] for c in st["pending"][:10])),
-                          [[("예, 운영 반영", "rly:%s:-" % pid)]], chat)
+            if not repo_on(proj):
+                return notify("[%s] 코드 저장소가 연결되지 않았습니다." % proj["name"], None, chat)
+            jb = JOBS.get((pid, jid)) if jid != "-" else None
+            js = pending_jobs(proj, jb["merge_sha"]) if jb and jb.get("merge_sha") else pending_jobs(proj)
+            if not js:
+                return notify("[%s] 운영 대기 중인 작업이 없습니다." % proj["name"], None, chat)
+            return notify("[%s] 테스트 서버에서 확인을 마쳤나요? 아래 작업 %d개를 운영에 올립니다.\n%s"
+                          % (proj["name"], len(js), "\n".join("- " + x["title"][:50] for x in js[:10])),
+                          [[("예, 운영 반영", "rly:%s:%s" % (pid, jid))]], chat)
         if act == "rly":
+            jb = JOBS.get((pid, jid)) if jid != "-" else None
             def go():
                 try:
-                    repo_promote(proj, "텔레그램")
+                    repo_promote(proj, "텔레그램", job=jb)
                 except ApiError as e:
                     notify("[%s] %s" % (proj["name"], e.msg), None, chat)
             threading.Thread(target=go, daemon=True).start()
@@ -3121,7 +3180,8 @@ def r_repo_clone(m, b):
 def r_repo_release(m, b):
     with LOCK:
         proj = proj_of(m[1])
-    return repo_promote(proj)
+        job = job_of(proj, str(b["job"])) if b.get("job") else None
+    return repo_promote(proj, job=job)
 
 
 @route("POST", r"/api/projects/([^/]+)/repo/rollback", lock=False)
@@ -3571,6 +3631,7 @@ button:disabled{opacity:.5;cursor:default}
 .usagebar{position:fixed;right:10px;bottom:6px;font-size:11px;color:var(--mute);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:3px 8px;opacity:.9;z-index:5}
 .usagebar b{color:var(--ink);font-weight:600}.usagebar .hi{color:var(--err)}
 @media (max-width:700px){.usagebar{left:10px;right:auto}}
+.chip.relwait{background:color-mix(in srgb,#d08a1c 20%,transparent);color:#b0700a}
 .chip.approved{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok)}
 .chip.failed,.chip.cancelled{background:color-mix(in srgb,var(--err) 18%,transparent);color:var(--err)}
 .empty{color:var(--mute);text-align:center;padding:60px 10px}
@@ -3657,7 +3718,6 @@ table.ut{border-collapse:collapse;width:100%;font-size:13px}.ut td,.ut th{paddin
       <div id="attl" class="attl"></div>
       <div class="row" style="margin-top:8px"><button class="pri" id="go">작업 시작</button><label class="attb">파일 첨부<input type="file" id="attf" multiple hidden accept="image/*,.pdf,.txt,.md,.csv,.json,.log,.yaml,.yml,.html,.css,.js,.ts,.vue,.py,.sql,.xml,.har"></label></div>
     </div>
-    <div id="relcard"></div>
     <div class="jobs" id="jobs"></div>
     <div class="row" style="margin-top:8px;justify-content:center"><button id="jclean" style="font-size:12px;padding:5px 10px">끝난 작업 정리</button></div>
   </aside>
@@ -3769,28 +3829,12 @@ $('#ptabs').onclick=e=>{
 document.querySelectorAll('#subnav .nv').forEach(b=>b.onclick=()=>setView(b.dataset.v));
 
 /* ---------- 작업 ---------- */
-let relAt=0,relKey='';
-async function loadRel(force){
-  const c=(P||[]).find(p=>p.id===cur);const el=$('#relcard');
-  if(!c||!c.repo||!c.repo.release){if(el.innerHTML)el.innerHTML='';return}
-  if(!force&&Date.now()-relAt<15000&&relKey===cur)return;relAt=Date.now();relKey=cur;
-  let st;try{st=await api(base()+'/repo')}catch(e){return}
-  const n=st.pending.length;
-  el.innerHTML='<div class="card" style="margin-top:10px"><h2>테스트 → 운영</h2>'
-    +(c.repo.test_url?'<div class="row" style="margin-bottom:6px"><a class="attb" style="text-decoration:none" href="'+esc(c.repo.test_url)+'" target="_blank" rel="noopener">테스트 서버 열기 ↗</a></div>':'')
-    +'<div class="vd">테스트('+esc(c.repo.branch)+')에만 있는 변경: <b>'+n+'개</b>'+(st.release_head?'<br>운영('+esc(c.repo.release)+'): '+esc(st.release_head):'')+'</div>'
-    +(n?'<ul class="tip" style="margin:6px 0">'+st.pending.slice(0,6).map(x=>'<li>'+esc(x.msg)+' <span style="color:var(--mute)">'+esc(x.when)+'</span></li>').join('')+(n>6?'<li>… 외 '+(n-6)+'개</li>':'')+'</ul>'
-      +'<div class="row"><button class="pri" id="relgo">운영 반영</button></div>':'<div class="vd">운영과 테스트가 같은 상태입니다.</div>')+'</div>';
-  if($('#relgo'))$('#relgo').onclick=async e=>{
-    if(!confirm('테스트 서버에서 확인을 마쳤나요?\n변경 '+n+'개를 운영에 올리면 1분 안에 실서버에 배포됩니다.'))return;
-    e.target.disabled=true;toast('운영에 반영하는 중…');
-    try{await post(base()+'/repo/release');toast('운영 반영 완료 - 1분 안에 실서버에 배포됩니다');await loadRel(true)}catch(err){alert(err.message);e.target.disabled=false}};
-}
+const chipC=j=>j.release_state==='pending'?'relwait':j.status;
+const chipL=j=>j.needs_input?'질문 대기':j.release_state==='pending'?'운영 대기':j.release_state==='released'?'운영 반영':STATUS[j.status];
 async function loadList(){
   if(!cur)return;
-  loadRel();
   const d=await api(base()+'/jobs');
-  const h=d.jobs.map(j=>'<div class="job'+(j.id===sel?' sel':'')+'" data-id="'+esc(j.id)+'"><div class="t">'+esc(j.title)+'</div><div class="m"><span class="chip '+j.status+'">'+(j.needs_input?'질문 대기':STATUS[j.status])+'</span><span>'+esc(j.created.slice(5,16))+'</span>'+(j.tokens?'<span>토큰 '+fmtN(j.tokens)+'</span>':'')+'</div></div>').join('');
+  const h=d.jobs.map(j=>'<div class="job'+(j.id===sel?' sel':'')+'" data-id="'+esc(j.id)+'"><div class="t">'+esc(j.title)+'</div><div class="m"><span class="chip '+chipC(j)+'">'+chipL(j)+'</span><span>'+esc(j.created.slice(5,16))+'</span>'+(j.tokens?'<span>토큰 '+fmtN(j.tokens)+'</span>':'')+'</div></div>').join('');
   if(h!==last.list){last.list=h;$('#jobs').innerHTML=h||'<div class="empty" style="padding:20px">아직 작업이 없습니다</div>'}
 }
 async function loadDetail(force){
@@ -3806,13 +3850,13 @@ async function loadDetail(force){
   const u=j.usage||{};
   const bys=Object.entries(u.by_stage||{}).map(([k,v])=>{const s=d.stages.find(x=>x.id===k);return esc(s?s.name:(k==='plan'?'자동 구성':k))+' '+fmtN(newTok(v))}).join(' · ');
   const srcL={telegram:'텔레그램',schedule:'예약 실행'}[j.source];
-  const head='<div class="title"><h2>'+esc(j.title)+'</h2><span class="chip '+j.status+'">'+(j.needs_input?'질문 대기':STATUS[j.status])+'</span>'+(srcL?'<span class="chip">'+srcL+'</span>':'')+(j.auto_approve?'<span class="chip">자동 승인</span>':'')+(d.auto_planned?'<span class="chip approved">자동 구성</span>':'')+'</div>'
+  const head='<div class="title"><h2>'+esc(j.title)+'</h2><span class="chip '+chipC(j)+'">'+chipL(j)+'</span>'+(srcL?'<span class="chip">'+srcL+'</span>':'')+(j.auto_approve?'<span class="chip">자동 승인</span>':'')+(d.auto_planned?'<span class="chip approved">자동 구성</span>':'')+'</div>'
     +(j.branch?'<div class="usage">브랜치: '+esc(j.branch)+'</div>':'')+'<div class="usage">'+esc(usageLine(u))+(d.limit?' · 작업 한도 '+fmtN(d.limit)+' 중 새 토큰 '+fmtN(newTok(u)):'')+'</div>'
     +(bys?'<div class="usage">단계별 새 토큰: '+bys+'</div>':'')
     +'<div class="steps">'+steps.map((s,i)=>'<div class="step '+st(i)+'"><b>'+esc(s[1])+'</b><span>'+esc(s[2])+'</span></div>').join('')+'</div>'
     +(j.error?'<div class="err-box">'+esc(j.error)+'</div>':'');
   const evh='<div class="ev">'+j.events.slice().reverse().map(e=>'<div class="'+e.kind+'"><span class="ts">'+esc((e.ts||'').slice(11,19))+'</span><span class="ag">'+esc(AG[e.agent]||e.agent)+'</span><span class="mg">'+esc(e.msg)+'</span></div>').join('')+'</div>';
-  const actKey=j.id+'|'+j.status;
+  const actKey=j.id+'|'+j.status+'|'+(j.release_state||'');
   if(last.act!==actKey||force){
     last.act=actKey;
     const works=stg.filter(s=>s.kind==='work');
@@ -3826,8 +3870,8 @@ async function loadDetail(force){
     }else if(j.status==='awaiting_user'){
       const lastRev=stg.slice().reverse().find(s=>s.kind==='review'&&f[s.id]!=null);
       const rv=lastRev?verdictOf(f[lastRev.id]):'APPROVE';
-      act='<div class="card approve"><h3>최종 승인이 필요합니다</h3><div class="sub">'+(rv==='APPROVE'?'검토를 통과한 결과물입니다.':'검토 단계의 수정요청이 남은 상태입니다. 해당 탭에서 내용을 확인하세요.')+(d.repo?(d.repo.mode==='branch'?' 승인하면 작업 브랜치를 GitHub에 푸시합니다(PR은 직접 병합).':' 승인하면 '+esc(d.repo.base)+'에 병합해 GitHub에 푸시합니다. 푸시되면 GitHub Actions 빌드가 시작됩니다.')+' \'변경 내용\' 탭에서 diff를 먼저 확인하세요.':' 승인하면 outbox에 approved 파일로 저장됩니다.')+'</div>'
-        +'<div class="row"><button class="pri" id="ap">최종 승인</button></div><hr style="border:0;border-top:1px solid var(--line);margin:12px 0">'
+      act='<div class="card approve"><h3>최종 승인이 필요합니다</h3><div class="sub">'+(rv==='APPROVE'?'검토를 통과한 결과물입니다.':'검토 단계의 수정요청이 남은 상태입니다. 해당 탭에서 내용을 확인하세요.')+(d.repo&&d.repo.release?' 승인하면 테스트 서버('+esc(d.repo.base)+')에만 반영됩니다. 운영은 테스트 서버에서 확인한 뒤 이 화면의 \'운영 반영\'으로 따로 올립니다.':d.repo?(d.repo.mode==='branch'?' 승인하면 작업 브랜치를 GitHub에 푸시합니다(PR은 직접 병합).':' 승인하면 '+esc(d.repo.base)+'에 병합해 GitHub에 푸시합니다. 푸시되면 GitHub Actions 빌드가 시작됩니다.')+' \'변경 내용\' 탭에서 diff를 먼저 확인하세요.':' 승인하면 outbox에 approved 파일로 저장됩니다.')+'</div>'
+        +'<div class="row"><button class="pri" id="ap">'+(d.repo&&d.repo.release?'승인 · 테스트 서버 반영':'최종 승인')+'</button></div><hr style="border:0;border-top:1px solid var(--line);margin:12px 0">'
         +'<textarea id="fb" placeholder="수정이 필요하면 요청 내용을 적어주세요"></textarea>'
         +'<div class="row" style="margin-top:8px"><select id="st" style="width:auto">'+opts+'</select><button id="rj">반려하고 다시 작업</button></div></div>';
     }else if(j.status==='running'||j.status==='queued'){
@@ -3836,6 +3880,15 @@ async function loadDetail(force){
       act='<div class="row" style="margin:10px 0"><select id="st" style="width:auto">'+opts.replace(' selected','')+'</select><button class="pri" id="rt">다시 시도</button></div>';
     }else if(j.status==='deploying'){
       act='<div class="vd">승인됨 - GitHub 저장소에 반영하는 중입니다…</div>';
+    }else if(j.status==='approved'&&j.release_state==='pending'){
+      const w=(d.repo&&d.repo.with)||[];
+      act='<div class="card approve"><h3>테스트 서버에 반영됨 · 운영 반영 대기</h3>'
+        +'<div class="sub">테스트 서버에서 확인을 마쳤으면 운영에 올리세요. 바로 올리지 않아도 됩니다. 이 작업은 운영 대기 상태로 남아 있다가 원할 때 반영할 수 있습니다.'
+        +(w.length?'<br><b>먼저 승인된 운영 대기 작업 '+w.length+'개도 함께 반영됩니다:</b> '+w.map(x=>esc(x.title)).join(', '):'')+'</div>'
+        +'<div class="row">'+(d.repo&&d.repo.test_url?'<a class="attb" style="text-decoration:none" href="'+esc(d.repo.test_url)+'" target="_blank" rel="noopener">테스트 서버 열기 ↗</a>':'')
+        +'<button class="pri" id="rel">운영 반영</button></div></div>';
+    }else if(j.status==='approved'&&j.release_state==='released'){
+      act='<div class="vd">운영 반영 완료'+(j.released_at?' ('+esc(j.released_at.slice(5,16))+')':'')+' · 문제가 있으면 설정 → 코드 저장소 → 운영 반영 이력에서 되돌릴 수 있습니다.</div>';
     }else if(j.status==='approved'){
       act='<div class="vd">승인 완료: shared/outbox/approved_'+esc(j.id)+'.md'+(d.repo?' · 반영 결과는 \'승인본\' 탭에서 확인':'')+'</div>';
     }
@@ -3865,6 +3918,7 @@ function bindJob(j){
   if(q('#rj'))q('#rj').onclick=()=>{const fb=q('#fb').value.trim();if(!fb){toast('수정 요청 내용을 적어주세요');return}run(()=>post(url+'/restart',{feedback:fb,start:q('#st').value}),'다시 작업을 시작합니다')};
   if(q('#rt'))q('#rt').onclick=()=>run(()=>post(url+'/restart',{start:q('#st').value}),'다시 시작합니다');
   if(q('#cn'))q('#cn').onclick=()=>{if(confirm('작업을 중단할까요?'))run(()=>post(url+'/cancel'),'중단 요청')};
+  if(q('#rel'))q('#rel').onclick=()=>{if(confirm('테스트 서버에서 확인을 마쳤나요?\n운영에 반영하면 1~3분 안에 실서버에 배포됩니다.'))run(()=>post(base()+'/repo/release',{job:j.id}),'운영 반영 완료 - 1~3분 안에 실서버에 배포됩니다')};
   if(q('#jdel'))q('#jdel').onclick=async()=>{if(!confirm('이 작업을 삭제할까요?\n요청·중간 결과·최종본·로그가 모두 지워지고 되돌릴 수 없습니다.'+(j.status==='approved'?'\n(이미 GitHub에 반영된 코드는 그대로 남습니다)':'')))return;try{await post(url+'/delete');toast('삭제했습니다');sel=null;last={};$('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>';await loadList()}catch(e){toast(e.message)}};
   if(q('#qago'))q('#qago').onclick=()=>{const a=q('#qa').value.trim();if(!a){toast('답변을 적어주세요');return}run(()=>post(url+'/restart',{feedback:a,start:j.step}),'답변을 반영해 이어서 진행합니다')};
 }
