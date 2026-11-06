@@ -2778,6 +2778,62 @@ def r_projects(m, b):
             "queue": {"waiting": QUEUE.qsize(), "running": RUNNING}}
 
 
+# ---------------------------------------------------------------- Claude 구독 사용량 (Claude Code /usage 와 같은 값)
+# 공식 문서에 없는 내부 주소라 바뀔 수 있다. 실패하면 화면에서 조용히 숨긴다(하네스 동작과 무관).
+USAGE_URL = os.environ.get("CLAUDE_USAGE_URL", "https://api.anthropic.com/api/oauth/usage")
+USAGE_CACHE = {"t": 0, "v": None}
+
+
+def _usage_window(d):
+    if not isinstance(d, dict):
+        return None
+    pct = d.get("utilization", d.get("used_percentage"))
+    if pct is None:
+        return None
+    r = d.get("resets_at") or d.get("reset_at")
+    ts = None
+    if isinstance(r, (int, float)):
+        ts = r / 1000 if r > 1e12 else r
+    elif isinstance(r, str) and r:
+        try:
+            from datetime import datetime
+            ts = datetime.fromisoformat(r.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            ts = None
+    return {"pct": round(float(pct)), "reset": int(ts) if ts else None}
+
+
+def claude_usage(force=False):
+    if not force and time.time() - USAGE_CACHE["t"] < 300:
+        return USAGE_CACHE["v"]
+    USAGE_CACHE["t"] = time.time()
+    out = None
+    try:
+        cred = json.loads((Path.home() / ".claude" / ".credentials.json").read_text())
+        oa = cred.get("claudeAiOauth") or {}
+        tok = oa.get("accessToken")
+        if tok and (not oa.get("expiresAt") or oa["expiresAt"] / 1000 > time.time()):
+            req = urllib.request.Request(USAGE_URL, headers={
+                "Authorization": "Bearer " + tok, "anthropic-beta": "oauth-2025-04-20",
+                "Accept": "application/json", "User-Agent": "agent-harness"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                d = json.loads(r.read().decode("utf-8"))
+            five = _usage_window(d.get("five_hour") or (d.get("rate_limits") or {}).get("five_hour"))
+            week = _usage_window(d.get("seven_day") or (d.get("rate_limits") or {}).get("seven_day"))
+            if five or week:
+                out = {"session": five, "week": week, "ts": now()}
+    except Exception:  # noqa: BLE001 - 표시용 부가 기능이라 실패해도 무시
+        out = None
+    if out or not USAGE_CACHE["v"]:
+        USAGE_CACHE["v"] = out
+    return USAGE_CACHE["v"]
+
+
+@route("GET", r"/api/usage", lock=False)
+def r_usage(m, b):
+    return {"usage": claude_usage()}
+
+
 @route("GET", r"/api/presets")
 def r_presets(m, b):
     return {"presets": PRESETS}

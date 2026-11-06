@@ -2778,6 +2778,62 @@ def r_projects(m, b):
             "queue": {"waiting": QUEUE.qsize(), "running": RUNNING}}
 
 
+# ---------------------------------------------------------------- Claude 구독 사용량 (Claude Code /usage 와 같은 값)
+# 공식 문서에 없는 내부 주소라 바뀔 수 있다. 실패하면 화면에서 조용히 숨긴다(하네스 동작과 무관).
+USAGE_URL = os.environ.get("CLAUDE_USAGE_URL", "https://api.anthropic.com/api/oauth/usage")
+USAGE_CACHE = {"t": 0, "v": None}
+
+
+def _usage_window(d):
+    if not isinstance(d, dict):
+        return None
+    pct = d.get("utilization", d.get("used_percentage"))
+    if pct is None:
+        return None
+    r = d.get("resets_at") or d.get("reset_at")
+    ts = None
+    if isinstance(r, (int, float)):
+        ts = r / 1000 if r > 1e12 else r
+    elif isinstance(r, str) and r:
+        try:
+            from datetime import datetime
+            ts = datetime.fromisoformat(r.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            ts = None
+    return {"pct": round(float(pct)), "reset": int(ts) if ts else None}
+
+
+def claude_usage(force=False):
+    if not force and time.time() - USAGE_CACHE["t"] < 300:
+        return USAGE_CACHE["v"]
+    USAGE_CACHE["t"] = time.time()
+    out = None
+    try:
+        cred = json.loads((Path.home() / ".claude" / ".credentials.json").read_text())
+        oa = cred.get("claudeAiOauth") or {}
+        tok = oa.get("accessToken")
+        if tok and (not oa.get("expiresAt") or oa["expiresAt"] / 1000 > time.time()):
+            req = urllib.request.Request(USAGE_URL, headers={
+                "Authorization": "Bearer " + tok, "anthropic-beta": "oauth-2025-04-20",
+                "Accept": "application/json", "User-Agent": "agent-harness"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                d = json.loads(r.read().decode("utf-8"))
+            five = _usage_window(d.get("five_hour") or (d.get("rate_limits") or {}).get("five_hour"))
+            week = _usage_window(d.get("seven_day") or (d.get("rate_limits") or {}).get("seven_day"))
+            if five or week:
+                out = {"session": five, "week": week, "ts": now()}
+    except Exception:  # noqa: BLE001 - 표시용 부가 기능이라 실패해도 무시
+        out = None
+    if out or not USAGE_CACHE["v"]:
+        USAGE_CACHE["v"] = out
+    return USAGE_CACHE["v"]
+
+
+@route("GET", r"/api/usage", lock=False)
+def r_usage(m, b):
+    return {"usage": claude_usage()}
+
+
 @route("GET", r"/api/presets")
 def r_presets(m, b):
     return {"presets": PRESETS}
@@ -3512,6 +3568,9 @@ button:disabled{opacity:.5;cursor:default}
 .req.drag{outline:2px dashed var(--accent)}
 .atts{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}.atts a{font-size:12px;color:var(--ink);text-decoration:none;border:1px solid var(--line);border-radius:8px;padding:4px 8px;display:flex;align-items:center;gap:6px}
 .atts img{max-width:160px;max-height:110px;border-radius:6px;display:block}
+.usagebar{position:fixed;right:10px;bottom:6px;font-size:11px;color:var(--mute);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:3px 8px;opacity:.9;z-index:5}
+.usagebar b{color:var(--ink);font-weight:600}.usagebar .hi{color:var(--err)}
+@media (max-width:700px){.usagebar{left:10px;right:auto}}
 .chip.approved{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok)}
 .chip.failed,.chip.cancelled{background:color-mix(in srgb,var(--err) 18%,transparent);color:var(--err)}
 .empty{color:var(--mute);text-align:center;padding:60px 10px}
@@ -4332,9 +4391,16 @@ async function tick(force){
   if(document.hidden&&!force)return;
   try{await loadProjects();if(view==='jobs'){await loadList();await loadDetail(force)}}catch(e){}
 }
+const WD=['일','월','화','수','목','금','토'];
+function fmtReset(t){if(!t)return '';const d=new Date(t*1000),h=d.getHours(),m=String(d.getMinutes()).padStart(2,'0');return WD[d.getDay()]+' '+(h<12?'오전 ':'오후 ')+((h%12)||12)+':'+m}
+async function loadUsage(){try{const u=(await api('/api/usage')).usage;const el=$('#usagebar');if(!u){el.hidden=true;return}
+  const seg=(n,w)=>w?n+' <b class="'+(w.pct>=80?'hi':'')+'">'+w.pct+'%</b>'+(w.reset?' · '+fmtReset(w.reset)+' 초기화':''):'';
+  el.innerHTML=[seg('현재 세션',u.session),seg('이번 주',u.week)].filter(Boolean).join(' &nbsp;|&nbsp; ');el.title='Claude 구독 사용량 (확인 '+u.ts+')';el.hidden=false}catch(e){}}
+loadUsage();setInterval(loadUsage,300000);
 setInterval(()=>{tickN++;if(P.some(p=>p.active>0)||tickN%3===0)tick(false)},3000);
 loadProjects().then(()=>setView(cur?'jobs':'newproj')).catch(e=>toast(e.message));
 </script>
+<div id="usagebar" class="usagebar" hidden></div>
 </body>
 </html>
 """
