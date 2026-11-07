@@ -1280,6 +1280,8 @@ def repo_after_work(job, proj, stages, st):
         run_step(job, proj, st, prompt_work(proj, stages, st, jid, fb))
     git(d, "add", "-A", proj=proj)
     title = re.sub(r"\s+", " ", job["title"])[:60]
+    if job.get("followups") and job.get("feedback"):
+        title = "%s (추가 요청 %d: %s)" % (title[:40], job["followups"], re.sub(r"\s+", " ", job["feedback"])[:50])
     git(d, "commit", "-q", "-m", "%s\n\nagent-harness 작업 %s · %s 단계" % (title, jid, st["name"]), proj=proj)
     write_diff(proj, jid)
     event(job, "system", "커밋 완료: %s" % git(d, "log", "-1", "--format=%h", proj=proj).strip(), "ok")
@@ -1316,7 +1318,7 @@ def repo_deliver(proj, j, summary_src):
             ahead = int(git(d, "rev-list", "--count", "origin/%s..%s" % (base, br), proj=proj).strip() or 0)
             if not ahead:
                 lines.append("- 바뀐 코드가 없어 저장소에는 반영하지 않았습니다")
-                if repo_release(proj):
+                if repo_release(proj) and not j.get("merge_sha"):
                     set_state(j, release_state="none")
             elif mode == "branch":
                 git(d, "push", "-q", "-f", "origin", "%s:%s" % (br, br), timeout=300, proj=proj)
@@ -1945,6 +1947,35 @@ def job_edit(proj, j, b):
     upd["step"] = act[0]["id"] if act else ""
     set_state(j, **upd)
     event(j, "user", "요청 수정 후 처음부터 다시 시작" + (" · 첨부 %d개 추가" % len(added) if added else ""))
+    QUEUE.put((proj["id"], jid, "first"))
+    return job_summary(j)
+
+
+def job_followup(proj, j, b):
+    """승인한 작업을 다시 열어, 앞선 결과(코드 저장소면 테스트 브랜치의 최신 코드) 위에서 이어서 수정한다."""
+    if j["status"] != "approved":
+        raise ApiError(409, "승인 완료된 작업만 이어서 요청할 수 있습니다")
+    text = str(b.get("request") or "").strip()
+    if not text:
+        raise ApiError(400, "추가 요청 내용을 입력하세요")
+    if len(text) > 20000:
+        raise ApiError(400, "요청이 너무 깁니다")
+    jid = j["id"]
+    keep = [x["name"] for x in att_list(proj, jid)]
+    if len(keep) + len(b.get("files") or []) > ATT_COUNT:
+        raise ApiError(400, "첨부는 최대 %d개까지입니다 (지금 %d개)" % (ATT_COUNT, len(keep)))
+    added = save_attachments(proj, jid, b.get("files"), keep)
+    n = int(j.get("followups") or 0) + 1
+    rq = fpath(proj, "request", jid)
+    rq.write_text((read_text(rq) or "").rstrip() + "\n\n## 추가 요청 %d (%s)\n%s\n" % (n, now()[:16], text))
+    try:
+        fpath(proj, "diff", jid).unlink()
+    except OSError:
+        pass
+    act = job_stage_src(proj, j)
+    set_state(j, status="queued", step=act[0]["id"] if act else "", feedback=text[:5000], error="", cancel=False,
+              needs_input=False, question="", followups=n)
+    event(j, "user", "이어서 수정 요청 (%d차)%s: %s" % (n, " · 첨부 %d개" % len(added) if added else "", text[:120]))
     QUEUE.put((proj["id"], jid, "first"))
     return job_summary(j)
 
@@ -3064,13 +3095,13 @@ def r_job_delete_many(m, b):
     return job_delete_many(proj_of(m[1]), b)
 
 
-@route("POST", r"/api/projects/([^/]+)/jobs/([^/]+)/(approve|restart|cancel|delete|edit)")
+@route("POST", r"/api/projects/([^/]+)/jobs/([^/]+)/(approve|restart|cancel|delete|edit|followup)")
 def r_job_action(m, b):
     proj = proj_of(m[1])
     j = job_of(proj, m[2])
     return {"approve": lambda: job_approve(proj, j), "restart": lambda: job_restart(proj, j, b),
             "cancel": lambda: job_cancel(proj, j), "delete": lambda: job_delete(proj, j),
-            "edit": lambda: job_edit(proj, j, b)}[m[3]]()
+            "edit": lambda: job_edit(proj, j, b), "followup": lambda: job_followup(proj, j, b)}[m[3]]()
 
 
 @route("POST", r"/api/plan", lock=False)
@@ -3570,7 +3601,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.js(415, {"error": "JSON만 허용"})
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            big = re.match(r"^/api/projects/[^/]+/jobs(/[^/]+/edit)?$", urlparse(self.path).path)
+            big = re.match(r"^/api/projects/[^/]+/jobs(/[^/]+/(edit|followup))?$", urlparse(self.path).path)
             if n > (30_000_000 if big else 300_000):
                 return self.js(413, {"error": "요청이 너무 큼"})
             body = json.loads(self.rfile.read(n) or b"{}")
@@ -3925,7 +3956,7 @@ async function loadDetail(force){
     +'<div class="steps">'+steps.map((s,i)=>'<div class="step '+st(i)+'"><b>'+esc(s[1])+'</b><span>'+esc(s[2])+'</span></div>').join('')+'</div>'
     +(j.error?'<div class="err-box">'+esc(j.error)+'</div>':'');
   const evh='<div class="ev">'+j.events.slice().reverse().map(e=>'<div class="'+e.kind+'"><span class="ts">'+esc((e.ts||'').slice(11,19))+'</span><span class="ag">'+esc(AG[e.agent]||e.agent)+'</span><span class="mg">'+esc(e.msg)+'</span></div>').join('')+'</div>';
-  const actKey=j.id+'|'+j.status+'|'+(j.release_state||'')+'|'+(EDIT===j.id?'e':'');
+  const actKey=j.id+'|'+j.status+'|'+(j.release_state||'')+'|'+(EDIT===j.id?'e':'')+(FOLLOW===j.id?'f':'');
   if(last.act!==actKey||force){
     last.act=actKey;
     const works=stg.filter(s=>s.kind==='work');
@@ -3973,6 +4004,13 @@ async function loadDetail(force){
     if(['awaiting_user','approved','failed','cancelled'].includes(j.status))act+='<div class="row" style="margin:6px 0 10px;justify-content:flex-end"><button class="dng" id="jdel" style="font-size:12px;padding:5px 10px">작업 삭제</button></div>';
     const at=d.attachments||[];
     if(at.length)act='<div class="atts">'+at.map(a=>{const u=base()+'/jobs/'+encodeURIComponent(j.id)+'/files/'+encodeURIComponent(a.name);return '<a href="'+u+'" target="_blank" rel="noopener">'+(a.img?'<img src="'+u+'" alt="'+esc(a.name)+'">':'📄 '+esc(a.name)+' <span style="color:var(--mute)">'+fmtB(a.size)+'</span>')+'</a>'}).join('')+'</div>'+act;
+    if(j.status==='approved'){
+      act+=FOLLOW===j.id
+        ?'<div class="card" style="margin-top:10px"><h3 style="margin:0 0 6px">이어서 수정 요청</h3><div class="sub">이 작업의 결과'+(d.repo?'(테스트 서버에 올라간 최신 코드)':'')+' 위에서 이어서 고칩니다. 마음에 안 드는 부분만 적어주세요.</div>'
+          +'<textarea id="futx" style="min-height:110px" placeholder="예: 버튼 색을 회색으로, 목록 정렬은 최신순으로 바꿔줘 (스크린샷은 Ctrl+V)"></textarea><div class="attl" id="funew"></div>'
+          +'<div class="row" style="margin-top:8px"><button class="pri" id="fugo">이어서 작업 시작</button><label class="attb">파일 첨부<input type="file" id="fuf" multiple hidden></label><button id="funo">취소</button></div></div>'
+        :'<div class="row" style="margin:8px 0"><button id="fu">이어서 수정 요청</button>'+(j.followups?'<span style="font-size:12px;color:var(--mute)">추가 요청 '+j.followups+'회</span>':'')+'</div>';
+    }
     $('#act').innerHTML=act;bindJob(j);
   }
   const tdef=(f.approved!=null&&d.repo?[['approved','승인본']]:[]).concat(f.diff!=null?[['diff','변경 내용']]:[]).concat([['final','최종본']]).concat(d.stages.slice().reverse().map(s=>[s.id,s.name+(s.kind==='review'?' (검토)':'')+(s.enabled?'':' ·꺼짐')])).concat([['request','요청']]);
@@ -3996,6 +4034,19 @@ function bindJob(j){
   if(q('#rj'))q('#rj').onclick=()=>{const fb=q('#fb').value.trim();if(!fb){toast('수정 요청 내용을 적어주세요');return}run(()=>post(url+'/restart',{feedback:fb,start:q('#st').value}),'다시 작업을 시작합니다')};
   if(q('#rt'))q('#rt').onclick=()=>run(()=>post(url+'/restart',{start:q('#st').value}),'다시 시작합니다');
   if(q('#cn'))q('#cn').onclick=()=>{if(confirm('작업을 중단할까요?'))run(()=>post(url+'/cancel'),'중단 요청')};
+  if(q('#fu'))q('#fu').onclick=()=>{FOLLOW=j.id;FUNEW=[];last={};tick(false)};
+  if(q('#funo'))q('#funo').onclick=()=>{FOLLOW=null;last={};tick(false)};
+  const fuAdd=fs=>{for(const f of fs){if(f.size>10*1024*1024){toast(f.name+': 10MB를 넘습니다');continue}
+    FUNEW.push({file:f,name:f.name&&f.name!=='image.png'?f.name:'screenshot-'+new Date().toTimeString().slice(0,8).replace(/:/g,'')+'.png'})}
+    q('#funew').innerHTML=FUNEW.map((a,i)=>'<span class="attc">➕ <b>'+esc(a.name)+'</b><span style="color:var(--mute)">'+fmtB(a.file.size)+'</span><button data-fr="'+i+'">×</button></span>').join('');
+    q('#funew').querySelectorAll('[data-fr]').forEach(b=>b.onclick=()=>{FUNEW.splice(+b.dataset.fr,1);fuAdd([])})};
+  if(q('#fuf'))q('#fuf').onchange=e=>{fuAdd(e.target.files);e.target.value=''};
+  if(q('#futx')){q('#futx').addEventListener('paste',e=>{const fs=[...(e.clipboardData||{}).items||[]].filter(x=>x.kind==='file').map(x=>x.getAsFile()).filter(Boolean);if(fs.length){e.preventDefault();fuAdd(fs)}});q('#futx').focus()}
+  if(q('#fugo'))q('#fugo').onclick=async e=>{const t=q('#futx').value.trim();if(!t){toast('추가 요청 내용을 입력하세요');return}
+    e.target.disabled=true;
+    try{const files=await Promise.all(FUNEW.map(async a=>({name:a.name,data:await b64(a.file)})));
+      await post(url+'/followup',{request:t,files});FOLLOW=null;toast('이어서 작업을 시작합니다');last={};await loadList();tick(false)}
+    catch(err){toast(err.message);e.target.disabled=false}};
   if(q('#ed'))q('#ed').onclick=()=>{EDIT=j.id;EDNEW=[];EDDROP=[];last={};tick(false)};
   if(q('#edno'))q('#edno').onclick=()=>{EDIT=null;last={};tick(false)};
   if(q('#cne'))q('#cne').onclick=async()=>{try{await post(url+'/cancel');EDIT=j.id;EDNEW=[];EDDROP=[];toast('중단했습니다. 요청을 고쳐 다시 시작하세요');last={};tick(false)}catch(e){toast(e.message)}};
@@ -4019,7 +4070,7 @@ function selectJob(id){
 }
 $('#jclean').onclick=async()=>{const d=prompt('승인 완료·실패·중단된 작업을 삭제합니다.\n며칠 지난 작업만 지울까요? (0 = 전부)','7');if(d===null)return;const n=parseInt(d);if(isNaN(n)||n<0){toast('숫자를 입력하세요');return}try{const r=await post(base()+'/jobs/delete-many',{older_days:n});toast(r.deleted+'개 작업을 삭제했습니다');if(sel&&!(await api(base()+'/jobs')).jobs.some(x=>x.id===sel)){sel=null;$('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>'}last={};await loadList()}catch(e){toast(e.message)}};
 $('#jobs').onclick=e=>{const j=e.target.closest('.job');if(j)selectJob(j.dataset.id)};
-let ATT=[],EDIT=null,EDNEW=[],EDDROP=[];
+let ATT=[],EDIT=null,EDNEW=[],EDDROP=[],FOLLOW=null,FUNEW=[];
 const fmtB=n=>n>1048576?(n/1048576).toFixed(1)+'MB':Math.ceil(n/1024)+'KB';
 function addFiles(list){
   for(const f of list){

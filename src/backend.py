@@ -1280,6 +1280,8 @@ def repo_after_work(job, proj, stages, st):
         run_step(job, proj, st, prompt_work(proj, stages, st, jid, fb))
     git(d, "add", "-A", proj=proj)
     title = re.sub(r"\s+", " ", job["title"])[:60]
+    if job.get("followups") and job.get("feedback"):
+        title = "%s (추가 요청 %d: %s)" % (title[:40], job["followups"], re.sub(r"\s+", " ", job["feedback"])[:50])
     git(d, "commit", "-q", "-m", "%s\n\nagent-harness 작업 %s · %s 단계" % (title, jid, st["name"]), proj=proj)
     write_diff(proj, jid)
     event(job, "system", "커밋 완료: %s" % git(d, "log", "-1", "--format=%h", proj=proj).strip(), "ok")
@@ -1316,7 +1318,7 @@ def repo_deliver(proj, j, summary_src):
             ahead = int(git(d, "rev-list", "--count", "origin/%s..%s" % (base, br), proj=proj).strip() or 0)
             if not ahead:
                 lines.append("- 바뀐 코드가 없어 저장소에는 반영하지 않았습니다")
-                if repo_release(proj):
+                if repo_release(proj) and not j.get("merge_sha"):
                     set_state(j, release_state="none")
             elif mode == "branch":
                 git(d, "push", "-q", "-f", "origin", "%s:%s" % (br, br), timeout=300, proj=proj)
@@ -1945,6 +1947,35 @@ def job_edit(proj, j, b):
     upd["step"] = act[0]["id"] if act else ""
     set_state(j, **upd)
     event(j, "user", "요청 수정 후 처음부터 다시 시작" + (" · 첨부 %d개 추가" % len(added) if added else ""))
+    QUEUE.put((proj["id"], jid, "first"))
+    return job_summary(j)
+
+
+def job_followup(proj, j, b):
+    """승인한 작업을 다시 열어, 앞선 결과(코드 저장소면 테스트 브랜치의 최신 코드) 위에서 이어서 수정한다."""
+    if j["status"] != "approved":
+        raise ApiError(409, "승인 완료된 작업만 이어서 요청할 수 있습니다")
+    text = str(b.get("request") or "").strip()
+    if not text:
+        raise ApiError(400, "추가 요청 내용을 입력하세요")
+    if len(text) > 20000:
+        raise ApiError(400, "요청이 너무 깁니다")
+    jid = j["id"]
+    keep = [x["name"] for x in att_list(proj, jid)]
+    if len(keep) + len(b.get("files") or []) > ATT_COUNT:
+        raise ApiError(400, "첨부는 최대 %d개까지입니다 (지금 %d개)" % (ATT_COUNT, len(keep)))
+    added = save_attachments(proj, jid, b.get("files"), keep)
+    n = int(j.get("followups") or 0) + 1
+    rq = fpath(proj, "request", jid)
+    rq.write_text((read_text(rq) or "").rstrip() + "\n\n## 추가 요청 %d (%s)\n%s\n" % (n, now()[:16], text))
+    try:
+        fpath(proj, "diff", jid).unlink()
+    except OSError:
+        pass
+    act = job_stage_src(proj, j)
+    set_state(j, status="queued", step=act[0]["id"] if act else "", feedback=text[:5000], error="", cancel=False,
+              needs_input=False, question="", followups=n)
+    event(j, "user", "이어서 수정 요청 (%d차)%s: %s" % (n, " · 첨부 %d개" % len(added) if added else "", text[:120]))
     QUEUE.put((proj["id"], jid, "first"))
     return job_summary(j)
 
@@ -3064,13 +3095,13 @@ def r_job_delete_many(m, b):
     return job_delete_many(proj_of(m[1]), b)
 
 
-@route("POST", r"/api/projects/([^/]+)/jobs/([^/]+)/(approve|restart|cancel|delete|edit)")
+@route("POST", r"/api/projects/([^/]+)/jobs/([^/]+)/(approve|restart|cancel|delete|edit|followup)")
 def r_job_action(m, b):
     proj = proj_of(m[1])
     j = job_of(proj, m[2])
     return {"approve": lambda: job_approve(proj, j), "restart": lambda: job_restart(proj, j, b),
             "cancel": lambda: job_cancel(proj, j), "delete": lambda: job_delete(proj, j),
-            "edit": lambda: job_edit(proj, j, b)}[m[3]]()
+            "edit": lambda: job_edit(proj, j, b), "followup": lambda: job_followup(proj, j, b)}[m[3]]()
 
 
 @route("POST", r"/api/plan", lock=False)
@@ -3570,7 +3601,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.js(415, {"error": "JSON만 허용"})
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            big = re.match(r"^/api/projects/[^/]+/jobs(/[^/]+/edit)?$", urlparse(self.path).path)
+            big = re.match(r"^/api/projects/[^/]+/jobs(/[^/]+/(edit|followup))?$", urlparse(self.path).path)
             if n > (30_000_000 if big else 300_000):
                 return self.js(413, {"error": "요청이 너무 큼"})
             body = json.loads(self.rfile.read(n) or b"{}")
