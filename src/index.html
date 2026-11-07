@@ -314,6 +314,8 @@ async function loadDetail(force){
         +(w.length?'<br><b>먼저 승인된 운영 대기 작업 '+w.length+'개도 함께 반영됩니다:</b> '+w.map(x=>esc(x.title)).join(', '):'')+'</div>'
         +'<div class="row">'+(d.repo&&d.repo.test_url?'<a class="attb" style="text-decoration:none" href="'+esc(d.repo.test_url)+'" target="_blank" rel="noopener">테스트 서버 열기 ↗</a>':'')
         +'<button class="pri" id="rel">운영 반영</button></div></div>';
+    }else if(j.status==='approved'&&j.release_state==='none'){
+      act='<div class="vd">이 작업은 바뀐 코드가 없어 테스트·운영 서버에 올라간 것이 없습니다 (분석·설계 요청 등). 운영 반영할 내용이 없습니다.</div>';
     }else if(j.status==='approved'&&j.release_state==='released'){
       act='<div class="vd">운영 반영 완료'+(j.released_at?' ('+esc(j.released_at.slice(5,16))+')':'')+' · 문제가 있으면 설정 → 코드 저장소 → 운영 반영 이력에서 되돌릴 수 있습니다.</div>';
     }else if(j.status==='approved'){

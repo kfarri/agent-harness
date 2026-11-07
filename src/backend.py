@@ -995,6 +995,22 @@ def sync_release_states(proj):
             event(j, "system", "운영이 이전 버전으로 되돌려져 다시 운영 대기", "warn")
 
 
+def backfill_release(proj, j):
+    """운영 대기 기능이 생기기 전에 승인한 작업: 테스트 브랜치의 병합 커밋을 찾아 상태를 채운다."""
+    d, base, rel = repo_dir(proj), repo_base(proj), repo_release(proj)
+    try:
+        r = git(d, "log", "--merges", "--fixed-strings", "--format=%H", "--grep=Merge %s:" % job_branch(j["id"]),
+                "origin/" + base, check=False, proj=proj)
+        sha = (r.stdout.split() or [""])[0] if r.returncode == 0 else ""
+        if not sha:
+            set_state(j, release_state="none")
+            return
+        st = "released" if is_ancestor(proj, sha, "origin/" + rel) else "pending"
+        set_state(j, merge_sha=sha, release_state=st)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def pending_jobs(proj, upto=None):
     """운영 대기 중인 작업 목록. upto 를 주면 그 작업까지(먼저 승인된 것 포함) 함께 반영되는 작업."""
     js = [j for (pid, _), j in JOBS.items() if pid == proj["id"] and j.get("release_state") == "pending"
@@ -1294,6 +1310,8 @@ def repo_deliver(proj, j, summary_src):
             ahead = int(git(d, "rev-list", "--count", "origin/%s..%s" % (base, br), proj=proj).strip() or 0)
             if not ahead:
                 lines.append("- 바뀐 코드가 없어 저장소에는 반영하지 않았습니다")
+                if repo_release(proj):
+                    set_state(j, release_state="none")
             elif mode == "branch":
                 git(d, "push", "-q", "-f", "origin", "%s:%s" % (br, br), timeout=300, proj=proj)
                 lines.append("- `%s` 브랜치로 푸시했습니다 (커밋 %d개)" % (br, ahead))
@@ -1752,6 +1770,8 @@ def job_detail(proj, j):
     files_att = att_list(proj, j["id"])
     rp = {"on": True, "mode": repo_cfg(proj).get("merge", "merge"), "base": repo_base(proj), "release": repo_release(proj),
           "test_url": repo_cfg(proj).get("test_url", "")} if repo_on(proj) else None
+    if rp and rp["release"] and j["status"] == "approved" and not j.get("release_state"):
+        backfill_release(proj, j)
     if rp and j.get("release_state") == "pending":
         try:
             rp["with"] = [{"id": x["id"], "title": x["title"]} for x in pending_jobs(proj, j["merge_sha"]) if x["id"] != j["id"]]
