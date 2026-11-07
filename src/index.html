@@ -283,7 +283,7 @@ async function loadDetail(force){
     +'<div class="steps">'+steps.map((s,i)=>'<div class="step '+st(i)+'"><b>'+esc(s[1])+'</b><span>'+esc(s[2])+'</span></div>').join('')+'</div>'
     +(j.error?'<div class="err-box">'+esc(j.error)+'</div>':'');
   const evh='<div class="ev">'+j.events.slice().reverse().map(e=>'<div class="'+e.kind+'"><span class="ts">'+esc((e.ts||'').slice(11,19))+'</span><span class="ag">'+esc(AG[e.agent]||e.agent)+'</span><span class="mg">'+esc(e.msg)+'</span></div>').join('')+'</div>';
-  const actKey=j.id+'|'+j.status+'|'+(j.release_state||'');
+  const actKey=j.id+'|'+j.status+'|'+(j.release_state||'')+'|'+(EDIT===j.id?'e':'');
   if(last.act!==actKey||force){
     last.act=actKey;
     const works=stg.filter(s=>s.kind==='work');
@@ -302,9 +302,16 @@ async function loadDetail(force){
         +'<textarea id="fb" placeholder="수정이 필요하면 요청 내용을 적어주세요"></textarea>'
         +'<div class="row" style="margin-top:8px"><select id="st" style="width:auto">'+opts+'</select><button id="rj">반려하고 다시 작업</button></div></div>';
     }else if(j.status==='running'||j.status==='queued'){
-      act='<div class="row" style="margin:10px 0"><button class="dng" id="cn">작업 중단</button></div>';
+      act='<div class="row" style="margin:10px 0"><button class="dng" id="cn">작업 중단</button><button id="cne">중단하고 요청 수정</button></div>';
+    }else if((j.status==='failed'||j.status==='cancelled')&&EDIT===j.id){
+      const at=d.attachments||[];
+      act='<div class="card approve"><h3>요청 수정</h3><div class="sub">고친 요청으로 처음부터 다시 작업합니다. 이전 시도의 중간 결과'+(d.repo?'와 코드 변경':'')+'은 버립니다.</div>'
+        +'<textarea id="edtx" style="min-height:140px">'+esc((f.request||'').replace(/\n$/,''))+'</textarea>'
+        +'<div class="attl" id="edatt">'+at.map(a=>'<span class="attc" data-keep="'+esc(a.name)+'">'+(a.img?'🖼':'📄')+' <b>'+esc(a.name)+'</b><button data-drop="'+esc(a.name)+'" title="빼기">×</button></span>').join('')+'</div>'
+        +'<div class="attl" id="ednew"></div>'
+        +'<div class="row" style="margin-top:8px"><button class="pri" id="edgo">수정하고 다시 시작</button><label class="attb">파일 추가<input type="file" id="edf" multiple hidden></label><button id="edno">취소</button></div></div>';
     }else if(j.status==='failed'||j.status==='cancelled'){
-      act='<div class="row" style="margin:10px 0"><select id="st" style="width:auto">'+opts.replace(' selected','')+'</select><button class="pri" id="rt">다시 시도</button></div>';
+      act='<div class="row" style="margin:10px 0"><button class="pri" id="ed">요청 수정</button><select id="st" style="width:auto">'+opts.replace(' selected','')+'</select><button id="rt">그대로 다시 시도</button></div>';
     }else if(j.status==='deploying'){
       act='<div class="vd">승인됨 - GitHub 저장소에 반영하는 중입니다…</div>';
     }else if(j.status==='approved'&&j.release_state==='pending'){
@@ -347,6 +354,17 @@ function bindJob(j){
   if(q('#rj'))q('#rj').onclick=()=>{const fb=q('#fb').value.trim();if(!fb){toast('수정 요청 내용을 적어주세요');return}run(()=>post(url+'/restart',{feedback:fb,start:q('#st').value}),'다시 작업을 시작합니다')};
   if(q('#rt'))q('#rt').onclick=()=>run(()=>post(url+'/restart',{start:q('#st').value}),'다시 시작합니다');
   if(q('#cn'))q('#cn').onclick=()=>{if(confirm('작업을 중단할까요?'))run(()=>post(url+'/cancel'),'중단 요청')};
+  if(q('#ed'))q('#ed').onclick=()=>{EDIT=j.id;EDNEW=[];EDDROP=[];last={};tick(false)};
+  if(q('#edno'))q('#edno').onclick=()=>{EDIT=null;last={};tick(false)};
+  if(q('#cne'))q('#cne').onclick=async()=>{try{await post(url+'/cancel');EDIT=j.id;EDNEW=[];EDDROP=[];toast('중단했습니다. 요청을 고쳐 다시 시작하세요');last={};tick(false)}catch(e){toast(e.message)}};
+  if(q('#edatt'))q('#edatt').querySelectorAll('[data-drop]').forEach(b=>b.onclick=()=>{EDDROP.push(b.dataset.drop);b.closest('.attc').remove()});
+  if(q('#edf'))q('#edf').onchange=e=>{for(const f of e.target.files){if(f.size>10*1024*1024){toast(f.name+': 10MB를 넘습니다');continue}EDNEW.push(f)}e.target.value='';
+    q('#ednew').innerHTML=EDNEW.map(f=>'<span class="attc">➕ <b>'+esc(f.name)+'</b><span style="color:var(--mute)">'+fmtB(f.size)+'</span></span>').join('')};
+  if(q('#edgo'))q('#edgo').onclick=async e=>{const t=q('#edtx').value.trim();if(!t){toast('요청 내용을 입력하세요');return}
+    e.target.disabled=true;
+    try{const files=await Promise.all(EDNEW.map(async f=>({name:f.name,data:await b64(f)})));
+      await post(url+'/edit',{request:t,remove:EDDROP,files});EDIT=null;toast('수정한 요청으로 다시 시작합니다');last={};await loadList();tick(false)}
+    catch(err){toast(err.message);e.target.disabled=false}};
   if(q('#rel'))q('#rel').onclick=()=>{if(confirm('테스트 서버에서 확인을 마쳤나요?\n운영에 반영하면 1~3분 안에 실서버에 배포됩니다.'))run(()=>post(base()+'/repo/release',{job:j.id}),'운영 반영 완료 - 1~3분 안에 실서버에 배포됩니다')};
   if(q('#jdel'))q('#jdel').onclick=async()=>{if(!confirm('이 작업을 삭제할까요?\n요청·중간 결과·최종본·로그가 모두 지워지고 되돌릴 수 없습니다.'+(j.status==='approved'?'\n(이미 GitHub에 반영된 코드는 그대로 남습니다)':'')))return;try{await post(url+'/delete');toast('삭제했습니다');sel=null;last={};$('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>';await loadList()}catch(e){toast(e.message)}};
   if(q('#qago'))q('#qago').onclick=()=>{const a=q('#qa').value.trim();if(!a){toast('답변을 적어주세요');return}run(()=>post(url+'/restart',{feedback:a,start:j.step}),'답변을 반영해 이어서 진행합니다')};
@@ -359,7 +377,7 @@ function selectJob(id){
 }
 $('#jclean').onclick=async()=>{const d=prompt('승인 완료·실패·중단된 작업을 삭제합니다.\n며칠 지난 작업만 지울까요? (0 = 전부)','7');if(d===null)return;const n=parseInt(d);if(isNaN(n)||n<0){toast('숫자를 입력하세요');return}try{const r=await post(base()+'/jobs/delete-many',{older_days:n});toast(r.deleted+'개 작업을 삭제했습니다');if(sel&&!(await api(base()+'/jobs')).jobs.some(x=>x.id===sel)){sel=null;$('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>'}last={};await loadList()}catch(e){toast(e.message)}};
 $('#jobs').onclick=e=>{const j=e.target.closest('.job');if(j)selectJob(j.dataset.id)};
-let ATT=[];
+let ATT=[],EDIT=null,EDNEW=[],EDDROP=[];
 const fmtB=n=>n>1048576?(n/1048576).toFixed(1)+'MB':Math.ceil(n/1024)+'KB';
 function addFiles(list){
   for(const f of list){

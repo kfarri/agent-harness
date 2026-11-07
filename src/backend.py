@@ -1187,6 +1187,12 @@ def repo_prepare(job, proj):
     git(d, "fetch", "origin", base, timeout=300, proj=proj)
     git(d, "reset", "--hard", "-q", proj=proj)
     git(d, "clean", "-fdq", proj=proj)
+    if job.get("fresh_branch"):
+        # 요청을 고쳤으면 예전 시도의 코드 변경은 버리고 기준 브랜치에서 새로 시작한다
+        git(d, "checkout", "-q", "--detach", "origin/" + base, proj=proj)
+        git(d, "branch", "-D", br, check=False, proj=proj)
+        set_state(job, fresh_branch=False)
+        event(job, "system", "요청이 바뀌어 예전 코드 변경은 버리고 %s 기준으로 새로 시작" % base)
     if git(d, "rev-parse", "--verify", "--quiet", "refs/heads/" + br, check=False, proj=proj).returncode == 0:
         git(d, "checkout", "-q", br, proj=proj)
         if git(d, "rebase", "-q", "origin/" + base, check=False, proj=proj).returncode:
@@ -1815,13 +1821,13 @@ def att_name(name, used):
     return out
 
 
-def save_attachments(proj, jid, files):
+def save_attachments(proj, jid, files, keep=()):
     """GUI에서 올린 파일(base64)을 inbox/<작업ID>_files/ 에 저장한다. 에이전트는 필요할 때 Read로 연다."""
     if not files:
         return []
     if not isinstance(files, list) or len(files) > ATT_COUNT:
         raise ApiError(400, "첨부는 최대 %d개까지입니다" % ATT_COUNT)
-    out, used, total = [], set(), 0
+    out, used, total = [], set(keep), 0
     blobs = []
     for f in files:
         try:
@@ -1898,6 +1904,48 @@ def job_restart(proj, j, b):
     label = "처음" if start == "first" else next(s["name"] for s in act if s["id"] == start)
     event(j, "user", "수정 요청으로 %s 단계부터 다시 시작%s" % (label, (": " + fb[:120]) if fb else ""))
     QUEUE.put((proj["id"], j["id"], start))
+    return job_summary(j)
+
+
+def job_edit(proj, j, b):
+    """중단·실패한 작업의 요청 내용(과 첨부)을 고쳐서 처음부터 다시 시작한다."""
+    if j["status"] not in ("failed", "cancelled"):
+        raise ApiError(409, "진행 중이거나 끝난 작업은 고칠 수 없습니다. 먼저 작업을 중단하세요")
+    text = str(b.get("request") or "").strip()
+    if not text:
+        raise ApiError(400, "요청 내용을 입력하세요")
+    if len(text) > 20000:
+        raise ApiError(400, "요청이 너무 깁니다")
+    jid, d = j["id"], att_dir(proj, j["id"])
+    for name in b.get("remove") or []:
+        f = d / Path(str(name)).name
+        if f.is_file() and f.resolve().parent == d.resolve():
+            f.unlink()
+    keep = [x["name"] for x in att_list(proj, jid)]
+    if len(keep) + len(b.get("files") or []) > ATT_COUNT:
+        raise ApiError(400, "첨부는 최대 %d개까지입니다" % ATT_COUNT)
+    added = save_attachments(proj, jid, b.get("files"), keep)
+    fpath(proj, "request", jid).write_text(text + "\n")
+    # 예전 요청으로 만든 중간 결과는 지워서 에이전트가 섞어 읽지 않게 한다
+    for f in proj_dirs(proj)["handoff"].glob("*_%s.md" % jid):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    for k in ("final", "diff"):
+        try:
+            fpath(proj, k, jid).unlink()
+        except OSError:
+            pass
+    upd = {"title": text.splitlines()[0][:60], "status": "queued", "feedback": "", "error": "", "cancel": False,
+           "needs_input": False, "question": "", "fresh_branch": bool(repo_on(proj))}
+    if proj.get("stage_mode") == "auto":
+        upd["stages"] = None
+    act = job_stage_src(proj, j)
+    upd["step"] = act[0]["id"] if act else ""
+    set_state(j, **upd)
+    event(j, "user", "요청 수정 후 처음부터 다시 시작" + (" · 첨부 %d개 추가" % len(added) if added else ""))
+    QUEUE.put((proj["id"], jid, "first"))
     return job_summary(j)
 
 
@@ -3016,12 +3064,13 @@ def r_job_delete_many(m, b):
     return job_delete_many(proj_of(m[1]), b)
 
 
-@route("POST", r"/api/projects/([^/]+)/jobs/([^/]+)/(approve|restart|cancel|delete)")
+@route("POST", r"/api/projects/([^/]+)/jobs/([^/]+)/(approve|restart|cancel|delete|edit)")
 def r_job_action(m, b):
     proj = proj_of(m[1])
     j = job_of(proj, m[2])
     return {"approve": lambda: job_approve(proj, j), "restart": lambda: job_restart(proj, j, b),
-            "cancel": lambda: job_cancel(proj, j), "delete": lambda: job_delete(proj, j)}[m[3]]()
+            "cancel": lambda: job_cancel(proj, j), "delete": lambda: job_delete(proj, j),
+            "edit": lambda: job_edit(proj, j, b)}[m[3]]()
 
 
 @route("POST", r"/api/plan", lock=False)
@@ -3521,7 +3570,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.js(415, {"error": "JSON만 허용"})
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            big = re.match(r"^/api/projects/[^/]+/jobs$", urlparse(self.path).path)
+            big = re.match(r"^/api/projects/[^/]+/jobs(/[^/]+/edit)?$", urlparse(self.path).path)
             if n > (30_000_000 if big else 300_000):
                 return self.js(413, {"error": "요청이 너무 큼"})
             body = json.loads(self.rfile.read(n) or b"{}")
