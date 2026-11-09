@@ -60,7 +60,7 @@ button:disabled{opacity:.5;cursor:default}
 @media (max-width:700px){.usagebar{left:10px;right:auto}}
 .chip.relwait{background:color-mix(in srgb,#d08a1c 20%,transparent);color:#b0700a}
 .chip.approved{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok)}
-.chip.failed,.chip.cancelled{background:color-mix(in srgb,var(--err) 18%,transparent);color:var(--err)}
+.chip.failed,.chip.cancelled,.chip.reverted{background:color-mix(in srgb,var(--err) 18%,transparent);color:var(--err)}
 .empty{color:var(--mute);text-align:center;padding:60px 10px}
 .title{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:4px}
 .title h2{font-size:18px;margin:0;color:var(--ink)}
@@ -201,7 +201,7 @@ main.card#main{padding:24px 28px;min-height:calc(100vh - 160px)}
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const STATUS={queued:'대기',running:'진행 중',awaiting_user:'승인 대기',approved:'승인 완료',deploying:'반영 중',failed:'실패',cancelled:'중단'};
+const STATUS={queued:'대기',running:'진행 중',awaiting_user:'승인 대기',approved:'승인 완료',deploying:'반영 중',failed:'실패',cancelled:'중단',reverted:'되돌림'};
 const AG={system:'시스템',user:'나'};
 let P=[],cur=null,view='jobs',settings={},flags={},presets=[],pj=null;
 let sel=null,tab=null,tabPinned=false,last={},busy=false,tickN=0;
@@ -300,7 +300,7 @@ async function loadDetail(force){
   const keys=steps.map(s=>s[0]);
   if(!tabPinned&&f.approved!=null&&d.repo){tab='approved'}else if(!tabPinned){const w=d.stages.slice().reverse().find(s=>s.kind==='work'&&f[s.id]!=null);tab=f.final?'final':(w?w.id:((j.status==='running'||j.status==='queued')?'log':'request'))}
   const nS=stg.length;
-  const ci=j.needs_input?Math.max(0,keys.indexOf(j.step)):(j.status==='awaiting_user'||j.status==='deploying')?nS:j.status==='approved'?nS+1:Math.max(0,keys.indexOf(j.step));
+  const ci=j.needs_input?Math.max(0,keys.indexOf(j.step)):(j.status==='awaiting_user'||j.status==='deploying')?nS:(j.status==='approved'||j.status==='reverted')?nS+1:Math.max(0,keys.indexOf(j.step));
   const st=i=>i<ci?'done':i===ci?((j.status==='failed'||j.status==='cancelled')?'err':(j.status==='running'||j.status==='awaiting_user'||j.status==='deploying')?'active':'wait'):'wait';
   const u=j.usage||{};
   const bys=Object.entries(u.by_stage||{}).map(([k,v])=>{const s=d.stages.find(x=>x.id===k);return esc(s?s.name:(k==='plan'?'자동 구성':k))+' '+fmtN(newTok(v))}).join(' · ');
@@ -331,13 +331,16 @@ async function loadDetail(force){
         +'<div class="row" style="margin-top:8px"><select id="st" style="width:auto">'+opts+'</select><button id="rj">반려하고 다시 작업</button></div></div>';
     }else if(j.status==='running'||j.status==='queued'){
       act='<div class="row" style="margin:10px 0"><button class="dng" id="cn">작업 중단</button><button id="cne">중단하고 요청 수정</button></div>';
-    }else if((j.status==='failed'||j.status==='cancelled')&&EDIT===j.id){
+    }else if((j.status==='failed'||j.status==='cancelled'||j.status==='reverted')&&EDIT===j.id){
       const at=d.attachments||[];
       act='<div class="card approve"><h3>요청 수정</h3><div class="sub">고친 요청으로 처음부터 다시 작업합니다. 이전 시도의 중간 결과'+(d.repo?'와 코드 변경':'')+'은 버립니다.</div>'
         +'<textarea id="edtx" style="min-height:140px">'+esc((f.request||'').replace(/\n$/,''))+'</textarea>'
         +'<div class="attl" id="edatt">'+at.map(a=>'<span class="attc" data-keep="'+esc(a.name)+'">'+(a.img?'🖼':'📄')+' <b>'+esc(a.name)+'</b><button data-drop="'+esc(a.name)+'" title="빼기">×</button></span>').join('')+'</div>'
         +'<div class="attl" id="ednew"></div>'
         +'<div class="row" style="margin-top:8px"><button class="pri" id="edgo">수정하고 다시 시작</button><label class="attb">파일 추가<input type="file" id="edf" multiple hidden></label><button id="edno">취소</button></div></div>';
+    }else if(j.status==='reverted'){
+      act='<div class="card"><h3 style="margin:0 0 6px">테스트 서버에서 되돌린 작업</h3><div class="sub">'+(j.reverted_at?esc(j.reverted_at.slice(5,16))+'에 ':'')+'이 작업의 코드 변경을 되돌렸습니다. 테스트 서버는 1~3분 안에 이전 상태로 다시 배포됩니다. 다시 하고 싶으면 요청을 고쳐서 새로 작업하세요.</div>'
+        +'<div class="row"><button class="pri" id="ed">요청 수정해서 다시 작업</button></div></div>';
     }else if(j.status==='failed'||j.status==='cancelled'){
       act='<div class="row" style="margin:10px 0"><button class="pri" id="ed">요청 수정</button><select id="st" style="width:auto">'+opts.replace(' selected','')+'</select><button id="rt">그대로 다시 시도</button></div>';
     }else if(j.status==='deploying'){
@@ -348,7 +351,8 @@ async function loadDetail(force){
         +'<div class="sub">테스트 서버에서 확인을 마쳤으면 운영에 올리세요. 바로 올리지 않아도 됩니다. 이 작업은 운영 대기 상태로 남아 있다가 원할 때 반영할 수 있습니다.'
         +(w.length?'<br><b>먼저 승인된 운영 대기 작업 '+w.length+'개도 함께 반영됩니다:</b> '+w.map(x=>esc(x.title)).join(', '):'')+'</div>'
         +'<div class="row">'+(d.repo&&d.repo.test_url?'<a class="attb" style="text-decoration:none" href="'+esc(d.repo.test_url)+'" target="_blank" rel="noopener">테스트 서버 열기 ↗</a>':'')
-        +'<button class="pri" id="rel">운영 반영</button></div></div>';
+        +'<button class="pri" id="rel">운영 반영</button><button class="dng" id="rvt">테스트 서버에서 되돌리기</button></div>'
+        +'<div class="vd" style="margin-top:6px">마음에 안 들면 \'되돌리기\'로 테스트 서버를 이 작업 이전 상태로 돌립니다. 조금만 고치면 되는 경우엔 아래 \'이어서 수정 요청\'이 더 편합니다.</div></div>';
     }else if(j.status==='approved'&&j.release_state==='none'){
       act='<div class="vd">이 작업은 바뀐 코드가 없어 테스트·운영 서버에 올라간 것이 없습니다 (분석·설계 요청 등). 운영 반영할 내용이 없습니다.</div>';
     }else if(j.status==='approved'&&j.release_state==='released'){
@@ -356,7 +360,7 @@ async function loadDetail(force){
     }else if(j.status==='approved'){
       act='<div class="vd">승인 완료: shared/outbox/approved_'+esc(j.id)+'.md'+(d.repo?' · 반영 결과는 \'승인본\' 탭에서 확인':'')+'</div>';
     }
-    if(['awaiting_user','approved','failed','cancelled'].includes(j.status))act+='<div class="row" style="margin:6px 0 10px;justify-content:flex-end"><button class="dng" id="jdel" style="font-size:12px;padding:5px 10px">작업 삭제</button></div>';
+    if(['awaiting_user','approved','failed','cancelled','reverted'].includes(j.status))act+='<div class="row" style="margin:6px 0 10px;justify-content:flex-end"><button class="dng" id="jdel" style="font-size:12px;padding:5px 10px">작업 삭제</button></div>';
     const at=d.attachments||[];
     if(at.length)act='<div class="atts">'+at.map(a=>{const u=base()+'/jobs/'+encodeURIComponent(j.id)+'/files/'+encodeURIComponent(a.name);return '<a href="'+u+'" target="_blank" rel="noopener">'+(a.img?'<img src="'+u+'" alt="'+esc(a.name)+'">':'📄 '+esc(a.name)+' <span style="color:var(--mute)">'+fmtB(a.size)+'</span>')+'</a>'}).join('')+'</div>'+act;
     if(j.status==='approved'){
@@ -413,6 +417,7 @@ function bindJob(j){
     try{const files=await Promise.all(EDNEW.map(async f=>({name:f.name,data:await b64(f)})));
       await post(url+'/edit',{request:t,remove:EDDROP,files});EDIT=null;toast('수정한 요청으로 다시 시작합니다');last={};await loadList();tick(false)}
     catch(err){toast(err.message);e.target.disabled=false}};
+  if(q('#rvt'))q('#rvt').onclick=()=>{if(confirm('이 작업의 코드 변경을 테스트 서버에서 되돌릴까요?\n(운영 서버에는 영향 없음, 1~3분 안에 테스트 서버가 이전 상태로 배포됩니다)'))run(()=>post(url+'/revert',{}),'되돌렸습니다 - 1~3분 안에 테스트 서버에 반영됩니다')};
   if(q('#rel'))q('#rel').onclick=()=>{if(confirm('테스트 서버에서 확인을 마쳤나요?\n운영에 반영하면 1~3분 안에 실서버에 배포됩니다.'))run(()=>post(base()+'/repo/release',{job:j.id}),'운영 반영 완료 - 1~3분 안에 실서버에 배포됩니다')};
   if(q('#jdel'))q('#jdel').onclick=async()=>{if(!confirm('이 작업을 삭제할까요?\n요청·중간 결과·최종본·로그가 모두 지워지고 되돌릴 수 없습니다.'+(j.status==='approved'?'\n(이미 GitHub에 반영된 코드는 그대로 남습니다)':'')))return;try{await post(url+'/delete');toast('삭제했습니다');sel=null;last={};$('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>';await loadList()}catch(e){toast(e.message)}};
   if(q('#qago'))q('#qago').onclick=()=>{const a=q('#qa').value.trim();if(!a){toast('답변을 적어주세요');return}run(()=>post(url+'/restart',{feedback:a,start:j.step}),'답변을 반영해 이어서 진행합니다')};

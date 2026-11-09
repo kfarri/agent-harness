@@ -1565,6 +1565,58 @@ def repo_deliver(proj, j, summary_src):
     notify_job(j, "approved")
 
 
+
+def repo_revert(proj, j):
+    """승인해 테스트 서버(기준 브랜치)에 올라간 작업을 되돌린다. 운영에는 아직 안 올라간 작업만.
+    이 작업의 병합 커밋(이어서 수정한 것 포함)을 최신 것부터 git revert 해서 푸시한다(강제 푸시 없음)."""
+    jid, br = j["id"], job_branch(j["id"])
+    done, lines = [], []
+    with repo_lock(proj["id"]):
+        if j.get("status") != "approved" or j.get("release_state") != "pending" or not job_merges(j):
+            raise ApiError(409, "테스트 서버에만 반영되고 아직 운영에 올리지 않은 작업만 되돌릴 수 있습니다")
+        try:
+            for r in repos_of(proj):
+                if r["id"] not in job_merges(j):
+                    continue
+                base, name = rbase(r), r.get("name", r["id"])
+                G(proj, r, "fetch", "origin", base, timeout=300)
+                if r.get("release"):
+                    G(proj, r, "fetch", "origin", r["release"], timeout=300)
+                G(proj, r, "reset", "--hard", "-q")
+                G(proj, r, "checkout", "-q", "-B", base, "origin/" + base)
+                done.append(r)
+                shas = G(proj, r, "log", "origin/" + base, "--merges", "--format=%H",
+                         "--grep=^Merge %s:" % br).split()
+                gone = set(re.findall(r"This reverts commit ([0-9a-f]{40})", G(proj, r, "log", "origin/" + base,
+                           "--format=%b", "--grep=^Revert \"Merge %s:" % br)))
+                shas = [x for x in shas if x not in gone]   # 예전에 이미 되돌린 병합은 빼고
+                if r.get("release") and any(is_anc(proj, r, x, "origin/" + r["release"]) for x in shas):
+                    raise ApiError(409, "%s: 이 작업의 일부가 이미 운영에 올라가 있습니다. 운영 반영 이력에서 먼저 되돌리세요" % name)
+                for x in shas:
+                    res = G(proj, r, "revert", "-m", "1", "--no-edit", x, check=False)
+                    if res.returncode:
+                        G(proj, r, "revert", "--abort", check=False)
+                        raise ApiError(409, "%s: 이 작업 뒤에 승인된 다른 작업이 같은 부분을 고쳐서 자동으로 되돌릴 수 없습니다. "
+                                            "나중 작업을 먼저 되돌리거나, 되돌리는 내용을 새 작업으로 요청하세요" % name)
+                lines.append("- %s: 병합 %d건 되돌림" % (name, len(shas)))
+            for r in done:   # 모든 저장소에서 되돌리기가 되는 걸 확인한 뒤에 푸시
+                base = rbase(r)
+                G(proj, r, "push", "-q", "origin", "%s:%s" % (base, base), timeout=300)
+                if r.get("deploy"):
+                    run_shell(j, proj, r, r["deploy"], "deploy")
+        except Exception:
+            for r in done:
+                G(proj, r, "reset", "--hard", "-q", "origin/" + rbase(r), check=False)
+            raise
+    set_state(j, status="reverted", release_state="none", merges={}, merge_sha="", reverted_at=now())
+    event(j, "user", "테스트 서버에서 되돌림\n" + "\n".join(lines), "warn")
+    ap = fpath(proj, "approved", jid)
+    if ap.exists():
+        ap.write_text((read_text(ap) or "").rstrip() + "\n\n## 되돌림 (%s)\n%s\n- 테스트 서버에 1~3분 안에 이전 상태로 배포됩니다\n"
+                      % (now()[:16], "\n".join(lines)))
+    return job_summary(j)
+
+
 def repo_drop_branch(proj, jid):
     with repo_lock(proj["id"]):
         br = job_branch(jid)
@@ -2244,7 +2296,8 @@ def project_detail(proj):
 def job_summary(j):
     return {k: j[k] for k in ("id", "title", "status", "step", "created", "updated")} | \
         {"tokens": new_tokens(j.get("usage") or {}), "needs_input": bool(j.get("needs_input")),
-         "release_state": j.get("release_state", ""), "released_at": j.get("released_at", "")}
+         "release_state": j.get("release_state", ""), "released_at": j.get("released_at", ""),
+         "reverted_at": j.get("reverted_at", "")}
 
 
 def job_detail(proj, j):
@@ -2401,7 +2454,7 @@ def job_restart(proj, j, b):
 
 def job_edit(proj, j, b):
     """중단·실패한 작업의 요청 내용(과 첨부)을 고쳐서 처음부터 다시 시작한다."""
-    if j["status"] not in ("failed", "cancelled"):
+    if j["status"] not in ("failed", "cancelled", "reverted"):
         raise ApiError(409, "진행 중이거나 끝난 작업은 고칠 수 없습니다. 먼저 작업을 중단하세요")
     text = str(b.get("request") or "").strip()
     if not text:
@@ -2504,7 +2557,7 @@ def job_cancel(proj, j):
     return job_summary(j)
 
 
-DELETABLE = ("awaiting_user", "approved", "failed", "cancelled")
+DELETABLE = ("awaiting_user", "approved", "failed", "cancelled", "reverted")
 
 
 def job_delete(proj, j):
@@ -2535,7 +2588,7 @@ def job_delete(proj, j):
 
 
 def job_delete_many(proj, b):
-    sts = [x for x in (b.get("status") or []) if x in DELETABLE] or ["approved", "failed", "cancelled"]
+    sts = [x for x in (b.get("status") or []) if x in DELETABLE] or ["approved", "failed", "cancelled", "reverted"]
     days = max(0, int(b.get("older_days") or 0))
     cut = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - days * 86400))
     n = 0
@@ -2789,7 +2842,7 @@ def tg_jobs_text(proj):
     if not js:
         return "아직 작업이 없습니다.", None
     st = {"queued": "대기", "running": "진행 중", "awaiting_user": "승인 대기", "approved": "완료", "deploying": "반영 중",
-          "failed": "실패", "cancelled": "중단"}
+          "failed": "실패", "cancelled": "중단", "reverted": "되돌림"}
     lines, btns = ["[%s] 최근 작업" % proj["name"]], []
     for j in js:
         lines.append("· %s — %s (%s)" % (j["title"][:40], st.get(j["status"], j["status"]), j["created"][5:16]))
@@ -3579,13 +3632,18 @@ def r_job_delete_many(m, b):
     return job_delete_many(proj_of(m[1]), b)
 
 
-@route("POST", r"/api/projects/([^/]+)/jobs/([^/]+)/(approve|restart|cancel|delete|edit|followup)")
+@route("POST", r"/api/projects/([^/]+)/jobs/([^/]+)/(approve|restart|cancel|delete|edit|followup|revert)", lock=False)
 def r_job_action(m, b):
     proj = proj_of(m[1])
     j = job_of(proj, m[2])
-    return {"approve": lambda: job_approve(proj, j), "restart": lambda: job_restart(proj, j, b),
+    fn = {"approve": lambda: job_approve(proj, j), "restart": lambda: job_restart(proj, j, b),
             "cancel": lambda: job_cancel(proj, j), "delete": lambda: job_delete(proj, j),
-            "edit": lambda: job_edit(proj, j, b), "followup": lambda: job_followup(proj, j, b)}[m[3]]()
+            "edit": lambda: job_edit(proj, j, b), "followup": lambda: job_followup(proj, j, b),
+           "revert": lambda: repo_revert(proj, j)}[m[3]]
+    if m[3] == "revert":   # git 작업이라 오래 걸릴 수 있어 전체 잠금 없이 실행
+        return fn()
+    with LOCK:
+        return fn()
 
 
 @route("POST", r"/api/plan", lock=False)

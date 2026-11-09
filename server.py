@@ -1565,6 +1565,58 @@ def repo_deliver(proj, j, summary_src):
     notify_job(j, "approved")
 
 
+
+def repo_revert(proj, j):
+    """승인해 테스트 서버(기준 브랜치)에 올라간 작업을 되돌린다. 운영에는 아직 안 올라간 작업만.
+    이 작업의 병합 커밋(이어서 수정한 것 포함)을 최신 것부터 git revert 해서 푸시한다(강제 푸시 없음)."""
+    jid, br = j["id"], job_branch(j["id"])
+    done, lines = [], []
+    with repo_lock(proj["id"]):
+        if j.get("status") != "approved" or j.get("release_state") != "pending" or not job_merges(j):
+            raise ApiError(409, "테스트 서버에만 반영되고 아직 운영에 올리지 않은 작업만 되돌릴 수 있습니다")
+        try:
+            for r in repos_of(proj):
+                if r["id"] not in job_merges(j):
+                    continue
+                base, name = rbase(r), r.get("name", r["id"])
+                G(proj, r, "fetch", "origin", base, timeout=300)
+                if r.get("release"):
+                    G(proj, r, "fetch", "origin", r["release"], timeout=300)
+                G(proj, r, "reset", "--hard", "-q")
+                G(proj, r, "checkout", "-q", "-B", base, "origin/" + base)
+                done.append(r)
+                shas = G(proj, r, "log", "origin/" + base, "--merges", "--format=%H",
+                         "--grep=^Merge %s:" % br).split()
+                gone = set(re.findall(r"This reverts commit ([0-9a-f]{40})", G(proj, r, "log", "origin/" + base,
+                           "--format=%b", "--grep=^Revert \"Merge %s:" % br)))
+                shas = [x for x in shas if x not in gone]   # 예전에 이미 되돌린 병합은 빼고
+                if r.get("release") and any(is_anc(proj, r, x, "origin/" + r["release"]) for x in shas):
+                    raise ApiError(409, "%s: 이 작업의 일부가 이미 운영에 올라가 있습니다. 운영 반영 이력에서 먼저 되돌리세요" % name)
+                for x in shas:
+                    res = G(proj, r, "revert", "-m", "1", "--no-edit", x, check=False)
+                    if res.returncode:
+                        G(proj, r, "revert", "--abort", check=False)
+                        raise ApiError(409, "%s: 이 작업 뒤에 승인된 다른 작업이 같은 부분을 고쳐서 자동으로 되돌릴 수 없습니다. "
+                                            "나중 작업을 먼저 되돌리거나, 되돌리는 내용을 새 작업으로 요청하세요" % name)
+                lines.append("- %s: 병합 %d건 되돌림" % (name, len(shas)))
+            for r in done:   # 모든 저장소에서 되돌리기가 되는 걸 확인한 뒤에 푸시
+                base = rbase(r)
+                G(proj, r, "push", "-q", "origin", "%s:%s" % (base, base), timeout=300)
+                if r.get("deploy"):
+                    run_shell(j, proj, r, r["deploy"], "deploy")
+        except Exception:
+            for r in done:
+                G(proj, r, "reset", "--hard", "-q", "origin/" + rbase(r), check=False)
+            raise
+    set_state(j, status="reverted", release_state="none", merges={}, merge_sha="", reverted_at=now())
+    event(j, "user", "테스트 서버에서 되돌림\n" + "\n".join(lines), "warn")
+    ap = fpath(proj, "approved", jid)
+    if ap.exists():
+        ap.write_text((read_text(ap) or "").rstrip() + "\n\n## 되돌림 (%s)\n%s\n- 테스트 서버에 1~3분 안에 이전 상태로 배포됩니다\n"
+                      % (now()[:16], "\n".join(lines)))
+    return job_summary(j)
+
+
 def repo_drop_branch(proj, jid):
     with repo_lock(proj["id"]):
         br = job_branch(jid)
@@ -2244,7 +2296,8 @@ def project_detail(proj):
 def job_summary(j):
     return {k: j[k] for k in ("id", "title", "status", "step", "created", "updated")} | \
         {"tokens": new_tokens(j.get("usage") or {}), "needs_input": bool(j.get("needs_input")),
-         "release_state": j.get("release_state", ""), "released_at": j.get("released_at", "")}
+         "release_state": j.get("release_state", ""), "released_at": j.get("released_at", ""),
+         "reverted_at": j.get("reverted_at", "")}
 
 
 def job_detail(proj, j):
@@ -2401,7 +2454,7 @@ def job_restart(proj, j, b):
 
 def job_edit(proj, j, b):
     """중단·실패한 작업의 요청 내용(과 첨부)을 고쳐서 처음부터 다시 시작한다."""
-    if j["status"] not in ("failed", "cancelled"):
+    if j["status"] not in ("failed", "cancelled", "reverted"):
         raise ApiError(409, "진행 중이거나 끝난 작업은 고칠 수 없습니다. 먼저 작업을 중단하세요")
     text = str(b.get("request") or "").strip()
     if not text:
@@ -2504,7 +2557,7 @@ def job_cancel(proj, j):
     return job_summary(j)
 
 
-DELETABLE = ("awaiting_user", "approved", "failed", "cancelled")
+DELETABLE = ("awaiting_user", "approved", "failed", "cancelled", "reverted")
 
 
 def job_delete(proj, j):
@@ -2535,7 +2588,7 @@ def job_delete(proj, j):
 
 
 def job_delete_many(proj, b):
-    sts = [x for x in (b.get("status") or []) if x in DELETABLE] or ["approved", "failed", "cancelled"]
+    sts = [x for x in (b.get("status") or []) if x in DELETABLE] or ["approved", "failed", "cancelled", "reverted"]
     days = max(0, int(b.get("older_days") or 0))
     cut = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - days * 86400))
     n = 0
@@ -2789,7 +2842,7 @@ def tg_jobs_text(proj):
     if not js:
         return "아직 작업이 없습니다.", None
     st = {"queued": "대기", "running": "진행 중", "awaiting_user": "승인 대기", "approved": "완료", "deploying": "반영 중",
-          "failed": "실패", "cancelled": "중단"}
+          "failed": "실패", "cancelled": "중단", "reverted": "되돌림"}
     lines, btns = ["[%s] 최근 작업" % proj["name"]], []
     for j in js:
         lines.append("· %s — %s (%s)" % (j["title"][:40], st.get(j["status"], j["status"]), j["created"][5:16]))
@@ -3579,13 +3632,18 @@ def r_job_delete_many(m, b):
     return job_delete_many(proj_of(m[1]), b)
 
 
-@route("POST", r"/api/projects/([^/]+)/jobs/([^/]+)/(approve|restart|cancel|delete|edit|followup)")
+@route("POST", r"/api/projects/([^/]+)/jobs/([^/]+)/(approve|restart|cancel|delete|edit|followup|revert)", lock=False)
 def r_job_action(m, b):
     proj = proj_of(m[1])
     j = job_of(proj, m[2])
-    return {"approve": lambda: job_approve(proj, j), "restart": lambda: job_restart(proj, j, b),
+    fn = {"approve": lambda: job_approve(proj, j), "restart": lambda: job_restart(proj, j, b),
             "cancel": lambda: job_cancel(proj, j), "delete": lambda: job_delete(proj, j),
-            "edit": lambda: job_edit(proj, j, b), "followup": lambda: job_followup(proj, j, b)}[m[3]]()
+            "edit": lambda: job_edit(proj, j, b), "followup": lambda: job_followup(proj, j, b),
+           "revert": lambda: repo_revert(proj, j)}[m[3]]
+    if m[3] == "revert":   # git 작업이라 오래 걸릴 수 있어 전체 잠금 없이 실행
+        return fn()
+    with LOCK:
+        return fn()
 
 
 @route("POST", r"/api/plan", lock=False)
@@ -4270,7 +4328,7 @@ button:disabled{opacity:.5;cursor:default}
 @media (max-width:700px){.usagebar{left:10px;right:auto}}
 .chip.relwait{background:color-mix(in srgb,#d08a1c 20%,transparent);color:#b0700a}
 .chip.approved{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok)}
-.chip.failed,.chip.cancelled{background:color-mix(in srgb,var(--err) 18%,transparent);color:var(--err)}
+.chip.failed,.chip.cancelled,.chip.reverted{background:color-mix(in srgb,var(--err) 18%,transparent);color:var(--err)}
 .empty{color:var(--mute);text-align:center;padding:60px 10px}
 .title{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:4px}
 .title h2{font-size:18px;margin:0;color:var(--ink)}
@@ -4411,7 +4469,7 @@ main.card#main{padding:24px 28px;min-height:calc(100vh - 160px)}
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const STATUS={queued:'대기',running:'진행 중',awaiting_user:'승인 대기',approved:'승인 완료',deploying:'반영 중',failed:'실패',cancelled:'중단'};
+const STATUS={queued:'대기',running:'진행 중',awaiting_user:'승인 대기',approved:'승인 완료',deploying:'반영 중',failed:'실패',cancelled:'중단',reverted:'되돌림'};
 const AG={system:'시스템',user:'나'};
 let P=[],cur=null,view='jobs',settings={},flags={},presets=[],pj=null;
 let sel=null,tab=null,tabPinned=false,last={},busy=false,tickN=0;
@@ -4510,7 +4568,7 @@ async function loadDetail(force){
   const keys=steps.map(s=>s[0]);
   if(!tabPinned&&f.approved!=null&&d.repo){tab='approved'}else if(!tabPinned){const w=d.stages.slice().reverse().find(s=>s.kind==='work'&&f[s.id]!=null);tab=f.final?'final':(w?w.id:((j.status==='running'||j.status==='queued')?'log':'request'))}
   const nS=stg.length;
-  const ci=j.needs_input?Math.max(0,keys.indexOf(j.step)):(j.status==='awaiting_user'||j.status==='deploying')?nS:j.status==='approved'?nS+1:Math.max(0,keys.indexOf(j.step));
+  const ci=j.needs_input?Math.max(0,keys.indexOf(j.step)):(j.status==='awaiting_user'||j.status==='deploying')?nS:(j.status==='approved'||j.status==='reverted')?nS+1:Math.max(0,keys.indexOf(j.step));
   const st=i=>i<ci?'done':i===ci?((j.status==='failed'||j.status==='cancelled')?'err':(j.status==='running'||j.status==='awaiting_user'||j.status==='deploying')?'active':'wait'):'wait';
   const u=j.usage||{};
   const bys=Object.entries(u.by_stage||{}).map(([k,v])=>{const s=d.stages.find(x=>x.id===k);return esc(s?s.name:(k==='plan'?'자동 구성':k))+' '+fmtN(newTok(v))}).join(' · ');
@@ -4541,13 +4599,16 @@ async function loadDetail(force){
         +'<div class="row" style="margin-top:8px"><select id="st" style="width:auto">'+opts+'</select><button id="rj">반려하고 다시 작업</button></div></div>';
     }else if(j.status==='running'||j.status==='queued'){
       act='<div class="row" style="margin:10px 0"><button class="dng" id="cn">작업 중단</button><button id="cne">중단하고 요청 수정</button></div>';
-    }else if((j.status==='failed'||j.status==='cancelled')&&EDIT===j.id){
+    }else if((j.status==='failed'||j.status==='cancelled'||j.status==='reverted')&&EDIT===j.id){
       const at=d.attachments||[];
       act='<div class="card approve"><h3>요청 수정</h3><div class="sub">고친 요청으로 처음부터 다시 작업합니다. 이전 시도의 중간 결과'+(d.repo?'와 코드 변경':'')+'은 버립니다.</div>'
         +'<textarea id="edtx" style="min-height:140px">'+esc((f.request||'').replace(/\n$/,''))+'</textarea>'
         +'<div class="attl" id="edatt">'+at.map(a=>'<span class="attc" data-keep="'+esc(a.name)+'">'+(a.img?'🖼':'📄')+' <b>'+esc(a.name)+'</b><button data-drop="'+esc(a.name)+'" title="빼기">×</button></span>').join('')+'</div>'
         +'<div class="attl" id="ednew"></div>'
         +'<div class="row" style="margin-top:8px"><button class="pri" id="edgo">수정하고 다시 시작</button><label class="attb">파일 추가<input type="file" id="edf" multiple hidden></label><button id="edno">취소</button></div></div>';
+    }else if(j.status==='reverted'){
+      act='<div class="card"><h3 style="margin:0 0 6px">테스트 서버에서 되돌린 작업</h3><div class="sub">'+(j.reverted_at?esc(j.reverted_at.slice(5,16))+'에 ':'')+'이 작업의 코드 변경을 되돌렸습니다. 테스트 서버는 1~3분 안에 이전 상태로 다시 배포됩니다. 다시 하고 싶으면 요청을 고쳐서 새로 작업하세요.</div>'
+        +'<div class="row"><button class="pri" id="ed">요청 수정해서 다시 작업</button></div></div>';
     }else if(j.status==='failed'||j.status==='cancelled'){
       act='<div class="row" style="margin:10px 0"><button class="pri" id="ed">요청 수정</button><select id="st" style="width:auto">'+opts.replace(' selected','')+'</select><button id="rt">그대로 다시 시도</button></div>';
     }else if(j.status==='deploying'){
@@ -4558,7 +4619,8 @@ async function loadDetail(force){
         +'<div class="sub">테스트 서버에서 확인을 마쳤으면 운영에 올리세요. 바로 올리지 않아도 됩니다. 이 작업은 운영 대기 상태로 남아 있다가 원할 때 반영할 수 있습니다.'
         +(w.length?'<br><b>먼저 승인된 운영 대기 작업 '+w.length+'개도 함께 반영됩니다:</b> '+w.map(x=>esc(x.title)).join(', '):'')+'</div>'
         +'<div class="row">'+(d.repo&&d.repo.test_url?'<a class="attb" style="text-decoration:none" href="'+esc(d.repo.test_url)+'" target="_blank" rel="noopener">테스트 서버 열기 ↗</a>':'')
-        +'<button class="pri" id="rel">운영 반영</button></div></div>';
+        +'<button class="pri" id="rel">운영 반영</button><button class="dng" id="rvt">테스트 서버에서 되돌리기</button></div>'
+        +'<div class="vd" style="margin-top:6px">마음에 안 들면 \'되돌리기\'로 테스트 서버를 이 작업 이전 상태로 돌립니다. 조금만 고치면 되는 경우엔 아래 \'이어서 수정 요청\'이 더 편합니다.</div></div>';
     }else if(j.status==='approved'&&j.release_state==='none'){
       act='<div class="vd">이 작업은 바뀐 코드가 없어 테스트·운영 서버에 올라간 것이 없습니다 (분석·설계 요청 등). 운영 반영할 내용이 없습니다.</div>';
     }else if(j.status==='approved'&&j.release_state==='released'){
@@ -4566,7 +4628,7 @@ async function loadDetail(force){
     }else if(j.status==='approved'){
       act='<div class="vd">승인 완료: shared/outbox/approved_'+esc(j.id)+'.md'+(d.repo?' · 반영 결과는 \'승인본\' 탭에서 확인':'')+'</div>';
     }
-    if(['awaiting_user','approved','failed','cancelled'].includes(j.status))act+='<div class="row" style="margin:6px 0 10px;justify-content:flex-end"><button class="dng" id="jdel" style="font-size:12px;padding:5px 10px">작업 삭제</button></div>';
+    if(['awaiting_user','approved','failed','cancelled','reverted'].includes(j.status))act+='<div class="row" style="margin:6px 0 10px;justify-content:flex-end"><button class="dng" id="jdel" style="font-size:12px;padding:5px 10px">작업 삭제</button></div>';
     const at=d.attachments||[];
     if(at.length)act='<div class="atts">'+at.map(a=>{const u=base()+'/jobs/'+encodeURIComponent(j.id)+'/files/'+encodeURIComponent(a.name);return '<a href="'+u+'" target="_blank" rel="noopener">'+(a.img?'<img src="'+u+'" alt="'+esc(a.name)+'">':'📄 '+esc(a.name)+' <span style="color:var(--mute)">'+fmtB(a.size)+'</span>')+'</a>'}).join('')+'</div>'+act;
     if(j.status==='approved'){
@@ -4623,6 +4685,7 @@ function bindJob(j){
     try{const files=await Promise.all(EDNEW.map(async f=>({name:f.name,data:await b64(f)})));
       await post(url+'/edit',{request:t,remove:EDDROP,files});EDIT=null;toast('수정한 요청으로 다시 시작합니다');last={};await loadList();tick(false)}
     catch(err){toast(err.message);e.target.disabled=false}};
+  if(q('#rvt'))q('#rvt').onclick=()=>{if(confirm('이 작업의 코드 변경을 테스트 서버에서 되돌릴까요?\n(운영 서버에는 영향 없음, 1~3분 안에 테스트 서버가 이전 상태로 배포됩니다)'))run(()=>post(url+'/revert',{}),'되돌렸습니다 - 1~3분 안에 테스트 서버에 반영됩니다')};
   if(q('#rel'))q('#rel').onclick=()=>{if(confirm('테스트 서버에서 확인을 마쳤나요?\n운영에 반영하면 1~3분 안에 실서버에 배포됩니다.'))run(()=>post(base()+'/repo/release',{job:j.id}),'운영 반영 완료 - 1~3분 안에 실서버에 배포됩니다')};
   if(q('#jdel'))q('#jdel').onclick=async()=>{if(!confirm('이 작업을 삭제할까요?\n요청·중간 결과·최종본·로그가 모두 지워지고 되돌릴 수 없습니다.'+(j.status==='approved'?'\n(이미 GitHub에 반영된 코드는 그대로 남습니다)':'')))return;try{await post(url+'/delete');toast('삭제했습니다');sel=null;last={};$('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>';await loadList()}catch(e){toast(e.message)}};
   if(q('#qago'))q('#qago').onclick=()=>{const a=q('#qa').value.trim();if(!a){toast('답변을 적어주세요');return}run(()=>post(url+'/restart',{feedback:a,start:j.step}),'답변을 반영해 이어서 진행합니다')};
