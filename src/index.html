@@ -811,36 +811,53 @@ async function loadSettings(){
     try{await post('/api/telegram/update',{unpair:b.dataset.unpair});toast('해제했습니다');await loadSettings()}catch(e){toast(e.message)}});
 }
 
+function repoForm(st,i){
+  const r=st?st.cfg:{};const k=st?r.id:'new';const on=!!st;
+  const f=(id,lab,val,ph)=>'<label class="lb">'+lab+'<input type="text" data-f="'+id+'" value="'+esc(val||'')+'" placeholder="'+esc(ph||'')+'"></label>';
+  return '<div class="sc" data-repo="'+esc(k)+'"><div class="sch"><b>'+(on?i+1:'+')+'</b><strong style="flex:1">'+(on?esc(r.name||r.id)+' 저장소':'저장소 추가')+'</strong>'
+    +(on?'<span class="chip '+(st.cloned?'approved':'')+'">'+(st.cloned?'내려받음':'내려받기 전')+'</span>':'')+'</div><div class="scb">'
+    +'<div class="g2">'+f('name','이름 (화면·커밋에 표시)',r.name,'예: 프론트, API')+f('url','저장소 주소 (SSH)',r.url,'git@github.com:아이디/저장소.git')+'</div>'
+    +'<div class="g2">'+f('path','로컬 폴더',r.path||(on?'':'(비우면 자동)'),'')+f('branch','기준(테스트) 브랜치',r.branch||'main','develop')+'</div>'
+    +'<div class="g2">'+f('release','운영 브랜치 (비우면 승인 즉시 운영)',r.release,'main')+f('test_url','테스트 서버 주소 (선택)',r.test_url,'http://192.168.0.16:38080')+'</div>'
+    +f('build','빌드 확인 명령 (이 저장소가 바뀐 작업에서만 실행 · 비우면 생략)',r.build,'예: npm ci && npm run build')
+    +'<div class="g2"><label class="lb">승인 시 반영 방식<select data-f="merge"><option value="merge"'+(r.merge!=='branch'?' selected':'')+'>기준 브랜치에 병합 후 푸시</option><option value="branch"'+(r.merge==='branch'?' selected':'')+'>작업 브랜치만 푸시 (PR)</option></select></label>'
+    +f('deploy','푸시 후 실행할 배포 명령 (선택)',r.deploy,'')+'</div>'
+    +'<div class="row"><button class="pri" data-act="save">저장</button>'
+    +(on?'<button data-act="clone">'+(st.cloned?'최신 내용 가져오기':'내려받기')+'</button><button data-act="key">배포 키 보기</button><button class="dng" data-act="remove">연결 해제</button>':'')+'</div>'
+    +(on?'<div class="vd">'+(st.cloned?'최근 커밋 '+esc(st.head||'-'):'아직 내려받지 않음')+(st.release_head?' · 운영: '+esc(st.release_head):'')+(st.web?' · <a href="'+esc(st.web)+'" target="_blank" rel="noopener">GitHub 열기</a>':'')+'</div>'
+      +'<pre class="vd keyv" style="white-space:pre-wrap;word-break:break-all'+(st.key?'':';display:none')+'">'+esc(st.key||'')+'</pre>':'')
+    +'</div></div>';
+}
 function repoCard(st){
-  const r=st.repo||{};const on=!!r.url;
+  const rs=st.repos||[],nm=st.names||{};
+  const hist=st.releases||[];
+  const verS=o=>Object.keys(o||{}).map(k=>(rs.length>1?esc(nm[k]||k)+' ':'')+esc(String(o[k]).slice(0,7))).join(' · ');
   return '<div class="card"><h2>코드 저장소 (GitHub 연동)</h2>'
-    +'<div class="vd">연결하면 이 프로젝트의 에이전트가 저장소 폴더의 실제 코드를 고칩니다. 작업마다 <b>harness/작업ID</b> 브랜치를 만들고, 하네스가 빌드 확인과 커밋을 대신 처리합니다(토큰 사용 없음). 최종 승인하면 GitHub에 푸시합니다.</div>'
-    +'<label class="lb">저장소 주소 (SSH 권장)<input type="text" id="rurl" value="'+esc(r.url||'')+'" placeholder="git@github.com:kfarri/myma.git"></label>'
-    +'<div class="g2"><label class="lb">로컬 폴더<input type="text" id="rpath" value="'+esc(r.path||st.default_path)+'"></label>'
-    +'<label class="lb">기준 브랜치<input type="text" id="rbr" value="'+esc(r.branch||'main')+'"></label></div>'
-    +'<label class="lb">운영 브랜치 (테스트 단계를 쓰려면 입력 · 비우면 승인 즉시 운영)<input type="text" id="rrel" value="'+esc(r.release||'')+'" placeholder="예: main  (이때 기준 브랜치는 develop)"></label>'
-    +(r.release?'<div class="vd">승인하면 <b>'+esc(r.branch||'main')+'</b>(테스트)에 올라가고, 작업 화면의 \'운영 반영\'을 눌러야 <b>'+esc(r.release)+'</b>(운영)으로 올라갑니다.</div>':'')
-    +'<label class="lb">테스트 서버 주소 (선택 · 작업 화면에 바로가기 링크로 표시)<input type="text" id="rturl" value="'+esc(r.test_url||'')+'" placeholder="예: http://192.168.0.16:38080"></label>'
-    +'<label class="lb">빌드 확인 명령 (비우면 생략 · 실패하면 오류를 에이전트에게 돌려줘 자동 수정)<input type="text" id="rbuild" value="'+esc(r.build||'')+'" placeholder="예: npm ci && npm run build"></label>'
-    +'<label class="lb">승인 시 반영 방식<select id="rmode" style="width:auto"><option value="merge"'+(r.merge!=='branch'?' selected':'')+'>기준 브랜치에 병합 후 푸시 (GitHub Actions 자동 빌드)</option><option value="branch"'+(r.merge==='branch'?' selected':'')+'>작업 브랜치만 푸시 (PR은 GitHub에서 직접 병합)</option></select></label>'
-    +'<label class="lb">푸시 후 실행할 배포 명령 (선택)<input type="text" id="rdep" value="'+esc(r.deploy||'')+'" placeholder="비워두면 GitHub Actions에 맡김"></label>'
-    +'<div class="row" style="margin-top:8px"><button class="pri" id="rsave">저장</button>'+(on?'<button id="rclone">'+(st.cloned?'최신 내용 가져오기':'내려받기')+'</button>':'')+'<button id="rkey">배포 키 보기</button>'+(on?'<button class="dng" id="roff">연결 해제</button>':'')+'</div>'
-    +'<div class="vd">상태: '+(on?(st.cloned?'내려받음 · 최근 커밋 '+esc(st.head||'-'):'아직 내려받지 않음'):'연결 안 됨')+(st.web?' · <a href="'+esc(st.web)+'" target="_blank" rel="noopener">GitHub 열기</a>':'')+'</div>'
-    +'<pre id="rkeyv" class="vd" style="white-space:pre-wrap;word-break:break-all'+(st.key?'':';display:none')+'">'+esc(st.key||'')+'</pre>'
-    +((st.releases||[]).length?'<div class="vd" style="margin-top:10px">운영 반영 이력</div><table class="ut"><tr><th>시각</th><th>버전</th><th>내용</th><th></th></tr>'
-      +st.releases.map((x,i)=>'<tr><td>'+esc(x.ts.slice(5,16))+'</td><td>'+esc(x.sha.slice(0,7))+'</td><td>'+(x.rollback?'<b>되돌리기</b>':'변경 '+x.n+'개 · '+esc((x.msgs||[]).slice(0,2).join(', ')))+' <span style="color:var(--mute)">('+esc(x.by||'')+')</span></td><td>'
-        +(i===0?'<span class="chip approved">현재 운영</span>':'<button data-rb="'+esc(x.sha)+'" style="font-size:12px;padding:3px 8px">이 버전으로 되돌리기</button>')+'</td></tr>').join('')
-      +(st.releases[0].prev&&!st.releases[0].rollback?'<tr><td colspan="3">반영 직전 버전 '+esc(st.releases[0].prev.slice(0,7))+'</td><td><button data-rb="'+esc(st.releases[0].prev)+'" class="dng" style="font-size:12px;padding:3px 8px">직전 버전으로 되돌리기</button></td></tr>':'')+'</table>':'')
-    +'<ul class="tip"><li>배포 키는 GitHub 저장소 → Settings → Deploy keys → Add deploy key에 붙여넣고 <b>Allow write access</b>를 켜세요.</li><li>빌드 산출물 폴더(dist, node_modules 등)는 저장소의 .gitignore에 있어야 커밋에 섞이지 않습니다.</li></ul></div>';
+    +'<div class="vd">연결한 저장소의 실제 코드를 에이전트가 고칩니다. 저장소를 여러 개(예: 프론트·API) 연결하면 요청 하나로 필요한 쪽을 함께 고치고, 승인·운영 반영도 한 번에 처리합니다. 빌드 확인과 커밋은 하네스가 대신 합니다(토큰 사용 없음).</div>'
+    +rs.map((x,i)=>repoForm(x,i)).join('')
+    +'<details style="margin-top:6px"'+(rs.length?'':' open')+'><summary class="vd" style="cursor:pointer">+ 저장소 '+(rs.length?'더 ':'')+'연결하기</summary>'+repoForm(null,rs.length)+'</details>'
+    +(hist.length?'<div class="vd" style="margin-top:12px">운영 반영 이력</div><table class="ut"><tr><th>시각</th><th>운영 버전</th><th>내용</th><th></th></tr>'
+      +hist.map((x,i)=>'<tr><td>'+esc((x.ts||'').slice(5,16))+'</td><td>'+verS(x.heads)+'</td><td>'+(x.rollback?'<b>되돌리기</b> '+esc((x.msgs||[]).join(', ')):'변경 '+x.n+'개 · '+esc((x.msgs||[]).slice(0,2).join(', ')))+(x.partial?' <b style="color:var(--err)">(일부만 반영)</b>':'')+' <span style="color:var(--mute)">('+esc(x.by||'')+')</span></td><td>'
+        +(i===0?'<span class="chip approved">현재 운영</span>':'<button data-rbi="'+i+'" style="font-size:12px;padding:3px 8px">이 시점으로 되돌리기</button>')+'</td></tr>').join('')
+      +(hist[0].before&&Object.keys(hist[0].before).length&&!hist[0].rollback?'<tr><td colspan="3">마지막 반영 직전 ('+verS(hist[0].before)+')</td><td><button data-rbi="0" data-which="before" class="dng" style="font-size:12px;padding:3px 8px">직전 버전으로 되돌리기</button></td></tr>':'')+'</table>':'')
+    +'<ul class="tip"><li>저장소마다 배포 키가 따로 있습니다. 배포 키 보기 → GitHub 그 저장소의 Settings → Deploy keys 에 붙여넣고 <b>Allow write access</b>를 켜세요.</li><li>빌드 산출물 폴더(dist, node_modules 등)는 저장소의 .gitignore에 있어야 커밋에 섞이지 않습니다.</li></ul></div>';
 }
 function bindRepo(){
-  const v=id=>$('#'+id).value.trim();
-  $('#rsave').onclick=async()=>{try{await post(base()+'/repo',{url:v('rurl'),path:v('rpath'),branch:v('rbr'),release:v('rrel'),test_url:v('rturl'),build:v('rbuild'),merge:$('#rmode').value,deploy:v('rdep')});toast('저장했습니다');await loadSettings()}catch(e){toast(e.message)}};
-  if($('#rclone'))$('#rclone').onclick=async e=>{e.target.disabled=true;toast('저장소와 통신 중…');try{const r=await post(base()+'/repo/clone');toast(r.msg);await loadSettings()}catch(err){alert(err.message);e.target.disabled=false}};
-  $('#rkey').onclick=async()=>{try{const r=await post(base()+'/repo/key');const p=$('#rkeyv');p.textContent=r.key;p.style.display='';try{await navigator.clipboard.writeText(r.key);toast('공개 키를 복사했습니다')}catch(_){toast('아래 공개 키를 복사하세요')}}catch(e){toast(e.message)}};
-  document.querySelectorAll('[data-rb]').forEach(b=>b.onclick=async()=>{if(!confirm('운영을 '+b.dataset.rb.slice(0,7)+' 버전으로 되돌릴까요?\n1분 안에 실서버가 이 버전으로 다시 배포됩니다. 테스트 브랜치는 그대로입니다.'))return;
-    b.disabled=true;try{await post(base()+'/repo/rollback',{sha:b.dataset.rb});toast('되돌렸습니다 - 1분 안에 실서버에 배포됩니다');await loadSettings()}catch(e){alert(e.message);b.disabled=false}});
-  if($('#roff'))$('#roff').onclick=async()=>{if(!confirm('저장소 연결을 해제할까요? 로컬 폴더는 지워지지 않습니다.'))return;try{await post(base()+'/repo',{url:''});toast('해제했습니다');await loadSettings()}catch(e){toast(e.message)}};
+  document.querySelectorAll('[data-repo]').forEach(box=>{
+    const k=box.dataset.repo,id=k==='new'?'':k;
+    const val=()=>{const o={id};box.querySelectorAll('[data-f]').forEach(e=>o[e.dataset.f]=e.value.trim());if(o.path==='(비우면 자동)')o.path='';return o};
+    box.querySelectorAll('[data-act]').forEach(b=>b.onclick=async()=>{
+      const a=b.dataset.act;
+      try{
+        if(a==='save'){await post(base()+'/repo',val());toast('저장했습니다');await loadSettings()}
+        else if(a==='clone'){b.disabled=true;toast('저장소와 통신 중…');const r=await post(base()+'/repo/clone',{id});toast(r.msg);await loadSettings()}
+        else if(a==='key'){const r=await post(base()+'/repo/key',{id});const p=box.querySelector('.keyv');p.textContent=r.key;p.style.display='';try{await navigator.clipboard.writeText(r.key);toast('공개 키를 복사했습니다')}catch(_){toast('아래 공개 키를 복사하세요')}}
+        else if(a==='remove'){if(!confirm('이 저장소 연결을 해제할까요? 로컬 폴더와 GitHub는 그대로입니다.'))return;await post(base()+'/repo',{id,remove:true});toast('해제했습니다');await loadSettings()}
+      }catch(e){alert(e.message);b.disabled=false}});
+  });
+  document.querySelectorAll('[data-rbi]').forEach(b=>b.onclick=async()=>{
+    if(!confirm((b.dataset.which==='before'?'운영을 마지막 반영 직전 버전으로':'운영을 이 시점 버전으로')+' 되돌릴까요?\n1분 안에 실서버가 이 버전으로 다시 배포됩니다. 테스트 브랜치는 그대로입니다.'))return;
+    b.disabled=true;try{await post(base()+'/repo/rollback',{idx:+b.dataset.rbi,which:b.dataset.which||'heads'});toast('되돌렸습니다 - 1분 안에 실서버에 배포됩니다');await loadSettings()}catch(e){alert(e.message);b.disabled=false}});
 }
 
 /* ---------- 새 프로젝트 ---------- */
@@ -866,6 +883,27 @@ function renderManual(){
   const p=manualPlan();
   $('#npprev').innerHTML=p?planHtml(p):'<div class="vd">에이전트를 1명 이상 추가하면 미리보기가 나옵니다.</div>';
 }
+function mergeCard(){
+  const rp=(P||[]).filter(p=>p.repo);
+  if(rp.length<2)return '';
+  const common=(()=>{let c=rp[0].name;for(const p of rp)while(c&&!p.name.startsWith(c))c=c.slice(0,-1);return c.trim()})();
+  return '<div class="card" style="margin-top:12px"><h2>코드 저장소 프로젝트 합치기</h2>'
+    +'<div class="vd">저장소가 연결된 프로젝트들을 하나로 묶습니다. 요청 한 번으로 여러 저장소(예: 프론트·API)를 함께 고치고, 승인·운영 반영도 한 번에 됩니다. 저장소 폴더·배포 키·에이전트·단계를 그대로 가져오므로 GitHub에 키를 다시 등록할 필요가 없습니다.</div>'
+    +rp.map((p,i)=>'<label class="chk"><input type="checkbox" class="mgp" value="'+esc(p.id)+'"'+(i<2?' checked':'')+'><span>'+esc(p.name)+'<small>'+esc((p.repo.names||[]).join(', '))+' · '+(p.repo.release?'테스트→운영':'바로 운영')+'</small></span></label>').join('')
+    +'<label class="lb">새 프로젝트 이름<input type="text" id="mgname" maxlength="40" value="'+esc(common)+'"></label>'
+    +'<ul class="tip"><li>원래 프로젝트들은 작업 기록 보관용으로 남고, 저장소 연결만 새 프로젝트로 옮겨집니다.</li><li>에이전트와 단계는 처음 체크한 프로젝트 것을 복사합니다.</li><li>진행 중인 작업이 없을 때만 합칠 수 있습니다.</li></ul>'
+    +'<div class="row"><button class="pri" id="mggo">합쳐서 새 프로젝트 만들기</button></div></div>';
+}
+function bindMerge(){
+  if(!$('#mggo'))return;
+  $('#mggo').onclick=async e=>{
+    const ids=[...document.querySelectorAll('.mgp:checked')].map(x=>x.value);
+    if(ids.length<2){toast('2개 이상 고르세요');return}
+    if(!confirm('선택한 프로젝트의 저장소를 새 프로젝트로 옮깁니다. 계속할까요?'))return;
+    e.target.disabled=true;
+    try{const r=await post('/api/merge-projects',{sources:ids,name:$('#mgname').value.trim()});toast('"'+r.name+'" 프로젝트를 만들었습니다 ('+r.repos.join(', ')+')');await loadProjects();switchProject(r.id)}
+    catch(err){alert(err.message);e.target.disabled=false}};
+}
 async function initNewProj(){
   if(!presets.length)presets=(await api('/api/presets')).presets;
   newPlan=presets[0].plan;manual=[];
@@ -879,7 +917,8 @@ async function initNewProj(){
     +'<div id="npbody"></div><div id="npprev"></div>'
     +'<label class="chk" style="margin-top:12px"><input type="checkbox" id="npauto"><span>요청마다 AI가 단계를 다시 설계<small>등록한 에이전트 중에서 요청에 맞게 골라 씁니다. 위 구성은 설계 실패 시 쓰는 대체용이 됩니다.</small></span></label>'
     +'<div class="row" style="margin-top:12px"><button class="pri" id="npgo">프로젝트 만들기</button><button id="npcancel">취소</button></div></div>'
-    +'<div id="imppanel"></div>';
+    +'<div id="imppanel"></div>'+mergeCard();
+  bindMerge();
   $('#npmode').onchange=e=>npBody(e.target.value);
   npBody('preset');
   $('#npgo').onclick=async()=>{
