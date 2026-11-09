@@ -2383,6 +2383,14 @@ def job_restart(proj, j, b):
         raise ApiError(400, "시작 단계가 올바르지 않습니다")
     fb = (b.get("feedback") or "").strip()[:5000]
     first = act[0]["id"] if act else ""
+    if fb:   # 수정 요청·답변도 요청 탭에 차례대로 남긴다
+        answer = bool(j.get("needs_input"))
+        n = int(j.get("revisions") or 0) + (0 if answer else 1)
+        rq = fpath(proj, "request", j["id"])
+        rq.write_text((read_text(rq) or "").rstrip() + "\n\n## %s (%s)\n%s\n"
+                      % ("질문에 대한 답변" if answer else "수정 요청 %d" % n, now()[:16], fb))
+        if not answer:
+            j["revisions"] = n
     set_state(j, status="queued", step=first if start == "first" else start, feedback=fb, error="", cancel=False,
               needs_input=False, question="")
     label = "처음" if start == "first" else next(s["name"] for s in act if s["id"] == start)
