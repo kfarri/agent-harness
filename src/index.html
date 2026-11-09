@@ -651,7 +651,8 @@ async function loadSources(){
     +'<div class="card"><h2>자료 목록 ('+d.sources.length+')</h2>'+list
     +'<div class="row" style="margin-top:10px"><button class="pri" id="srcnew">+ 자료 추가</button></div>'
     +'<div class="vd" style="margin-top:8px">파일을 직접 넣어도 됩니다: <code>'+esc(d.dir)+'</code> 폴더에 .md 또는 .txt 파일을 복사하면 여기에 나타납니다.</div></div>'
-    +'<div id="srcform"></div>';
+    +'<div id="dbcard"></div><div id="srcform"></div>';
+  loadDb().catch(()=>{});
   $('#smd').onchange=async e=>{try{await post(base()+'/sources/mode',{mode:e.target.value});toast('저장했습니다');await loadSources()}catch(err){toast(err.message)}};
   $('#srcnew').onclick=()=>srcForm('','');
   document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{
@@ -660,6 +661,25 @@ async function loadSources(){
   document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=async()=>{
     try{const full=await post(base()+'/sources/read',{name:b.dataset.edit});srcForm(full.name,full.content)}catch(e){toast(e.message)}});
   if(srcEdit){srcForm(srcEdit.name,srcEdit.content);srcEdit=null}
+}
+async function loadDb(){
+  const d=await api(base()+'/db');
+  const L=d.last;
+  const st=L?(L.ok?'<span class="chip approved">성공</span> ':'<span class="chip failed">실패</span> ')+esc(L.at)+' ('+esc(L.who||'')+') · '+esc(L.msg):'아직 가져온 적 없음';
+  $('#dbcard').innerHTML='<div class="card"><h2>DB 구조 자료 (자동)</h2>'
+    +'<div class="vd" style="margin:0 0 8px">파이 .env에 넣어 둔 <b>읽기 전용</b> DB 계정으로 테이블·컬럼·프로시저·뷰·코드값을 뽑아 에이전트 자료로 넣습니다. 에이전트는 목차를 먼저 보고 필요한 것만 읽으며, DB 비밀번호는 에이전트에게 전달되지 않습니다.</div>'
+    +'<label class="lb">환경 변수 접두어<input type="text" id="dbpre" value="'+esc(d.prefix)+'" placeholder="예: MYMA_DB → MYMA_DB_HOST, _PORT, _USER, _PASSWORD, _NAME"></label>'
+    +'<label class="lb">실제 값까지 넣을 코드 테이블 (쉼표로 구분, * 사용 가능)<input type="text" id="dbct" value="'+esc(d.code_tables)+'"></label>'
+    +'<label class="lb" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="dbauto"'+(d.auto?' checked':'')+' style="width:auto"> 매일 새벽 3시 40분에 자동으로 다시 가져오기</label>'
+    +'<div class="vd">연결: '+(d.prefix?(d.ready?esc(d.target):'<span class="chip failed">.env에 없음</span> '+esc(d.missing.join(', '))):'접두어를 입력하고 저장하세요')+'</div>'
+    +'<div class="vd">마지막: '+st+'</div>'
+    +'<div class="row" style="margin-top:10px"><button id="dbsave">저장</button><button class="pri" id="dbrun"'+(d.ready&&!d.running?'':' disabled')+'>'+(d.running?'가져오는 중…':'지금 가져오기')+'</button>'
+    +(d.has?'<button id="dbview">목차 보기</button>':'')+'</div><div id="dbtoc"></div></div>';
+  $('#dbsave').onclick=async()=>{try{await post(base()+'/db',{prefix:$('#dbpre').value.trim(),code_tables:$('#dbct').value.trim(),auto:$('#dbauto').checked});toast('저장했습니다');await loadDb()}catch(e){toast(e.message)}};
+  $('#dbrun').onclick=async()=>{const b=$('#dbrun');b.disabled=true;b.textContent='가져오는 중…';
+    try{const r=await post(base()+'/db/refresh',{});toast(r.last&&r.last.ok?'가져왔습니다':'실패: '+(r.last?r.last.msg:''))}catch(e){toast(e.message)}await loadDb()};
+  if($('#dbview'))$('#dbview').onclick=async()=>{const t=$('#dbtoc');if(t.innerHTML){t.innerHTML='';return}
+    try{const r=await api(base()+'/db/readme');t.innerHTML='<pre class="mono" style="max-height:420px;overflow:auto;white-space:pre-wrap;margin-top:10px">'+esc(r.content)+'</pre>'}catch(e){toast(e.message)}};
 }
 function srcForm(name,content){
   $('#srcform').innerHTML='<div class="card"><h2>'+(name?'자료 편집: '+esc(name):'새 자료')+'</h2>'

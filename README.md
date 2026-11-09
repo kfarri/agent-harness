@@ -26,3 +26,12 @@ chmod +x /opt/agent-harness-src/update.sh
 - 백업 내용: ~/agents(설정·.env·프로젝트·작업 기록·참고 자료·보안 차단 목록), ~/.ssh(GitHub 배포 키), Claude 로그인 정보, systemd 서비스
 - 빼는 것: 코드 저장소(repos, GitHub에서 다시 받음), 로그, node_modules
 - 새 파이에서 복원: 백업 파일을 새 파이로 복사 → `sudo bash restore.sh harness-backup-YYYYMMDD-HHMMSS.tar.gz`
+
+## DB 구조 자료 (읽기 전용)
+
+프로젝트 **자료** 화면의 "DB 구조 자료"에서 환경 변수 접두어(예: `MYMA_DB`)를 저장하면, 파이 `.env`의
+`<접두어>_HOST/_PORT/_USER/_PASSWORD/_NAME` 계정으로 테이블·컬럼·인덱스·FK·프로시저·뷰·코드 테이블 값을
+`shared/sources/db/`에 뽑아 둔다. 매일 03:40(`DB_EXPORT_AT`) 자동 갱신, "지금 가져오기"로 수동 갱신.
+에이전트는 목차(README.md)부터 보고 필요한 파일만 읽는다. 이름에 PASSWORD/SECRET이 들어간 환경 변수는
+에이전트에게 넘기지 않고, 에이전트의 `mariadb`/`mysql` 직접 실행은 막는다. 계정은 SELECT, SHOW VIEW,
+SHOW CREATE ROUTINE 권한만 준다. 파이에 `mariadb-client`가 필요하다.

@@ -9,6 +9,7 @@
 """
 import base64
 import copy
+import fnmatch
 import http.cookies
 import ipaddress
 import hmac
@@ -436,6 +437,7 @@ def build_settings(proj, perms):
     allow = ["Read", "Write", "Edit"]
     src = proj_dirs(proj)["sources"]
     deny = ["Bash(sudo:*)", "Bash(rm:*)", "Read(/%s)" % (BASE / ".env"),
+            "Bash(mariadb:*)", "Bash(mysql:*)", "Bash(mariadb-dump:*)", "Bash(mysqldump:*)",
             "Write(/%s/**)" % src, "Edit(/%s/**)" % src]   # 참고 자료는 읽기만 허용
     if perms.get("web"):
         allow += ["WebSearch", "WebFetch"]
@@ -743,7 +745,9 @@ def add_usage(job, stage_id, data):
 
 def child_env():
     e = dict(os.environ)
-    e.pop("GUI_PASSWORD", None)  # 에이전트가 GUI 비밀번호를 읽지 못하게 한다
+    for k in list(e):   # 에이전트에게 비밀번호·토큰을 넘기지 않는다 (DB 비밀번호 포함)
+        if re.search(r"PASSWORD|SECRET|_PWD$", k) or k == "TELEGRAM_BOT_TOKEN":
+            e.pop(k, None)
     e.setdefault("DISABLE_AUTOUPDATER", "1")
     e.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     return e
@@ -1674,15 +1678,228 @@ def sources_block(proj):
     if mode == "off":
         return ""
     items = src_list(proj)
+    db = db_block(proj)
     if not items:
-        return ""
+        return db
     lines = ["[참고 자료] 사용자가 직접 제공한 자료다. 관련 있는 파일을 읽어 근거로 삼는다."]
     lines += ["- ../shared/sources/%s" % s["name"] for s in items[:SRC_MAX]]
     if mode == "only":
         lines.append("답변은 이 자료에 있는 내용만 근거로 작성한다. 자료에 없는 것은 '제공된 자료에 없음'이라고 밝히고 추측하지 않는다.")
     else:
         lines.append("이 자료를 우선 근거로 삼고, 부족한 부분만 다른 방법으로 보완한다.")
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n" + db
+
+
+# ---------------------------------------------------------------- DB 구조 자료 (읽기 전용 계정으로 추출)
+
+DB_AUTO_AT = os.environ.get("DB_EXPORT_AT", "03:40")   # 매일 자동 갱신 시각
+DB_RUN = {}            # pid -> True (추출 중)
+DB_ROW_MAX = 3000      # 코드 테이블 한 개당 최대 행 수
+DB_ROW_SKIP = 20000    # 이보다 큰 테이블은 코드 테이블로 보지 않는다
+DB_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,30}$")
+
+
+def db_cfg(proj):
+    return proj.get("db") or {}
+
+
+def db_dir(proj):
+    return proj_dirs(proj)["sources"] / "db"
+
+
+def db_conn(proj):
+    pre = db_cfg(proj).get("prefix") or ""
+    if not DB_PREFIX_RE.match(pre):
+        return None, []
+    keys = ["HOST", "PORT", "USER", "PASSWORD", "NAME"]
+    c = {k.lower(): os.environ.get("%s_%s" % (pre, k), "") for k in keys}
+    missing = ["%s_%s" % (pre, k) for k in keys if not c[k.lower()] and k != "PORT"]
+    return c, missing
+
+
+def _db_unesc(v):
+    if v == "NULL":
+        return None
+    return re.sub(r"\\(.)", lambda m: {"n": "\n", "t": "\t", "0": "\0", "\\": "\\"}.get(m[1], m[1]), v)
+
+
+def db_query(c, sql, header=False, timeout=90):
+    exe = shutil.which("mariadb") or shutil.which("mysql")
+    if not exe:
+        raise RuntimeError("파이에 mariadb 클라이언트가 없습니다 (sudo apt install mariadb-client)")
+    cmd = [exe, "-h", c["host"], "-P", c["port"] or "3306", "-u", c["user"], c["name"],
+           "--batch", "--connect-timeout=10", "--default-character-set=utf8mb4", "-e", "SET SESSION group_concat_max_len=4000000; " + sql]
+    if not header:
+        cmd.insert(-2, "-N")
+    env = dict(os.environ, MYSQL_PWD=c["password"])   # 비밀번호는 명령줄에 남기지 않는다
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    if r.returncode != 0:
+        err = "\n".join(x for x in r.stderr.splitlines() if not x.startswith("WARNING"))
+        raise RuntimeError((err or "DB 조회 실패").strip()[:300])
+    rows = [[_db_unesc(v) for v in ln.split("\t")] for ln in r.stdout.split("\n") if ln != ""]
+    return rows
+
+
+def _md(v):
+    return ("" if v is None else str(v)).replace("|", "\\|").replace("\n", " ").replace("\t", " ").strip()
+
+
+def _fname(n):
+    return re.sub(r"[^\w가-힣.\-]", "_", n)[:80]
+
+
+def db_export(proj):
+    c, missing = db_conn(proj)
+    if c is None:
+        raise RuntimeError("환경 변수 이름(접두어)을 먼저 설정하세요")
+    if missing:
+        raise RuntimeError("파이 .env에 없음: " + ", ".join(missing))
+    cfg = db_cfg(proj)
+    pats = [x.strip() for x in str(cfg.get("code_tables") or "CM*").split(",") if x.strip()]
+    tabs = db_query(c, "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS, TABLE_COMMENT FROM information_schema.TABLES "
+                       "WHERE TABLE_SCHEMA=database() ORDER BY TABLE_NAME")
+    cols = db_query(c, "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, EXTRA, "
+                       "COLUMN_COMMENT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=database() "
+                       "ORDER BY TABLE_NAME, ORDINAL_POSITION")
+    idx = db_query(c, "SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) "
+                      "FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=database() "
+                      "GROUP BY TABLE_NAME, INDEX_NAME, NON_UNIQUE ORDER BY TABLE_NAME, INDEX_NAME")
+    fks = db_query(c, "SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME "
+                      "FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=database() "
+                      "AND REFERENCED_TABLE_NAME IS NOT NULL")
+    rts = db_query(c, "SELECT ROUTINE_NAME, ROUTINE_TYPE, ROUTINE_DEFINITION, ROUTINE_COMMENT, DTD_IDENTIFIER "
+                      "FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=database() ORDER BY ROUTINE_NAME")
+    prm = db_query(c, "SELECT SPECIFIC_NAME, GROUP_CONCAT(CONCAT_WS(' ', PARAMETER_MODE, PARAMETER_NAME, DTD_IDENTIFIER) "
+                      "ORDER BY ORDINAL_POSITION SEPARATOR ', ') FROM information_schema.PARAMETERS "
+                      "WHERE SPECIFIC_SCHEMA=database() AND ORDINAL_POSITION>0 GROUP BY SPECIFIC_NAME")
+    vws = db_query(c, "SELECT TABLE_NAME, VIEW_DEFINITION FROM information_schema.VIEWS "
+                      "WHERE TABLE_SCHEMA=database() ORDER BY TABLE_NAME")
+    trg = db_query(c, "SELECT TRIGGER_NAME, ACTION_TIMING, EVENT_MANIPULATION, EVENT_OBJECT_TABLE, ACTION_STATEMENT "
+                      "FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=database() ORDER BY TRIGGER_NAME")
+    if any(r[2] is None for r in rts):
+        raise RuntimeError("프로시저 내용을 볼 권한이 없습니다 (GRANT SHOW CREATE ROUTINE 필요)")
+
+    out = db_dir(proj)
+    tmp = out.with_name("db.tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    for d in ("tables", "routines", "views", "codes"):
+        (tmp / d).mkdir(parents=True)
+    bycol, byidx, byfk = {}, {}, {}
+    for r in cols:
+        bycol.setdefault(r[0], []).append(r)
+    for r in idx:
+        byidx.setdefault(r[0], []).append(r)
+    for r in fks:
+        byfk.setdefault(r[0], []).append(r)
+    params = {r[0]: r[1] for r in prm}
+    stamp = now()
+
+    base_tabs = [t for t in tabs if t[1] != "VIEW"]
+    for t in base_tabs:
+        name = t[0]
+        L = ["# %s" % name, "", "설명: %s · 대략 행 수: %s" % (_md(t[3]) or "-", t[2] or "0"), "",
+             "| 컬럼 | 타입 | NULL | 키 | 기본값 | 기타 | 설명 |", "|---|---|---|---|---|---|---|"]
+        L += ["| %s |" % " | ".join(_md(x) for x in r[1:]) for r in bycol.get(name, [])]
+        if byidx.get(name):
+            L += ["", "## 인덱스", ""] + ["- %s%s: %s" % (r[1], "" if r[2] == "1" else " (UNIQUE)", r[3])
+                                         for r in byidx[name]]
+        if byfk.get(name):
+            L += ["", "## 참조 (FK)", ""] + ["- %s → %s.%s" % (r[1], r[2], r[3]) for r in byfk[name]]
+        rel = [x for x in trg if x[3] == name]
+        if rel:
+            L += ["", "## 트리거", ""] + ["- %s (%s %s) → triggers 항목 참고" % (x[0], x[1], x[2]) for x in rel]
+        (tmp / "tables" / (_fname(name) + ".md")).write_text("\n".join(L) + "\n")
+    for r in rts:
+        head = "-- %s %s(%s)%s\n" % (r[1], r[0], params.get(r[0], ""), (" RETURNS " + r[4]) if r[1] == "FUNCTION" and r[4] else "")
+        if r[3]:
+            head += "-- 설명: %s\n" % _md(r[3])
+        (tmp / "routines" / (_fname(r[0]) + ".sql")).write_text(head + (r[2] or "") + "\n")
+    for r in vws:
+        (tmp / "views" / (_fname(r[0]) + ".sql")).write_text("-- VIEW %s\n%s\n" % (r[0], r[1] or ""))
+    if trg:
+        (tmp / "triggers.sql").write_text("\n\n".join("-- TRIGGER %s %s %s ON %s\n%s" % (x[0], x[1], x[2], x[3], x[4] or "")
+                                                     for x in trg) + "\n")
+    codes = []
+    for t in base_tabs:
+        if not any(fnmatch.fnmatchcase(t[0], p) for p in pats) or int(t[2] or 0) > DB_ROW_SKIP:
+            continue
+        rows = db_query(c, "SELECT * FROM `%s` LIMIT %d" % (t[0].replace("`", ""), DB_ROW_MAX + 1), header=True)
+        if not rows:
+            continue
+        hdr, data = rows[0], rows[1:]
+        L = ["# %s 데이터 (%s 기준%s)" % (t[0], stamp, ", 앞 %d행만" % DB_ROW_MAX if len(data) > DB_ROW_MAX else ""),
+             "", "| %s |" % " | ".join(_md(h) for h in hdr), "|%s" % ("---|" * len(hdr))]
+        L += ["| %s |" % " | ".join(_md(v) for v in r) for r in data[:DB_ROW_MAX]]
+        (tmp / "codes" / (_fname(t[0]) + ".md")).write_text("\n".join(L) + "\n")
+        codes.append((t[0], len(data[:DB_ROW_MAX])))
+
+    R = ["# DB 구조 목차 (%s)" % c["name"], "",
+         "%s 기준, 운영 DB에서 읽기 전용 계정으로 자동 추출한 자료다. 이 목차에서 필요한 항목만 골라 해당 파일을 읽는다." % stamp,
+         "", "- 테이블: tables/<이름>.md (컬럼·인덱스·FK)",
+         "- 프로시저·함수: routines/<이름>.sql", "- 뷰: views/<이름>.sql",
+         "- 코드 테이블 실제 값: codes/<이름>.md" + (" · 트리거: triggers.sql" if trg else ""), "",
+         "## 테이블 (%d)" % len(base_tabs), "", "| 테이블 | 대략 행 수 | 컬럼 수 | 설명 |", "|---|---|---|---|"]
+    R += ["| %s | %s | %d | %s |" % (t[0], t[2] or "0", len(bycol.get(t[0], [])), _md(t[3])) for t in base_tabs]
+    R += ["", "## 프로시저·함수 (%d)" % len(rts), ""]
+    R += ["- %s%s(%s)%s" % ("" if r[1] == "PROCEDURE" else "[함수] ", r[0], params.get(r[0], ""),
+                            (" — " + _md(r[3])) if r[3] else "") for r in rts]
+    R += ["", "## 뷰 (%d)" % len(vws), ""] + ["- %s" % r[0] for r in vws]
+    R += ["", "## 코드 테이블 데이터 (%d)" % len(codes), ""] + ["- %s: %d행" % x for x in codes]
+    (tmp / "README.md").write_text("\n".join(R) + "\n")
+
+    old = out.with_name("db.old")
+    shutil.rmtree(old, ignore_errors=True)
+    if out.exists():
+        out.rename(old)
+    tmp.rename(out)
+    shutil.rmtree(old, ignore_errors=True)
+    return {"tables": len(base_tabs), "routines": len(rts), "views": len(vws), "codes": len(codes), "triggers": len(trg)}
+
+
+def db_refresh(proj, who="수동"):
+    pid = proj["id"]
+    with LOCK:
+        if DB_RUN.get(pid):
+            raise ApiError(409, "이미 DB 구조를 가져오는 중입니다")
+        DB_RUN[pid] = True
+    try:
+        try:
+            counts = db_export(proj)
+            last = {"at": now(), "ok": True, "who": who, "counts": counts,
+                    "msg": "테이블 %(tables)d · 프로시저 %(routines)d · 뷰 %(views)d · 코드 테이블 %(codes)d" % counts}
+            if not counts["routines"]:
+                last["msg"] += " (프로시저가 0개면 계정에 SHOW CREATE ROUTINE 권한이 있는지 확인)"
+        except Exception as e:  # noqa: BLE001
+            shutil.rmtree(db_dir(proj).with_name("db.tmp"), ignore_errors=True)
+            last = {"at": now(), "ok": False, "who": who, "msg": str(e)[:300]}
+            notify("[%s] DB 구조 자료 갱신 실패: %s" % (proj["name"], last["msg"]))
+        with LOCK:
+            proj.setdefault("db", {})["last"] = last
+            save_cfg()
+        return last
+    finally:
+        DB_RUN.pop(pid, None)
+
+
+def db_status(proj):
+    cfg = db_cfg(proj)
+    c, missing = db_conn(proj)
+    readme = db_dir(proj) / "README.md"
+    return {"prefix": cfg.get("prefix", ""), "code_tables": cfg.get("code_tables", "CM*"),
+            "auto": bool(cfg.get("auto", True)), "last": cfg.get("last"), "running": bool(DB_RUN.get(proj["id"])),
+            "ready": c is not None and not missing, "missing": missing,
+            "target": ("%s:%s / %s (%s)" % (c["host"], c["port"] or "3306", c["name"], c["user"])) if c and not missing else "",
+            "has": readme.exists()}
+
+
+def db_block(proj):
+    """DB 구조 자료가 있으면 에이전트에게 목차부터 보게 한다."""
+    if proj.get("use_sources", "prefer") == "off" or not (db_dir(proj) / "README.md").exists():
+        return ""
+    at = (db_cfg(proj).get("last") or {}).get("at", "")
+    return ("[DB 구조] 운영 DB의 실제 구조(테이블·컬럼·프로시저·뷰·코드값)를 %s 기준으로 뽑아 둔 자료가 "
+            "../shared/sources/db/ 에 있다. DB 관련 판단이 필요하면 먼저 ../shared/sources/db/README.md 목차를 보고, "
+            "필요한 테이블·프로시저 파일만 골라 읽는다. 전부 읽지 않는다. DB에 직접 접속하지 않는다.\n" % (at or "최근"))
 
 
 def feedback_block(fb):
@@ -2871,8 +3088,14 @@ def sched_loop():
                             continue
                         sc["last_run"] = stamp
                         due.append((proj, sc))
-                if due:
+                dbdue = [p for p in CFG["projects"] if stamp[11:] == DB_AUTO_AT and db_cfg(p).get("prefix")
+                         and db_cfg(p).get("auto", True) and db_cfg(p).get("auto_day") != stamp[:10]]
+                for p in dbdue:
+                    p["db"]["auto_day"] = stamp[:10]
+                if due or dbdue:
                     save_cfg()
+                for p in dbdue:
+                    threading.Thread(target=db_refresh, args=(p, "자동"), daemon=True).start()
                 for proj, sc in due:
                     try:
                         job = create_job(proj, sc["request"], source="schedule",
@@ -3421,6 +3644,42 @@ def r_source_mode(m, b):
     return {"mode": mode}
 
 
+@route("GET", r"/api/projects/([^/]+)/db")
+def r_db(m, b):
+    return db_status(proj_of(m[1]))
+
+
+@route("POST", r"/api/projects/([^/]+)/db")
+def r_db_save(m, b):
+    proj = proj_of(m[1])
+    pre = str(b.get("prefix") or "").strip().upper()
+    if pre and not DB_PREFIX_RE.match(pre):
+        raise ApiError(400, "환경 변수 접두어는 영문 대문자·숫자·밑줄만 쓸 수 있습니다 (예: MYMA_DB)")
+    ct = str(b.get("code_tables") or "").strip()[:200]
+    if not re.match(r"^[\w*?, ]*$", ct):
+        raise ApiError(400, "코드 테이블은 이름이나 패턴을 쉼표로 구분해 적으세요 (예: CM*, ZZ_CODE)")
+    with LOCK:
+        d = proj.setdefault("db", {})
+        d.update({"prefix": pre, "code_tables": ct or "CM*", "auto": bool(b.get("auto", True))})
+        save_cfg()
+    return db_status(proj)
+
+
+@route("POST", r"/api/projects/([^/]+)/db/refresh", lock=False)  # 수 초 걸리므로 전체 잠금 없이
+def r_db_refresh(m, b):
+    proj = proj_of(m[1])
+    db_refresh(proj)
+    return db_status(proj)
+
+
+@route("GET", r"/api/projects/([^/]+)/db/readme")
+def r_db_readme(m, b):
+    t = read_text(db_dir(proj_of(m[1])) / "README.md", 300_000)
+    if t is None:
+        raise ApiError(404, "아직 가져온 DB 구조 자료가 없습니다")
+    return {"content": t}
+
+
 @route("GET", r"/api/all-agents")
 def r_all_agents(m, b):
     out = []
@@ -3904,6 +4163,11 @@ def main():
     if not PASSWORD:
         sys.exit("GUI_PASSWORD 가 설정되지 않았습니다. %s/.env 에 GUI_PASSWORD=원하는비밀번호 를 추가하세요." % BASE)
     load_cfg()
+    for pj in CFG["projects"]:   # 권한 규칙이 바뀐 버전으로 올라와도 기존 에이전트 설정에 반영
+        try:
+            refresh_agent_settings(pj)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
     sec_load()
     recover()
     probe_flags()
