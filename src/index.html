@@ -128,6 +128,34 @@ table.ut{border-collapse:collapse;width:100%;font-size:13px}.ut td,.ut th{paddin
 .tip{font-size:13px;color:var(--mute)}.tip li{margin:4px 0}
 #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:9px 16px;border-radius:99px;font-size:13px;opacity:0;transition:.2s;pointer-events:none;max-width:90vw}
 #toast.show{opacity:1}
+/* ---- 화면 개편 (2026-11) ---- */
+:root{--radius:14px;--shadow:0 1px 2px rgba(20,20,10,.05),0 4px 14px rgba(20,20,10,.04)}
+header{position:sticky;top:0;z-index:20;padding:10px 24px;gap:16px}
+header h1{font-size:17px;letter-spacing:-.01em}
+.subnav{position:sticky;top:52px;z-index:19;padding:6px 24px}
+.wrap{grid-template-columns:400px minmax(0,1fr);gap:20px;padding:20px 24px;max-width:1520px}
+.wrap>aside{position:sticky;top:112px;align-self:start}
+.card{border-radius:var(--radius);padding:18px;box-shadow:var(--shadow)}
+.card h2{font-size:14px;color:var(--ink);margin-bottom:12px}
+#req{min-height:230px;font-size:15px;line-height:1.65;padding:12px 14px;background:var(--panel)}
+#req:focus,textarea:focus,input[type=text]:focus,select:focus{outline:2px solid color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:0;border-color:var(--accent)}
+#go{padding:9px 22px}
+.jobs{max-height:calc(100vh - 560px);min-height:180px;gap:8px}
+.job{padding:11px 13px;border-radius:12px}
+main.card#main{padding:24px 28px;min-height:calc(100vh - 160px)}
+.title h2{font-size:21px;letter-spacing:-.01em}
+.steps{gap:8px}
+.step{border-radius:12px;padding:9px 12px}
+.tabs{position:sticky;top:104px;background:var(--panel);z-index:3;margin-top:18px}
+.tab{padding:10px 14px;font-size:14px}
+.doc{max-height:none;font-size:15.5px;line-height:1.8;padding:20px 4px 8px}
+.doc h2{font-size:21px}.doc h3{font-size:18px}
+.doc pre{font-size:13px;line-height:1.55}
+.doc .ev{margin-top:0}.doc .ev div{font-size:13.5px;padding:5px 0;border-bottom:1px dashed var(--line)}
+.approve{border-radius:var(--radius);padding:16px 18px}
+@media (max-width:1100px){.wrap{grid-template-columns:340px minmax(0,1fr)}}
+@media (max-width:860px){.wrap{grid-template-columns:minmax(0,1fr);padding:12px}.wrap>aside{position:static}
+  .jobs{max-height:45vh}main.card#main{padding:16px;min-height:0}.tabs{top:96px}#req{min-height:160px}header,.subnav{padding-left:12px;padding-right:12px}}
 </style>
 </head>
 <body>
@@ -141,7 +169,7 @@ table.ut{border-collapse:collapse;width:100%;font-size:13px}.ut td,.ut th{paddin
   <aside>
     <div class="card">
       <h2>새 작업 요청</h2>
-      <textarea id="req" placeholder="요청 내용을 입력하세요 (스크린샷은 Ctrl+V로 붙여넣거나 끌어다 놓을 수 있습니다)"></textarea>
+      <textarea id="req" placeholder="무엇을 해야 하는지 자세히 적어주세요.&#10;&#10;예) 마필 목록 화면에서 검색창이 모바일에서 잘려 보여요. 한 줄로 보이게 고쳐주세요.&#10;&#10;· 스크린샷은 Ctrl+V로 붙여넣거나 끌어다 놓기&#10;· Ctrl+Enter로 바로 시작"></textarea>
       <div id="attl" class="attl"></div>
       <div class="row" style="margin-top:8px"><button class="pri" id="go">작업 시작</button><label class="attb">파일 첨부<input type="file" id="attf" multiple hidden accept="image/*,.pdf,.txt,.md,.csv,.json,.log,.yaml,.yml,.html,.css,.js,.ts,.vue,.py,.sql,.xml,.har"></label></div>
     </div>
@@ -270,7 +298,7 @@ async function loadDetail(force){
   const j=d.job,f=d.files,stg=d.stages.filter(s=>s.enabled);
   const steps=stg.map(s=>[s.id,s.name,s.agent]).concat([['user','최종 승인','나']]);
   const keys=steps.map(s=>s[0]);
-  if(!tabPinned&&f.approved!=null&&d.repo){tab='approved'}else if(!tabPinned){const w=d.stages.slice().reverse().find(s=>s.kind==='work'&&f[s.id]!=null);tab=f.final?'final':(w?w.id:'request')}
+  if(!tabPinned&&f.approved!=null&&d.repo){tab='approved'}else if(!tabPinned){const w=d.stages.slice().reverse().find(s=>s.kind==='work'&&f[s.id]!=null);tab=f.final?'final':(w?w.id:((j.status==='running'||j.status==='queued')?'log':'request'))}
   const nS=stg.length;
   const ci=j.needs_input?Math.max(0,keys.indexOf(j.step)):(j.status==='awaiting_user'||j.status==='deploying')?nS:j.status==='approved'?nS+1:Math.max(0,keys.indexOf(j.step));
   const st=i=>i<ci?'done':i===ci?((j.status==='failed'||j.status==='cancelled')?'err':(j.status==='running'||j.status==='awaiting_user'||j.status==='deploying')?'active':'wait'):'wait';
@@ -340,15 +368,15 @@ async function loadDetail(force){
     }
     $('#act').innerHTML=act;bindJob(j);
   }
-  const tdef=(f.approved!=null&&d.repo?[['approved','승인본']]:[]).concat(f.diff!=null?[['diff','변경 내용']]:[]).concat([['final','최종본']]).concat(d.stages.slice().reverse().map(s=>[s.id,s.name+(s.kind==='review'?' (검토)':'')+(s.enabled?'':' ·꺼짐')])).concat([['request','요청']]);
-  const tabsH='<div class="tabs">'+tdef.map(t=>'<button class="tab'+(tab===t[0]?' on':'')+(f[t[0]]!=null?'':' none')+'" data-t="'+esc(t[0])+'">'+esc(t[1])+'</button>').join('')+'</div>';
-  const txt=f[tab];const ts=d.stages.find(s=>s.id===tab);const isRev=ts&&ts.kind==='review';
+  const tdef=(f.approved!=null&&d.repo?[['approved','승인본']]:[]).concat(f.diff!=null?[['diff','변경 내용']]:[]).concat([['final','최종본']]).concat(d.stages.slice().reverse().map(s=>[s.id,s.name+(s.kind==='review'?' (검토)':'')+(s.enabled?'':' ·꺼짐')])).concat([['request','요청'],['log','진행 기록 ('+j.events.length+')']]);
+  const tabsH='<div class="tabs">'+tdef.map(t=>'<button class="tab'+(tab===t[0]?' on':'')+(f[t[0]]!=null||t[0]==='log'?'':' none')+'" data-t="'+esc(t[0])+'">'+esc(t[1])+'</button>').join('')+'</div>';
+  const txt=tab==='log'?'':f[tab];const ts=d.stages.find(s=>s.id===tab);const isRev=ts&&ts.kind==='review';
   let vd='';if(isRev){const v=verdictOf(txt);if(v)vd='<div class="vd">판정: <b>'+(v==='APPROVE'?'승인':'수정요청')+'</b></div>'}
-  const docH=txt==null?'<div class="empty" style="padding:30px">아직 만들어지지 않았습니다</div>':vd+md(isRev?stripV(txt):txt);
+  const docH=tab==='log'?evh:txt==null?'<div class="empty" style="padding:30px">아직 만들어지지 않았습니다</div>':vd+md(isRev?stripV(txt):txt);
   const sig=JSON.stringify([head,evh,tabsH,docH]);
   if(last.sig!==sig||force){
     const keep=$('.doc')?$('.doc').scrollTop:0;
-    $('#hd').innerHTML=head;$('#tb').innerHTML=tabsH;$('#ev').innerHTML=evh;
+    $('#hd').innerHTML=head;$('#tb').innerHTML=tabsH;
     const dc=$('.doc');dc.innerHTML=docH;if(last.sel===sel&&last.tab===tab)dc.scrollTop=keep;
     last.sig=sig;last.sel=sel;last.tab=tab;
   }
@@ -391,7 +419,7 @@ function bindJob(j){
 }
 function selectJob(id){
   sel=id;tab=null;tabPinned=false;last={list:last.list};
-  $('#main').innerHTML='<div id="hd"></div><div id="act"></div><div id="tb"></div><div class="doc"></div><h2 style="margin:16px 0 0;font-size:13px;color:var(--mute)">진행 기록</h2><div id="ev"></div>';
+  $('#main').innerHTML='<div id="hd"></div><div id="act"></div><div id="tb"></div><div class="doc"></div>';
   $('#tb').onclick=e=>{const b=e.target.closest('.tab');if(b){tab=b.dataset.t;tabPinned=true;loadDetail(true)}};
   tick(true);
 }
@@ -413,6 +441,7 @@ function drawAtt(){
   $('#attl').querySelectorAll('[data-rm]').forEach(b=>b.onclick=()=>{const a=ATT.splice(+b.dataset.rm,1)[0];if(a&&a.url)URL.revokeObjectURL(a.url);drawAtt()});
 }
 const b64=f=>new Promise((ok,no)=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(',')[1]||'');r.onerror=no;r.readAsDataURL(f)});
+$('#req').addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();$('#go').click()}});
 $('#attf').onchange=e=>{addFiles(e.target.files);e.target.value=''};
 $('#req').addEventListener('paste',e=>{const fs=[...(e.clipboardData||{}).items||[]].filter(x=>x.kind==='file').map(x=>x.getAsFile()).filter(Boolean);if(fs.length){e.preventDefault();addFiles(fs)}});
 {const box=$('#req').closest('.card');box.classList.add('req');
