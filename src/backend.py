@@ -2463,6 +2463,10 @@ def job_detail(proj, j):
         rp["preview"] = bool(j.get("preview_merges"))
         rp["preview_fresh"] = bool(rp["preview"] and j["status"] == "awaiting_user" and preview_fresh(proj, j))
         rp["preview_at"] = j.get("preview_at", "")
+        if j["status"] == "awaiting_user" and rp["release"]:   # 테스트 서버에 올릴 코드 변경이 있는 저장소
+            br = job_branch(j["id"])
+            rp["changed"] = [r.get("name", r["id"]) for r in repos_of(proj) if r.get("release") and G(
+                proj, r, "rev-list", "--count", "origin/%s..%s" % (rbase(r), br), check=False).stdout.strip() not in ("", "0")]
     if rp and j.get("release_state") == "pending":
         try:
             rp["with"] = [{"id": x["id"], "title": x["title"]} for x in pending_jobs(proj, j) if x["id"] != j["id"]]
