@@ -159,7 +159,7 @@ main.card#main{padding:24px 28px;min-height:calc(100vh - 160px)}
   .jobs{max-height:45vh}main.card#main{padding:16px;min-height:0}.tabs{top:96px}#req{min-height:160px}header,.subnav{padding-left:12px;padding-right:12px}}
 </style>
 </head>
-<body>
+<body><datalist id="mdl"><option value="opus">가장 최신 Opus</option><option value="sonnet">가장 최신 Sonnet</option><option value="haiku">가장 최신 Haiku (저렴)</option><option value="claude-opus-5-5">Opus 5.5 고정</option><option value="claude-sonnet-5-5">Sonnet 5.5 고정</option><option value="claude-haiku-5-5">Haiku 5.5 고정</option></datalist>
 <header><h1>에이전트 하네스</h1><div class="ptabs" id="ptabs"></div><div class="sp"></div><div class="q" id="qinfo"></div><a class="q" href="/logout" style="color:var(--mute);margin-left:12px">로그아웃</a></header>
 <div class="subnav" id="subnav" hidden>
   <button class="nv on" data-v="jobs">작업</button><button class="nv" data-v="agents">에이전트</button><button class="nv" data-v="sources">자료</button><button class="nv" data-v="stages">단계</button><button class="nv" data-v="sched">예약</button><button class="nv" data-v="settings">설정</button>
@@ -482,7 +482,7 @@ async function openAgent(id){
   const st=a.stages.length?a.stages.map(s=>'<span class="chip running">'+esc(s)+'</span>').join(''):'<span class="chip">담당 단계 없음</span>';
   $('#aedit').innerHTML='<div class="title"><h2>'+esc(a.name)+'</h2></div><div class="badges"><span class="chip">'+esc(a.workspace)+'</span>'+st+'</div>'+warn
     +'<div class="g2"><label class="lb">이름<input type="text" id="an" maxlength="30" value="'+esc(a.name)+'"></label>'
-    +'<label class="lb">모델 (비우면 기본값. 예: haiku, sonnet, opus)<input type="text" id="am" value="'+esc(a.model)+'" placeholder="기본값"></label></div>'
+    +'<label class="lb">모델 (비우면 기본값. 목록에서 고르거나 직접 입력)<input type="text" id="am" list="mdl" value="'+esc(a.model)+'" placeholder="기본값"></label></div>'
     +permsHtml(a.perms)
     +'<label class="lb" style="margin-top:10px">역할 설명 (CLAUDE.md)'+(a.has_md?'':' - 아직 없어서 기본 틀을 채웠습니다')+'<textarea id="amd" class="mono" spellcheck="false">'+esc(a.claude_md)+'</textarea></label>'
     +'<div class="vd">저장하면 이전 내용은 shared/history/_agents 에 백업됩니다. 권한 설정(settings.json)은 위 체크박스 기준으로 다시 만들어집니다.</div>'
@@ -506,7 +506,7 @@ function newAgentForm(){
   selAgent=null;
   $('#aedit').innerHTML='<div class="title"><h2>새 에이전트</h2></div>'
     +'<div class="g2"><label class="lb">이름<input type="text" id="nn" maxlength="30" placeholder="예: 번역가"></label>'
-    +'<label class="lb">모델 (선택)<input type="text" id="nm" placeholder="기본값"></label></div>'
+    +'<label class="lb">모델 (선택)<input type="text" id="nm" list="mdl" placeholder="기본값"></label></div>'
     +'<label class="lb">역할 설명 (나중에 자유롭게 고칠 수 있습니다. 비워 두면 기본 틀만 채워집니다)<textarea id="nd" placeholder="예: 전문 번역가다. 원문의 의미와 어조를 보존하며 자연스럽게 옮기고, 고유명사·숫자는 그대로 둔다. 직역으로 어색해지는 표현은 관용구로 바꾸되 내용을 더하거나 빼지 않는다."></textarea></label>'
     +permsHtml({web:false,bash:false})
     +'<label class="lb">이미 만들어 둔 폴더를 연결하려면 폴더 이름 입력 (선택)<input type="text" id="nw" placeholder="비워 두면 새 폴더를 자동으로 만듭니다"></label>'
@@ -832,7 +832,7 @@ async function loadSettings(){
     +'<div class="card"><h2>전체 설정 (모든 프로젝트 공통)</h2>'
     +'<div class="g2"><label class="lb">동시에 실행할 작업 수<select id="gp">'+[1,2,3].map(n=>'<option value="'+n+'"'+(settings.parallel===n?' selected':'')+'>'+n+'개'+(n===1?' (라즈베리파이 권장)':'')+'</option>').join('')+'</select></label>'
     +'<label class="lb">작업당 토큰 한도 (0=무제한, 새 토큰 기준)<input type="text" id="gt" value="'+(settings.job_token_limit||0)+'"></label></div>'
-    +'<label class="lb">단계 추천(AI)에 쓸 모델<input type="text" id="gm" value="'+esc(settings.planner_model||'')+'" placeholder="sonnet"></label>'
+    +'<label class="lb">단계 추천(AI)에 쓸 모델<input type="text" id="gm" value="'+esc(settings.planner_model||'')+'" list="mdl" placeholder="sonnet"></label>'
     +'<div class="vd">동시 실행은 프로젝트가 달라도 합산됩니다. 한 번에 에이전트 1개가 메모리를 약 300~500MB 쓰므로 4GB 파이는 1~2개를 권장합니다.</div>'
     +'<div class="row" style="margin-top:8px"><button class="pri" id="gsave">저장</button></div></div>'
     +'<div class="card"><h2>토큰 절감 옵션 (설치된 claude가 지원하면 자동 적용)</h2><div class="row">'+fl+'</div>'
@@ -918,7 +918,7 @@ function manualRows(){
   return manual.map((a,i)=>'<div class="sc" data-i="'+i+'"><div class="sch"><b>'+(i+1)+'</b>'
     +'<input type="text" data-f="name" value="'+esc(a.name)+'" maxlength="30" placeholder="이름 (예: 리서처)">'
     +'<label class="inl"><input type="checkbox" data-f="web"'+(a.web?' checked':'')+'> 웹</label>'
-    +'<input type="text" data-f="model" value="'+esc(a.model||'')+'" placeholder="모델(선택)" style="width:110px">'
+    +'<input type="text" data-f="model" value="'+esc(a.model||'')+'" list="mdl" placeholder="모델(선택)" style="width:110px">'
     +'<button class="dng" data-a="del">삭제</button></div>'
     +'<div class="scb"><label class="lb">이 에이전트가 할 일<textarea data-f="role" rows="2" style="min-height:52px" placeholder="예: 자료를 조사해 사실만 정리하고 출처를 적는다">'+esc(a.role)+'</textarea></label></div></div>').join('')
     ||'<div class="empty" style="padding:16px">아직 에이전트가 없습니다. 아래에서 추가하세요.</div>';

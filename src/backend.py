@@ -71,6 +71,17 @@ CLAUDE_JSON = Path.home() / ".claude.json"
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9._:\-\[\]]{0,60}$")
+def norm_model(m):
+    """사람이 적은 모델 이름을 Claude CLI가 아는 이름으로: 'opus5.5'·'Opus 5.5' → claude-opus-5-5, 'Opus' → opus."""
+    t = re.sub(r"\s+", " ", str(m or "").strip().lower())
+    k = re.match(r"^(?:claude[- ]?)?(opus|sonnet|haiku|fable|mythos)(?:[- ]?(\d+)(?:[.\- ](\d+))?)?$", t)
+    if not k:
+        return str(m or "").strip()
+    if not k[2]:
+        return k[1]
+    return "claude-%s-%s%s" % (k[1], k[2], ("-" + k[3]) if k[3] else "")
+
+
 RESERVED_STAGE = {"request", "final", "approved"}
 RESERVED_DIR = {"shared", "logs", "scripts", "projects"}
 DEFAULT_SETTINGS = {"parallel": 1, "job_token_limit": 0, "planner_model": "sonnet",
@@ -279,7 +290,7 @@ def norm_plan(p, max_stages=8, max_agents=6):
         key = re.sub(r"[^a-z0-9_]", "", str(a.get("key") or "").lower())[:20] or "a%d" % (len(agents) + 1)
         while key in keys:
             key += "x"
-        model = str(a.get("model") or "").strip()
+        model = norm_model(a.get("model"))
         agents.append({"key": key, "name": (str(a.get("name") or key).strip()[:30] or key),
                        "role": str(a.get("role") or "").strip()[:1500], "web": bool(a.get("web")),
                        "model": model if MODEL_RE.match(model) else ""})
@@ -616,7 +627,7 @@ def create_agent_in(proj, name, desc, perms, model="", existing=""):
     if not sp.exists():
         sp.write_text(json.dumps(build_settings(proj, perms), ensure_ascii=False, indent=2))
     nums = [int(re.sub(r"\D", "", a["id"]) or 0) for a in proj["agents"]]
-    a = {"id": "agent%d" % (max(nums + [0]) + 1), "name": name, "workspace": ws_name, "model": model}
+    a = {"id": "agent%d" % (max(nums + [0]) + 1), "name": name, "workspace": ws_name, "model": norm_model(model)}
     proj["agents"].append(a)
     trust(ws)
     return a
@@ -775,6 +786,7 @@ def probe_flags():
 
 
 def build_cmd(prompt, model="", turns=10, tools=None):
+    model = norm_model(model)
     cmd = shlex.split(AGENT_CMD) + ["-p", prompt, "--output-format", "json", "--max-turns", str(turns),
                                     "--permission-mode", "acceptEdits"]
     if model:
@@ -2853,7 +2865,7 @@ def agent_save(proj, a, b):
     sp = ws / ".claude" / "settings.json"
     backup_file(proj, sp)
     sp.write_text(json.dumps(build_settings(proj, b.get("perms") or {}), ensure_ascii=False, indent=2))
-    a["name"], a["model"] = name, model
+    a["name"], a["model"] = name, norm_model(model)
     save_cfg()
     ok = trust(ws)
     return {"agent": agent_info(proj, a, True), "warning": None if ok else
@@ -2898,7 +2910,7 @@ def settings_update(b):
     except (TypeError, ValueError):
         raise ApiError(400, "숫자 형식이 올바르지 않습니다")
     if "planner_model" in b:
-        m = str(b["planner_model"] or "").strip()
+        m = norm_model(b["planner_model"])
         if not MODEL_RE.match(m):
             raise ApiError(400, "모델 이름이 올바르지 않습니다")
         s["planner_model"] = m
