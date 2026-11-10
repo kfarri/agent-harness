@@ -129,6 +129,7 @@ table.ut{border-collapse:collapse;width:100%;font-size:13px}.ut td,.ut th{paddin
 #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:9px 16px;border-radius:99px;font-size:13px;opacity:0;transition:.2s;pointer-events:none;max-width:90vw}
 #toast.show{opacity:1}
 /* ---- 화면 개편 (2026-11) ---- */
+.pvbox{border:1px solid var(--ok,#3a8);border-radius:10px;padding:12px 14px;background:color-mix(in srgb,var(--ok,#3a8) 8%,transparent)}
 :root{--radius:14px;--shadow:0 1px 2px rgba(20,20,10,.05),0 4px 14px rgba(20,20,10,.04)}
 header{position:sticky;top:0;z-index:20;padding:10px 24px;gap:16px}
 header h1{font-size:17px;letter-spacing:-.01em}
@@ -325,8 +326,8 @@ async function loadDetail(force){
     }else if(j.status==='awaiting_user'){
       const lastRev=stg.slice().reverse().find(s=>s.kind==='review'&&f[s.id]!=null);
       const rv=lastRev?verdictOf(f[lastRev.id]):'APPROVE';
-      act='<div class="card approve"><h3>최종 승인이 필요합니다</h3><div class="sub">'+(rv==='APPROVE'?'검토를 통과한 결과물입니다.':'검토 단계의 수정요청이 남은 상태입니다. 해당 탭에서 내용을 확인하세요.')+(d.repo&&d.repo.release?' 승인하면 테스트 서버('+esc(d.repo.base)+')에만 반영됩니다. 운영은 테스트 서버에서 확인한 뒤 이 화면의 \'운영 반영\'으로 따로 올립니다.':d.repo?(d.repo.mode==='branch'?' 승인하면 작업 브랜치를 GitHub에 푸시합니다(PR은 직접 병합).':' 승인하면 '+esc(d.repo.base)+'에 병합해 GitHub에 푸시합니다. 푸시되면 GitHub Actions 빌드가 시작됩니다.')+' \'변경 내용\' 탭에서 diff를 먼저 확인하세요.':' 승인하면 outbox에 approved 파일로 저장됩니다.')+'</div>'
-        +'<div class="row"><button class="pri" id="ap">'+(d.repo&&d.repo.release?'승인 · 테스트 서버 반영':'최종 승인')+'</button></div><hr style="border:0;border-top:1px solid var(--line);margin:12px 0">'
+      act='<div class="card approve"><h3>최종 승인이 필요합니다</h3><div class="sub">'+(rv==='APPROVE'?'검토를 통과한 결과물입니다.':'검토 단계의 수정요청이 남은 상태입니다. 해당 탭에서 내용을 확인하세요.')+(d.repo&&d.repo.release?'':d.repo?(d.repo.mode==='branch'?' 승인하면 작업 브랜치를 GitHub에 푸시합니다(PR은 직접 병합).':' 승인하면 '+esc(d.repo.base)+'에 병합해 GitHub에 푸시합니다. 푸시되면 GitHub Actions 빌드가 시작됩니다.')+' \'변경 내용\' 탭에서 diff를 먼저 확인하세요.':' 승인하면 outbox에 approved 파일로 저장됩니다.')+'</div>'
+        +(d.repo&&d.repo.release?pvRow(d):'<div class="row"><button class="pri" id="ap">최종 승인</button></div>')+'<hr style="border:0;border-top:1px solid var(--line);margin:12px 0">'
         +'<textarea id="fb" placeholder="수정이 필요하면 요청 내용을 적어주세요"></textarea>'
         +'<div class="row" style="margin-top:8px"><select id="st" style="width:auto">'+opts+'</select><button id="rj">반려하고 다시 작업</button></div></div>';
     }else if(j.status==='running'||j.status==='queued'){
@@ -344,7 +345,7 @@ async function loadDetail(force){
     }else if(j.status==='failed'||j.status==='cancelled'){
       act='<div class="row" style="margin:10px 0"><button class="pri" id="ed">요청 수정</button><select id="st" style="width:auto">'+opts.replace(' selected','')+'</select><button id="rt">그대로 다시 시도</button></div>';
     }else if(j.status==='deploying'){
-      act='<div class="vd">승인됨 - GitHub 저장소에 반영하는 중입니다…</div>';
+      act='<div class="vd">'+(j.previewing?'테스트 서버에 올리는 중입니다… (승인 전 미리보기)':'승인됨 - GitHub 저장소에 반영하는 중입니다…')+'</div>';
     }else if(j.status==='approved'&&j.release_state==='pending'){
       const w=(d.repo&&d.repo.with)||[];
       act='<div class="card approve"><h3>테스트 서버에 반영됨 · 운영 반영 대기</h3>'
@@ -417,6 +418,8 @@ function bindJob(j){
     try{const files=await Promise.all(EDNEW.map(async f=>({name:f.name,data:await b64(f)})));
       await post(url+'/edit',{request:t,remove:EDDROP,files});EDIT=null;toast('수정한 요청으로 다시 시작합니다');last={};await loadList();tick(false)}
     catch(err){toast(err.message);e.target.disabled=false}};
+  if(q('#pv'))q('#pv').onclick=()=>run(()=>post(url+'/preview',{}),'테스트 서버에 올리는 중 - 1~3분 뒤 확인하세요');
+  if(q('#pvdn'))q('#pvdn').onclick=()=>{if(confirm('테스트 서버에 올려 둔 이 작업의 변경을 내릴까요?\n(작업 결과는 그대로 남아 다시 올리거나 승인할 수 있습니다)'))run(()=>post(url+'/takedown',{}),'내렸습니다 - 1~3분 뒤 테스트 서버가 이전 상태로 돌아갑니다')};
   if(q('#rvt'))q('#rvt').onclick=()=>{if(confirm('이 작업의 코드 변경을 테스트 서버에서 되돌릴까요?\n(운영 서버에는 영향 없음, 1~3분 안에 테스트 서버가 이전 상태로 배포됩니다)'))run(()=>post(url+'/revert',{}),'되돌렸습니다 - 1~3분 안에 테스트 서버에 반영됩니다')};
   if(q('#rel'))q('#rel').onclick=()=>{if(confirm('테스트 서버에서 확인을 마쳤나요?\n운영에 반영하면 1~3분 안에 실서버에 배포됩니다.'))run(()=>post(base()+'/repo/release',{job:j.id}),'운영 반영 완료 - 1~3분 안에 실서버에 배포됩니다')};
   if(q('#jdel'))q('#jdel').onclick=async()=>{if(!confirm('이 작업을 삭제할까요?\n요청·중간 결과·최종본·로그가 모두 지워지고 되돌릴 수 없습니다.'+(j.status==='approved'?'\n(이미 GitHub에 반영된 코드는 그대로 남습니다)':'')))return;try{await post(url+'/delete');toast('삭제했습니다');sel=null;last={};$('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>';await loadList()}catch(e){toast(e.message)}};
@@ -690,6 +693,16 @@ async function loadDb(){
     try{const r=await post(base()+'/db/refresh',{});toast(r.last&&r.last.ok?'가져왔습니다':'실패: '+(r.last?r.last.msg:''))}catch(e){toast(e.message)}await loadDb()};
   if($('#dbview'))$('#dbview').onclick=async()=>{const t=$('#dbtoc');if(t.innerHTML){t.innerHTML='';return}
     try{const r=await api(base()+'/db/readme');t.innerHTML='<pre class="mono" style="max-height:420px;overflow:auto;white-space:pre-wrap;margin-top:10px">'+esc(r.content)+'</pre>'}catch(e){toast(e.message)}};
+}
+function pvRow(d){
+  const r=d.repo,tu=r.test_url?'<a class="attb" style="text-decoration:none" href="'+esc(r.test_url)+'" target="_blank" rel="noopener">테스트 서버 열기 ↗</a>':'';
+  if(r.preview_fresh)return '<div class="pvbox"><b>① 테스트 서버에 올라가 있습니다</b>'+(r.preview_at?' <span style="color:var(--mute)">('+esc(r.preview_at.slice(5,16))+')</span>':'')
+    +'<div class="sub" style="margin:4px 0 8px">1~3분 뒤 테스트 서버에서 직접 확인하세요. 괜찮으면 <b>② 승인</b>, 마음에 안 들면 아래에 수정 내용을 적어 다시 작업하거나 <b>내리기</b>를 누르세요. 운영 서버에는 아직 아무것도 올라가지 않았습니다.</div>'
+    +'<div class="row">'+tu+'<button class="pri" id="ap">② 승인</button><button class="dng" id="pvdn">테스트 서버에서 내리기</button></div></div>';
+  return '<div class="sub" style="margin:0 0 8px">'+(r.preview?'<b>다시 작업한 내용은 아직 테스트 서버에 없습니다.</b> 테스트 서버에는 이전 미리보기가 올라가 있습니다. ':'')
+    +'<b>① 테스트 서버에 올려 보기</b>로 화면을 먼저 확인한 뒤 승인하세요. 운영 서버에는 승인 후 \'운영 반영\'을 눌러야 올라갑니다.</div>'
+    +'<div class="row"><button class="pri" id="pv">① 테스트 서버에 올려 보기</button>'+(r.preview?'<button class="dng" id="pvdn">이전 미리보기 내리기</button>':'')
+    +'<button id="ap" title="테스트 서버 확인 없이 바로 승인 (테스트 서버에도 반영됨)">확인 없이 바로 승인</button></div>';
 }
 function srcForm(name,content){
   $('#srcform').innerHTML='<div class="card"><h2>'+(name?'자료 편집: '+esc(name):'새 자료')+'</h2>'

@@ -1165,6 +1165,10 @@ def repo_promote(proj, who="GUI", job=None):
                 t = targets.get(r["id"])
                 if not t:
                     continue
+                bl = preview_blockers(proj, r, t)
+                if bl:
+                    raise ApiError(409, "아직 승인하지 않고 테스트 서버에만 올려 둔 작업이 함께 운영에 올라가게 됩니다: %s. "
+                                        "그 작업을 먼저 승인하거나 테스트 서버에서 내리세요" % ", ".join(bl))
                 n = int(G(proj, r, "rev-list", "--count", "--no-merges", "origin/%s..%s" % (r["release"], t)).strip() or 0)
                 if n:
                     plan.append((r, t, n))
@@ -1504,10 +1508,12 @@ def repo_discard(proj):
     return hit
 
 
-def repo_deliver(proj, j, summary_src):
-    """최종 승인 후: 바뀐 저장소마다 기준 브랜치에 병합해 푸시(또는 작업 브랜치만 푸시) → 배포 명령 실행."""
+def repo_deliver(proj, j, summary_src, preview=False):
+    """최종 승인 후: 바뀐 저장소마다 기준 브랜치에 병합해 푸시(또는 작업 브랜치만 푸시) → 배포 명령 실행.
+    preview=True 면 승인 전 미리보기: 테스트 브랜치에만 병합·푸시하고 승인 대기로 돌아간다."""
     jid, br = j["id"], job_branch(j["id"])
     lines, merges = [], job_merges(j)
+    pv = {k: list(v) for k, v in (j.get("preview_merges") or {}).items()}
     multi = len(repos_of(proj)) > 1
     try:
         with repo_lock(proj["id"]):
@@ -1522,6 +1528,10 @@ def repo_deliver(proj, j, summary_src):
                 ahead = int(G(proj, r, "rev-list", "--count", "origin/%s..%s" % (base, br)).strip() or 0)
                 if ahead:
                     todo.append((r, ahead))
+            if preview:
+                todo = [(r, a) for r, a in todo if r.get("release") and r.get("merge", "merge") != "branch"]
+                if not todo:
+                    raise RuntimeError("테스트 서버에 새로 올릴 바뀐 코드가 없습니다")
             if not todo:
                 lines.append("- 바뀐 코드가 없어 저장소에는 반영하지 않았습니다")
                 if repo_release(proj) and not merges:
@@ -1549,7 +1559,10 @@ def repo_deliver(proj, j, summary_src):
                     continue
                 G(proj, r, "push", "-q", "origin", "%s:%s" % (base, base), timeout=300)
                 sha = G(proj, r, "log", "-1", "--format=%h").strip()
-                if r.get("release"):
+                if preview:
+                    pv.setdefault(r["id"], []).append(G(proj, r, "rev-parse", "HEAD").strip())
+                    set_state(j, preview_merges=dict(pv))
+                elif r.get("release"):
                     merges[r["id"]] = G(proj, r, "rev-parse", "HEAD").strip()
                     set_state(j, merges=dict(merges), merge_sha="", release_state="pending", approved_at=now())
                 lines.append("- %s`%s`에 병합하고 푸시했습니다 (커밋 %s, 변경 커밋 %d개)" % (pre, base, sha, ahead))
@@ -1563,22 +1576,131 @@ def repo_deliver(proj, j, summary_src):
                     if not ok:
                         lines.append("```\n%s\n```" % tail[-1500:])
                         event(j, "system", "배포 명령 실패 (%s, 코드는 이미 푸시됨)" % name, "err")
-            if any(r.get("release") for r, _ in todo):
+            if preview:
+                pass
+            elif any(r.get("release") for r, _ in todo):
                 tu = repo_test_url(proj)
                 lines.append("- **테스트 서버**%s에 1~3분 안에 배포됩니다. 확인한 뒤 이 작업 화면의 '운영 반영'을 누르면 운영으로 올라갑니다"
                              % (" (%s)" % tu if tu else ""))
     except Exception as e:  # noqa: BLE001
-        set_state(j, status="awaiting_user", error="저장소 반영 실패: %s" % e)
-        event(j, "system", "저장소 반영 실패: %s" % e, "err")
+        set_state(j, status="awaiting_user", error="%s 실패: %s" % ("테스트 서버 올리기" if preview else "저장소 반영", e),
+                  previewing=False)
+        event(j, "system", "%s 실패: %s" % ("테스트 서버 올리기" if preview else "저장소 반영", e), "err")
+        if preview:
+            return
         notify("[%s] %s\n저장소 반영 실패: %s" % (proj["name"], j["title"], str(e)[:300]),
                [[("다시 승인", "ap:%s:%s" % (proj["id"], jid))]], j.get("chat") or None)
         return
+    if preview:
+        set_state(j, status="awaiting_user", error="", previewing=False, preview_at=now())
+        event(j, "user", "승인 전 테스트 서버에 올림 - 1~3분 뒤 확인하고 승인하거나 내리세요", "ok")
+        notify("[%s] %s\n테스트 서버에 올렸습니다. 1~3분 뒤 확인하고 승인하세요%s" % (
+            proj["name"], j["title"], (" (%s)" % repo_test_url(proj)) if repo_test_url(proj) else ""), None, j.get("chat") or None)
+        return
+    if j.get("preview_merges"):   # 미리보기로 올렸던 병합은 이제 정식 승인분에 포함됨
+        set_state(j, preview_merges={}, preview_at="")
     body = (read_text(summary_src) or "").rstrip()
     fpath(proj, "approved", jid).write_text(body + "\n\n## 저장소 반영\n" + "\n".join(lines) + "\n")
     set_state(j, status="approved", error="")
     event(j, "user", "최종 승인 · 저장소 반영 완료", "ok")
     notify_job(j, "approved")
 
+
+
+def preview_fresh(proj, j):
+    """미리보기로 올린 뒤 작업 브랜치에 새 커밋이 없으면 True (테스트 서버에 있는 그대로 승인 가능)."""
+    if not j.get("preview_merges"):
+        return False
+    br = job_branch(j["id"])
+    for r in repos_of(proj):
+        if G(proj, r, "rev-parse", "--verify", "--quiet", "refs/heads/" + br, check=False).returncode:
+            continue
+        if r_changed(proj, r) and G(proj, r, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip() == br:
+            return False
+        n = G(proj, r, "rev-list", "--count", "origin/%s..%s" % (rbase(r), br), check=False).stdout.strip()
+        if n not in ("", "0"):
+            return False
+    return True
+
+
+def preview_approve(proj, j, src):
+    """테스트 서버에 올려 본 그대로 승인: 다시 병합하지 않고 기록만 승인 상태로 바꾼다."""
+    pv = j.get("preview_merges") or {}
+    merges = dict(job_merges(j), **{rid: v[-1] for rid, v in pv.items() if v})
+    names = ", ".join(r.get("name", r["id"]) for r in repos_of(proj) if r["id"] in pv)
+    lines = ["- 승인 전에 테스트 서버(%s)에 올려 확인한 변경을 그대로 승인했습니다 (%s)" % (repo_base(proj), names),
+             "- 운영에는 이 작업 화면의 '운영 반영'을 눌러야 올라갑니다"]
+    fpath(proj, "approved", j["id"]).write_text((read_text(src) or "").rstrip() + "\n\n## 저장소 반영\n" + "\n".join(lines) + "\n")
+    set_state(j, status="approved", error="", merges=merges, merge_sha="", release_state="pending", approved_at=now(),
+              preview_merges={}, preview_at="")
+    event(j, "user", "최종 승인 (테스트 서버에서 확인한 그대로)", "ok")
+    notify_job(j, "approved")
+    return job_summary(j)
+
+
+def preview_takedown(proj, j):
+    """승인 전에 테스트 서버에 올렸던 변경을 되돌린다(git revert, 강제 푸시 없음)."""
+    pv = j.get("preview_merges") or {}
+    if not pv:
+        raise ApiError(409, "테스트 서버에 올려 둔 미리보기가 없습니다")
+    done, revs = [], {}
+    with repo_lock(proj["id"]):
+        try:
+            for r in repos_of(proj):
+                shas = pv.get(r["id"]) or []
+                if not shas:
+                    continue
+                base, name = rbase(r), r.get("name", r["id"])
+                G(proj, r, "fetch", "origin", base, timeout=300)
+                G(proj, r, "reset", "--hard", "-q")
+                G(proj, r, "checkout", "-q", "-B", base, "origin/" + base)
+                done.append(r)
+                gone = set(re.findall(r"This reverts commit ([0-9a-f]{40})", G(proj, r, "log", "origin/" + base, "--format=%b")))
+                revs[r["id"]] = []
+                for x in reversed(shas):
+                    if x in gone or not is_anc(proj, r, x, "HEAD"):
+                        continue
+                    if G(proj, r, "revert", "-m", "1", "--no-edit", x, check=False).returncode:
+                        G(proj, r, "revert", "--abort", check=False)
+                        raise ApiError(409, "%s: 그사이 승인된 다른 작업이 같은 부분을 고쳐서 자동으로 내릴 수 없습니다" % name)
+                    revs[r["id"]].append(G(proj, r, "rev-parse", "HEAD").strip())
+            for r in done:
+                G(proj, r, "push", "-q", "origin", "%s:%s" % (rbase(r), rbase(r)), timeout=300)
+                if r.get("deploy"):
+                    run_shell(j, proj, r, r["deploy"], "deploy")
+            # 작업 브랜치에 같은 변경을 새 커밋으로 다시 얹어 둔다: 그래야 다시 올리기·승인할 때 병합할 내용이 생긴다
+            br = job_branch(j["id"])
+            for r in done:
+                if not revs.get(r["id"]):
+                    continue
+                G(proj, r, "checkout", "-q", "-B", br, rbase(r))
+                for x in reversed(revs[r["id"]]):
+                    G(proj, r, "revert", "--no-commit", x)
+                G(proj, r, "commit", "-q", "--allow-empty", "-m", "%s (테스트 서버에서 내린 뒤 작업 내용 다시 적용)\n\n"
+                  "agent-harness 작업 %s" % (j["title"][:60], j["id"]))
+        except Exception:
+            for r in done:
+                G(proj, r, "reset", "--hard", "-q", "origin/" + rbase(r), check=False)
+            raise
+        finally:   # 작업 브랜치로 돌아가 둔다(이어서 다시 작업할 수 있게)
+            for r in repos_of(proj):
+                G(proj, r, "checkout", "-q", job_branch(j["id"]), check=False)
+    set_state(j, preview_merges={}, preview_at="")
+    event(j, "user", "테스트 서버에서 미리보기를 내림 (1~3분 뒤 이전 상태로 배포)", "warn")
+    return job_summary(j)
+
+
+def preview_blockers(proj, r, target):
+    """운영에 올릴 target 안에 아직 승인 안 된 미리보기 병합이 섞여 있으면 그 작업 제목들."""
+    out = []
+    for (pid, _), x in JOBS.items():
+        if pid != proj["id"]:
+            continue
+        for sha in (x.get("preview_merges") or {}).get(r["id"], []):
+            if is_anc(proj, r, sha, target):
+                out.append(x["title"][:40])
+                break
+    return out
 
 
 def repo_revert(proj, j):
@@ -2337,6 +2459,10 @@ def job_detail(proj, j):
           "names": [r.get("name", r["id"]) for r in rs_]} if rs_ else None
     if rp and rp["release"] and j["status"] == "approved" and not j.get("release_state"):
         backfill_release(proj, j)
+    if rp:
+        rp["preview"] = bool(j.get("preview_merges"))
+        rp["preview_fresh"] = bool(rp["preview"] and j["status"] == "awaiting_user" and preview_fresh(proj, j))
+        rp["preview_at"] = j.get("preview_at", "")
     if rp and j.get("release_state") == "pending":
         try:
             rp["with"] = [{"id": x["id"], "title": x["title"]} for x in pending_jobs(proj, j) if x["id"] != j["id"]]
@@ -2478,6 +2604,8 @@ def job_edit(proj, j, b):
     """중단·실패한 작업의 요청 내용(과 첨부)을 고쳐서 처음부터 다시 시작한다."""
     if j["status"] not in ("failed", "cancelled", "reverted"):
         raise ApiError(409, "진행 중이거나 끝난 작업은 고칠 수 없습니다. 먼저 작업을 중단하세요")
+    if j.get("preview_merges"):
+        raise ApiError(409, "요청을 고치기 전에 '테스트 서버에서 내리기'로 미리보기를 먼저 내려 주세요")
     text = str(b.get("request") or "").strip()
     if not text:
         raise ApiError(400, "요청 내용을 입력하세요")
@@ -2557,6 +2685,8 @@ def job_approve(proj, j):
     if not src.exists():
         raise ApiError(409, "승인할 결과 파일이 없습니다")
     proj_dirs(proj)["outbox"].mkdir(parents=True, exist_ok=True)
+    if repo_on(proj) and preview_fresh(proj, j):
+        return preview_approve(proj, j, src)
     if repo_on(proj):
         set_state(j, status="deploying", error="")
         event(j, "user", "최종 승인 - 저장소에 반영하는 중")
@@ -2566,6 +2696,20 @@ def job_approve(proj, j):
     set_state(j, status="approved")
     event(j, "user", "최종 승인 -> outbox/approved_%s.md" % j["id"], "ok")
     notify_job(j, "approved")
+    return job_summary(j)
+
+
+def job_preview(proj, j):
+    if j["status"] != "awaiting_user" or j.get("needs_input"):
+        raise ApiError(409, "승인 대기 상태에서만 테스트 서버에 올려 볼 수 있습니다")
+    if not repo_release(proj):
+        raise ApiError(400, "테스트 서버(운영 브랜치 분리)가 설정된 프로젝트에서만 쓸 수 있습니다")
+    if preview_fresh(proj, j):
+        raise ApiError(409, "이미 지금 내용이 테스트 서버에 올라가 있습니다")
+    src = fpath(proj, "final", j["id"])
+    set_state(j, status="deploying", previewing=True, error="")
+    event(j, "user", "승인 전 테스트 서버에 올리는 중")
+    threading.Thread(target=repo_deliver, args=(proj, j, src, True), daemon=True).start()
     return job_summary(j)
 
 
@@ -2587,6 +2731,8 @@ def job_delete(proj, j):
     jid = j["id"]
     if j["status"] not in DELETABLE:
         raise ApiError(409, "진행 중인 작업은 먼저 중지한 뒤 삭제하세요")
+    if j.get("preview_merges"):
+        raise ApiError(409, "이 작업은 승인 전에 테스트 서버에 올려 둔 상태입니다. 먼저 '테스트 서버에서 내리기'를 눌러 주세요")
     d = proj_dirs(proj)
     targets = [d["jobs"] / ("%s.json" % jid), fpath(proj, "request", jid), fpath(proj, "final", jid),
                fpath(proj, "approved", jid)]
@@ -2615,7 +2761,7 @@ def job_delete_many(proj, b):
     cut = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - days * 86400))
     n = 0
     for (pid, _), j in list(JOBS.items()):
-        if pid == proj["id"] and j["status"] in sts and (not days or j["created"] < cut):
+        if pid == proj["id"] and j["status"] in sts and (not days or j["created"] < cut) and not j.get("preview_merges"):
             job_delete(proj, j)
             n += 1
     return {"deleted": n}
@@ -3654,15 +3800,16 @@ def r_job_delete_many(m, b):
     return job_delete_many(proj_of(m[1]), b)
 
 
-@route("POST", r"/api/projects/([^/]+)/jobs/([^/]+)/(approve|restart|cancel|delete|edit|followup|revert)", lock=False)
+@route("POST", r"/api/projects/([^/]+)/jobs/([^/]+)/(approve|restart|cancel|delete|edit|followup|revert|preview|takedown)", lock=False)
 def r_job_action(m, b):
     proj = proj_of(m[1])
     j = job_of(proj, m[2])
     fn = {"approve": lambda: job_approve(proj, j), "restart": lambda: job_restart(proj, j, b),
             "cancel": lambda: job_cancel(proj, j), "delete": lambda: job_delete(proj, j),
             "edit": lambda: job_edit(proj, j, b), "followup": lambda: job_followup(proj, j, b),
-           "revert": lambda: repo_revert(proj, j)}[m[3]]
-    if m[3] == "revert":   # git 작업이라 오래 걸릴 수 있어 전체 잠금 없이 실행
+           "revert": lambda: repo_revert(proj, j), "preview": lambda: job_preview(proj, j),
+           "takedown": lambda: preview_takedown(proj, j)}[m[3]]
+    if m[3] in ("revert", "takedown"):   # git 작업이라 오래 걸릴 수 있어 전체 잠금 없이 실행
         return fn()
     with LOCK:
         return fn()
