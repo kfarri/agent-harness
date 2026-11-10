@@ -2130,11 +2130,62 @@ CLARIFY_RULE = (
 )
 
 
+CHOICES_RULE = (
+    "사용자가 직접 정해야 할 사항(결과를 바꾸는 방식·정책·범위·문구 선택)이나 이번 범위 밖의 개선 제안이 있으면, "
+    "%s 맨 끝에 아래 형식 블록을 하나 붙인다. 앞 단계 결과에 적힌 것도 모아 넣는다. 없으면 블록을 붙이지 않는다. "
+    "각 5개 이하, 한 줄씩 짧게, 사소한 것은 넣지 않는다. current는 이번 결과에 적용한 선택지 번호(0부터, 적용 안 했으면 null).\n"
+    "```choices\n{\"decisions\":[{\"q\":\"정할 것\",\"options\":[\"선택지1\",\"선택지2\"],\"current\":0,\"why\":\"짧은 근거\"}],"
+    "\"improvements\":[{\"text\":\"개선 제안\",\"why\":\"기대 효과\"}]}\n```\n")
+CHOICES_RE = re.compile(r"\n*```choices\s*(\{.*?\})\s*```\s*", re.S)
+
+
+def choices_path(proj, jid):
+    return proj_dirs(proj)["handoff"] / ("choices_%s.json" % jid)
+
+
+def extract_choices(proj, stages, jid):
+    """최종 결과 끝의 ```choices 블록을 떼어 따로 저장한다(화면에서 항목별로 고르게)."""
+    srcs = [fpath(proj, "final", jid)] + [fpath(proj, s["id"], jid) for s in reversed(stages) if s["kind"] == "work"][:1]
+    found = None
+    for f in srcs:
+        t = read_text(f)
+        if not t:
+            continue
+        ms = list(CHOICES_RE.finditer(t))
+        if not ms:
+            continue
+        if found is None:
+            try:
+                d = json.loads(ms[-1].group(1))
+                dec = [{"q": str(x.get("q", ""))[:200], "options": [str(o)[:200] for o in (x.get("options") or [])][:6],
+                        "current": x.get("current") if isinstance(x.get("current"), int) else None,
+                        "why": str(x.get("why", ""))[:300]} for x in (d.get("decisions") or [])[:8] if x.get("q")]
+                imp = [{"text": str(x.get("text", ""))[:300], "why": str(x.get("why", ""))[:300]}
+                       for x in (d.get("improvements") or [])[:8] if x.get("text")]
+                found = {"decisions": [x for x in dec if len(x["options"]) >= 2], "improvements": imp}
+            except (ValueError, AttributeError, TypeError):
+                found = None
+        f.write_text(CHOICES_RE.sub("\n", t).rstrip() + "\n")
+    cp = choices_path(proj, jid)
+    if found and (found["decisions"] or found["improvements"]):
+        cp.write_text(json.dumps(found, ensure_ascii=False))
+    elif cp.exists():
+        cp.unlink()
+
+
+def last_work(stages, stage):
+    return not any(s["polish"] for s in stages if s.get("enabled", True)) and \
+        stage["id"] == [s for s in stages if s["kind"] == "work" and s.get("enabled", True)][-1]["id"]
+
+
 def prompt_work(proj, stages, stage, jid, fb):
-    return ("STEP: %s\n작업ID: %s\n%s\n%s%s지시: %s\n출력 파일: %s\n%s%s%s"
+    return ("STEP: %s\n작업ID: %s\n%s\n%s%s지시: %s\n출력 파일: %s\n%s%s%s%s"
             % (stage["id"], jid, inputs_block(proj, stages, stage, jid), sources_block(proj), repo_block(proj, jid, "work"),
                stage["instruction"] or "요청을 수행한다.",
-               rel(proj, stage["id"], jid), feedback_block(fb), CLARIFY_RULE, CONCISE))
+               rel(proj, stage["id"], jid), feedback_block(fb), CLARIFY_RULE,
+               (CHOICES_RULE % "출력 파일") if last_work(stages, stage) else
+               "사용자가 정해야 할 선택 사항이나 범위 밖 개선 제안이 있으면 출력 파일 끝에 '정할 사항/개선 제안'으로 짧게 적는다.\n",
+               CONCISE))
 
 
 def prompt_review(proj, stages, stage, jid):
@@ -2150,6 +2201,7 @@ def prompt_review(proj, stages, stage, jid):
     if stage.get("polish"):
         p += ("VERDICT가 APPROVE일 때만 오탈자와 문장을 다듬은 최종본을 %s 에 저장하고 맨 아래에 '검수 메모'로 "
               "고친 내용을 짧게 적는다. REVISE이면 최종본은 만들지 않는다.\n" % rel(proj, "final", jid))
+        p += CHOICES_RULE % "최종본"
     return p + "검토 대상 외 다른 파일은 수정하지 않는다. " + CONCISE
 
 
@@ -2215,6 +2267,10 @@ def pipeline(job, start):
             event(job, who, "%s: 수정요청 (%d/%d회) - %s 단계로 돌려보냄" % (st["name"], r + 1, max_rounds,
                                                                       stages[tpos]["name"]), "warn")
             i = tpos
+        try:
+            extract_choices(proj, stages, jid)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
         set_state(job, status="awaiting_user")
         if job.get("auto_approve"):
             event(job, "system", "자동 승인 설정에 따라 바로 승인합니다", "ok")
@@ -2484,7 +2540,11 @@ def job_detail(proj, j):
             rp["with"] = [{"id": x["id"], "title": x["title"]} for x in pending_jobs(proj, j) if x["id"] != j["id"]]
         except Exception:  # noqa: BLE001
             rp["with"] = []
-    return {"job": j, "files": files, "repo": rp, "attachments": files_att, "limit": S_().get("job_token_limit", 0), "max_rounds": proj.get("max_rounds", 1),
+    try:
+        ch = json.loads(choices_path(proj, j["id"]).read_text())
+    except (OSError, ValueError):
+        ch = None
+    return {"job": j, "files": files, "repo": rp, "attachments": files_att, "choices": ch, "limit": S_().get("job_token_limit", 0), "max_rounds": proj.get("max_rounds", 1),
             "auto_planned": bool(j.get("stages")),
             "stages": [{"id": s["id"], "name": s["name"], "kind": s["kind"], "enabled": s.get("enabled", True),
                         "agent": agent_name(proj, s["agent"])} for s in src]}

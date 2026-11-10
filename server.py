@@ -2130,11 +2130,62 @@ CLARIFY_RULE = (
 )
 
 
+CHOICES_RULE = (
+    "사용자가 직접 정해야 할 사항(결과를 바꾸는 방식·정책·범위·문구 선택)이나 이번 범위 밖의 개선 제안이 있으면, "
+    "%s 맨 끝에 아래 형식 블록을 하나 붙인다. 앞 단계 결과에 적힌 것도 모아 넣는다. 없으면 블록을 붙이지 않는다. "
+    "각 5개 이하, 한 줄씩 짧게, 사소한 것은 넣지 않는다. current는 이번 결과에 적용한 선택지 번호(0부터, 적용 안 했으면 null).\n"
+    "```choices\n{\"decisions\":[{\"q\":\"정할 것\",\"options\":[\"선택지1\",\"선택지2\"],\"current\":0,\"why\":\"짧은 근거\"}],"
+    "\"improvements\":[{\"text\":\"개선 제안\",\"why\":\"기대 효과\"}]}\n```\n")
+CHOICES_RE = re.compile(r"\n*```choices\s*(\{.*?\})\s*```\s*", re.S)
+
+
+def choices_path(proj, jid):
+    return proj_dirs(proj)["handoff"] / ("choices_%s.json" % jid)
+
+
+def extract_choices(proj, stages, jid):
+    """최종 결과 끝의 ```choices 블록을 떼어 따로 저장한다(화면에서 항목별로 고르게)."""
+    srcs = [fpath(proj, "final", jid)] + [fpath(proj, s["id"], jid) for s in reversed(stages) if s["kind"] == "work"][:1]
+    found = None
+    for f in srcs:
+        t = read_text(f)
+        if not t:
+            continue
+        ms = list(CHOICES_RE.finditer(t))
+        if not ms:
+            continue
+        if found is None:
+            try:
+                d = json.loads(ms[-1].group(1))
+                dec = [{"q": str(x.get("q", ""))[:200], "options": [str(o)[:200] for o in (x.get("options") or [])][:6],
+                        "current": x.get("current") if isinstance(x.get("current"), int) else None,
+                        "why": str(x.get("why", ""))[:300]} for x in (d.get("decisions") or [])[:8] if x.get("q")]
+                imp = [{"text": str(x.get("text", ""))[:300], "why": str(x.get("why", ""))[:300]}
+                       for x in (d.get("improvements") or [])[:8] if x.get("text")]
+                found = {"decisions": [x for x in dec if len(x["options"]) >= 2], "improvements": imp}
+            except (ValueError, AttributeError, TypeError):
+                found = None
+        f.write_text(CHOICES_RE.sub("\n", t).rstrip() + "\n")
+    cp = choices_path(proj, jid)
+    if found and (found["decisions"] or found["improvements"]):
+        cp.write_text(json.dumps(found, ensure_ascii=False))
+    elif cp.exists():
+        cp.unlink()
+
+
+def last_work(stages, stage):
+    return not any(s["polish"] for s in stages if s.get("enabled", True)) and \
+        stage["id"] == [s for s in stages if s["kind"] == "work" and s.get("enabled", True)][-1]["id"]
+
+
 def prompt_work(proj, stages, stage, jid, fb):
-    return ("STEP: %s\n작업ID: %s\n%s\n%s%s지시: %s\n출력 파일: %s\n%s%s%s"
+    return ("STEP: %s\n작업ID: %s\n%s\n%s%s지시: %s\n출력 파일: %s\n%s%s%s%s"
             % (stage["id"], jid, inputs_block(proj, stages, stage, jid), sources_block(proj), repo_block(proj, jid, "work"),
                stage["instruction"] or "요청을 수행한다.",
-               rel(proj, stage["id"], jid), feedback_block(fb), CLARIFY_RULE, CONCISE))
+               rel(proj, stage["id"], jid), feedback_block(fb), CLARIFY_RULE,
+               (CHOICES_RULE % "출력 파일") if last_work(stages, stage) else
+               "사용자가 정해야 할 선택 사항이나 범위 밖 개선 제안이 있으면 출력 파일 끝에 '정할 사항/개선 제안'으로 짧게 적는다.\n",
+               CONCISE))
 
 
 def prompt_review(proj, stages, stage, jid):
@@ -2150,6 +2201,7 @@ def prompt_review(proj, stages, stage, jid):
     if stage.get("polish"):
         p += ("VERDICT가 APPROVE일 때만 오탈자와 문장을 다듬은 최종본을 %s 에 저장하고 맨 아래에 '검수 메모'로 "
               "고친 내용을 짧게 적는다. REVISE이면 최종본은 만들지 않는다.\n" % rel(proj, "final", jid))
+        p += CHOICES_RULE % "최종본"
     return p + "검토 대상 외 다른 파일은 수정하지 않는다. " + CONCISE
 
 
@@ -2215,6 +2267,10 @@ def pipeline(job, start):
             event(job, who, "%s: 수정요청 (%d/%d회) - %s 단계로 돌려보냄" % (st["name"], r + 1, max_rounds,
                                                                       stages[tpos]["name"]), "warn")
             i = tpos
+        try:
+            extract_choices(proj, stages, jid)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
         set_state(job, status="awaiting_user")
         if job.get("auto_approve"):
             event(job, "system", "자동 승인 설정에 따라 바로 승인합니다", "ok")
@@ -2484,7 +2540,11 @@ def job_detail(proj, j):
             rp["with"] = [{"id": x["id"], "title": x["title"]} for x in pending_jobs(proj, j) if x["id"] != j["id"]]
         except Exception:  # noqa: BLE001
             rp["with"] = []
-    return {"job": j, "files": files, "repo": rp, "attachments": files_att, "limit": S_().get("job_token_limit", 0), "max_rounds": proj.get("max_rounds", 1),
+    try:
+        ch = json.loads(choices_path(proj, j["id"]).read_text())
+    except (OSError, ValueError):
+        ch = None
+    return {"job": j, "files": files, "repo": rp, "attachments": files_att, "choices": ch, "limit": S_().get("job_token_limit", 0), "max_rounds": proj.get("max_rounds", 1),
             "auto_planned": bool(j.get("stages")),
             "stages": [{"id": s["id"], "name": s["name"], "kind": s["kind"], "enabled": s.get("enabled", True),
                         "agent": agent_name(proj, s["agent"])} for s in src]}
@@ -4591,6 +4651,7 @@ table.ut{border-collapse:collapse;width:100%;font-size:13px}.ut td,.ut th{paddin
 #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:9px 16px;border-radius:99px;font-size:13px;opacity:0;transition:.2s;pointer-events:none;max-width:90vw}
 #toast.show{opacity:1}
 /* ---- 화면 개편 (2026-11) ---- */
+.chbox{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:0 0 10px}.chq{margin:6px 0 8px}.chqt{font-weight:600;font-size:13.5px;margin-bottom:3px}.chopt{display:flex;gap:7px;align-items:baseline;padding:3px 0 3px 4px;font-size:13.5px;cursor:pointer}.chopt input{width:auto;margin:0}.chw{color:var(--mute);font-size:12px;font-weight:400}
 .pvbox{border:1px solid var(--ok,#3a8);border-radius:10px;padding:12px 14px;background:color-mix(in srgb,var(--ok,#3a8) 8%,transparent)}
 :root{--radius:14px;--shadow:0 1px 2px rgba(20,20,10,.05),0 4px 14px rgba(20,20,10,.04)}
 header{position:sticky;top:0;z-index:20;padding:10px 24px;gap:16px}
@@ -4758,6 +4819,7 @@ async function loadList(){
 async function loadDetail(force){
   if(!sel||!cur||view!=='jobs')return;
   let d;try{d=await api(base()+'/jobs/'+encodeURIComponent(sel))}catch(e){return}
+  LASTD=d;
   const j=d.job,f=d.files,stg=d.stages.filter(s=>s.enabled);
   const steps=stg.map(s=>[s.id,s.name,s.agent]).concat([['user','최종 승인','나']]);
   const keys=steps.map(s=>s[0]);
@@ -4790,8 +4852,8 @@ async function loadDetail(force){
       const rv=lastRev?verdictOf(f[lastRev.id]):'APPROVE';
       act='<div class="card approve"><h3>최종 승인이 필요합니다</h3><div class="sub">'+(rv==='APPROVE'?'검토를 통과한 결과물입니다.':'검토 단계의 수정요청이 남은 상태입니다. 해당 탭에서 내용을 확인하세요.')+(d.repo&&d.repo.release?'':d.repo?(d.repo.mode==='branch'?' 승인하면 작업 브랜치를 GitHub에 푸시합니다(PR은 직접 병합).':' 승인하면 '+esc(d.repo.base)+'에 병합해 GitHub에 푸시합니다. 푸시되면 GitHub Actions 빌드가 시작됩니다.')+' \'변경 내용\' 탭에서 diff를 먼저 확인하세요.':' 승인하면 outbox에 approved 파일로 저장됩니다.')+'</div>'
         +(d.repo&&d.repo.release?pvRow(d):'<div class="row"><button class="pri" id="ap">최종 승인</button></div>')+'<hr style="border:0;border-top:1px solid var(--line);margin:12px 0">'
-        +'<textarea id="fb" placeholder="수정이 필요하면 요청 내용을 적어주세요 (스크린샷은 Ctrl+V로 붙여넣기)"></textarea><div class="attl" id="fbnew"></div>'
-        +'<div class="row" style="margin-top:8px"><select id="st" style="width:auto">'+opts+'</select><button id="rj">반려하고 다시 작업</button><label class="attb">파일 첨부<input type="file" id="fbf" multiple hidden></label></div></div>';
+        +chRow(d)+'<textarea id="fb" placeholder="'+(d.choices?'고른 항목 외에 더 고칠 점이 있으면 적어주세요':'수정이 필요하면 요청 내용을 적어주세요')+' (스크린샷은 Ctrl+V로 붙여넣기)"></textarea><div class="attl" id="fbnew"></div>'
+        +'<div class="row" style="margin-top:8px"><select id="st" style="width:auto">'+opts+'</select><button id="rj">'+(d.choices?'고른 내용 반영해 다시 작업':'반려하고 다시 작업')+'</button><label class="attb">파일 첨부<input type="file" id="fbf" multiple hidden></label></div></div>';
     }else if(j.status==='running'||j.status==='queued'){
       act='<div class="row" style="margin:10px 0"><button class="dng" id="cn">작업 중단</button><button id="cne">중단하고 요청 수정</button></div>';
     }else if((j.status==='failed'||j.status==='cancelled'||j.status==='reverted')&&EDIT===j.id){
@@ -4829,11 +4891,11 @@ async function loadDetail(force){
     if(j.status==='approved'){
       act+=FOLLOW===j.id
         ?'<div class="card" style="margin-top:10px"><h3 style="margin:0 0 6px">이어서 수정 요청</h3><div class="sub">이 작업의 결과'+(d.repo?'(테스트 서버에 올라간 최신 코드)':'')+' 위에서 이어서 고칩니다. 마음에 안 드는 부분만 적어주세요.</div>'
-          +'<textarea id="futx" style="min-height:110px" placeholder="예: 버튼 색을 회색으로, 목록 정렬은 최신순으로 바꿔줘 (스크린샷은 Ctrl+V)"></textarea><div class="attl" id="funew"></div>'
+          +chRow(d)+'<textarea id="futx" style="min-height:110px" placeholder="예: 버튼 색을 회색으로, 목록 정렬은 최신순으로 바꿔줘 (스크린샷은 Ctrl+V)"></textarea><div class="attl" id="funew"></div>'
           +'<div class="row" style="margin-top:8px"><button class="pri" id="fugo">이어서 작업 시작</button><label class="attb">파일 첨부<input type="file" id="fuf" multiple hidden></label><button id="funo">취소</button></div></div>'
         :'<div class="row" style="margin:8px 0"><button id="fu">이어서 수정 요청</button>'+(j.followups?'<span style="font-size:12px;color:var(--mute)">추가 요청 '+j.followups+'회</span>':'')+'</div>';
     }
-    keepDrafts(j.id);$('#act').innerHTML=act;bindJob(j);restoreDrafts(j.id);
+    keepDrafts($('#act').dataset.jid);$('#act').innerHTML=act;$('#act').dataset.jid=j.id;bindJob(j);restoreDrafts(j.id);
   }
   const tdef=(f.approved!=null&&d.repo?[['approved','승인본']]:[]).concat(f.diff!=null?[['diff','변경 내용']]:[]).concat([['final','최종본']]).concat(d.stages.slice().reverse().map(s=>[s.id,s.name+(s.kind==='review'?' (검토)':'')+(s.enabled?'':' ·꺼짐')])).concat([['request','요청'],['log','진행 기록 ('+j.events.length+')']]);
   const tabsH='<div class="tabs">'+tdef.map(t=>'<button class="tab'+(tab===t[0]?' on':'')+(f[t[0]]!=null||t[0]==='log'?'':' none')+'" data-t="'+esc(t[0])+'">'+esc(t[1])+'</button>').join('')+'</div>';
@@ -4854,15 +4916,16 @@ function bindJob(j){
   const url=base()+'/jobs/'+j.id;
   if(q('#ap'))q('#ap').onclick=()=>{if(confirm('이 결과물을 최종 승인할까요?'))run(()=>post(url+'/approve'),'승인되었습니다')};
   bindNew(j.id,'fb','fb','fbf');
-  if(q('#rj'))q('#rj').onclick=async()=>{const fb=q('#fb').value.trim();if(!fb){toast('수정 요청 내용을 적어주세요');return}
+  if(q('#rj'))q('#rj').onclick=async()=>{const cf=chFeedback(LASTD||{}),tx=q('#fb').value.trim(),fb=(cf+(tx?(cf?'\n## 추가 요청\n':'')+tx:'')).trim();
+    if(!fb){toast(LASTD&&LASTD.choices?'바꾼 항목이 없습니다. 그대로 괜찮으면 승인하세요':'수정 요청 내용을 적어주세요');return}
     let files=[];try{files=await newFiles(j.id,'fb')}catch(e){toast('파일을 읽지 못했습니다');return}
-    run(async()=>{await post(url+'/restart',{feedback:fb,start:q('#st').value,files});clearDraft(j.id,'fb');dropNew(j.id,'fb')},'다시 작업을 시작합니다')};
+    run(async()=>{await post(url+'/restart',{feedback:fb,start:q('#st').value,files});clearDraft(j.id,'fb');delete CHS[j.id];dropNew(j.id,'fb')},'다시 작업을 시작합니다')};
   if(q('#rt'))q('#rt').onclick=()=>run(()=>post(url+'/restart',{start:q('#st').value}),'다시 시작합니다');
   if(q('#cn'))q('#cn').onclick=()=>{if(confirm('작업을 중단할까요?'))run(()=>post(url+'/cancel'),'중단 요청')};
   if(q('#fu'))q('#fu').onclick=()=>{FOLLOW=j.id;last={};tick(false)};
   if(q('#funo'))q('#funo').onclick=()=>{FOLLOW=null;clearDraft(j.id,'futx');dropNew(j.id,'fu');last={};tick(false)};
   bindNew(j.id,'fu','futx','fuf');if(q('#futx'))q('#futx').focus();
-  if(q('#fugo'))q('#fugo').onclick=async e=>{const t=q('#futx').value.trim();if(!t){toast('추가 요청 내용을 입력하세요');return}
+  if(q('#fugo'))q('#fugo').onclick=async e=>{const cf=chFeedback(LASTD||{}),tx=q('#futx').value.trim(),t=(cf+(tx?(cf?'\n## 추가 요청\n':'')+tx:'')).trim();if(!t){toast('추가 요청 내용을 입력하거나 항목을 고르세요');return}
     e.target.disabled=true;
     try{const files=await newFiles(j.id,'fu');
       await post(url+'/followup',{request:t,files});FOLLOW=null;clearDraft(j.id,'futx');dropNew(j.id,'fu');toast('이어서 작업을 시작합니다');last={};await loadList();tick(false)}
@@ -4895,9 +4958,12 @@ $('#jclean').onclick=async()=>{const d=prompt('승인 완료·실패·중단된 
 $('#jobs').onclick=e=>{const j=e.target.closest('.job');if(j)selectJob(j.dataset.id)};
 let ATT=[],EDIT=null,EDNEW=[],EDDROP=[],FOLLOW=null,FUNEW=[];
 // 작성 중인 글·첨부는 화면이 다시 그려지거나 탭·작업을 옮겨도 유지한다 (작업별로 보관)
-const DRAFT={},NEWF={},DRAFT_IDS=['fb','qa','futx','edtx'];
-function keepDrafts(jid){for(const id of DRAFT_IDS){const e=$('#'+id);if(e)DRAFT[jid+'#'+id]=e.value}}
-function restoreDrafts(jid){for(const id of DRAFT_IDS){const e=$('#'+id);if(!e)continue;const k=jid+'#'+id;
+let LASTD=null;const CHS={};const DRAFT={},NEWF={},DRAFT_IDS=['fb','qa','futx','edtx'];
+function keepDrafts(jid){if(!jid)return;if(document.querySelector('.chbox')){const st={};document.querySelectorAll('.chbox input').forEach(e=>{st[e.name?e.name+'='+e.value:'i'+e.dataset.chi]=e.checked});CHS[jid]=st}
+  for(const id of DRAFT_IDS){const e=$('#'+id);if(e)DRAFT[jid+'#'+id]=e.value}}
+function restoreDrafts(jid){const cs=CHS[jid];if(cs)document.querySelectorAll('.chbox input').forEach(e=>{const k=e.name?e.name+'='+e.value:'i'+e.dataset.chi;if(k in cs)e.checked=cs[k]});
+  document.querySelectorAll('.chbox input').forEach(e=>e.addEventListener('change',()=>keepDrafts(jid)));
+  for(const id of DRAFT_IDS){const e=$('#'+id);if(!e)continue;const k=jid+'#'+id;
   if(DRAFT[k]!=null)e.value=DRAFT[k];e.addEventListener('input',()=>{DRAFT[k]=e.value;try{localStorage.setItem('hd:'+k,e.value)}catch(_){}});
   if(DRAFT[k]==null){try{const v=localStorage.getItem('hd:'+k);if(v){e.value=v;DRAFT[k]=v}}catch(_){}}}
   for(const w of ['fb','fu'])if($('#'+w+'new'))drawNew(jid,w)}
@@ -5185,6 +5251,21 @@ function pvRow(d){
     +'<b>① 테스트 서버에 올려 보기</b>로 화면을 먼저 확인한 뒤 승인하세요. 운영 서버에는 승인 후 \'운영 반영\'을 눌러야 올라갑니다.</div>'
     +'<div class="row"><button class="pri" id="pv">① 테스트 서버에 올려 보기</button>'+tu+(r.preview?'<button class="dng" id="pvdn">이전 미리보기 내리기</button>':'')
     +'<button id="ap" title="테스트 서버 확인 없이 바로 승인 (테스트 서버에도 반영됨)">확인 없이 바로 승인</button></div>';
+}
+function chRow(d){
+  const c=d.choices;if(!c)return '';
+  const dec=c.decisions||[],imp=c.improvements||[];
+  let h='<div class="chbox"><b>직접 정할 항목</b><div class="sub" style="margin:2px 0 8px">고른 뒤 아래 버튼을 누르면 바꾼 항목만 에이전트에게 전달됩니다. 그대로 두고 승인해도 됩니다.</div>';
+  if(dec.length)h+=dec.map((x,i)=>'<div class="chq"><div class="chqt">'+(i+1)+'. '+esc(x.q)+(x.why?' <span class="chw">'+esc(x.why)+'</span>':'')+'</div>'
+    +x.options.map((o,k)=>'<label class="chopt"><input type="radio" name="chd'+i+'" value="'+k+'"'+((x.current===k||(x.current==null&&k===0&&false))?' checked':'')+'> '+esc(o)+(x.current===k?' <span class="chip approved">지금 적용됨</span>':'')+'</label>').join('')+'</div>').join('');
+  if(imp.length)h+='<div class="chqt" style="margin-top:8px">개선 제안 (반영할 것만 체크)</div>'+imp.map((x,i)=>'<label class="chopt"><input type="checkbox" data-chi="'+i+'"> '+esc(x.text)+(x.why?' <span class="chw">'+esc(x.why)+'</span>':'')+'</label>').join('');
+  return h+'</div>';
+}
+function chFeedback(d){
+  const c=d.choices;if(!c)return '';const L=[];
+  (c.decisions||[]).forEach((x,i)=>{const r=document.querySelector('input[name=chd'+i+']:checked');if(r&&+r.value!==x.current)L.push('- '+x.q+' → '+x.options[+r.value]+(x.current!=null?' (지금: '+x.options[x.current]+')':''))});
+  const I=[];(c.improvements||[]).forEach((x,i)=>{const b=document.querySelector('[data-chi="'+i+'"]');if(b&&b.checked)I.push('- '+x.text)});
+  return (L.length?'## 사용자가 고른 선택 사항 (이대로 바꿀 것)\n'+L.join('\n')+'\n':'')+(I.length?(L.length?'\n':'')+'## 반영할 개선 제안\n'+I.join('\n')+'\n':'');
 }
 function srcForm(name,content){
   $('#srcform').innerHTML='<div class="card"><h2>'+(name?'자료 편집: '+esc(name):'새 자료')+'</h2>'
