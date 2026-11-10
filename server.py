@@ -2503,6 +2503,7 @@ ATT_EXT = {"png", "jpg", "jpeg", "gif", "webp", "pdf", "txt", "md", "csv", "json
            "js", "ts", "vue", "py", "sql", "xml", "har"}
 ATT_IMG = {"png", "jpg", "jpeg", "gif", "webp"}
 ATT_MAX, ATT_TOTAL, ATT_COUNT = 10 * 1024 * 1024, 20 * 1024 * 1024, 10
+ATT_JOB_MAX = 30   # 수정 요청·이어서 요청으로 쌓이는 작업당 전체 첨부 수
 
 
 def att_dir(proj, jid):
@@ -2600,6 +2601,14 @@ def job_restart(proj, j, b):
         raise ApiError(400, "시작 단계가 올바르지 않습니다")
     fb = (b.get("feedback") or "").strip()[:5000]
     first = act[0]["id"] if act else ""
+    added = []
+    if b.get("files"):
+        keep = [x["name"] for x in att_list(proj, j["id"])]
+        if len(keep) + len(b["files"]) > ATT_JOB_MAX:
+            raise ApiError(400, "첨부는 작업당 최대 %d개까지입니다 (지금 %d개)" % (ATT_JOB_MAX, len(keep)))
+        added = save_attachments(proj, j["id"], b["files"], keep)
+        if added:
+            fb = (fb + "\n\n(이번 수정 요청에 첨부한 파일: %s)" % ", ".join(x["name"] for x in added)).strip()
     if fb:   # 수정 요청·답변도 요청 탭에 차례대로 남긴다
         answer = bool(j.get("needs_input"))
         n = int(j.get("revisions") or 0) + (0 if answer else 1)
@@ -2671,8 +2680,8 @@ def job_followup(proj, j, b):
         raise ApiError(400, "요청이 너무 깁니다")
     jid = j["id"]
     keep = [x["name"] for x in att_list(proj, jid)]
-    if len(keep) + len(b.get("files") or []) > ATT_COUNT:
-        raise ApiError(400, "첨부는 최대 %d개까지입니다 (지금 %d개)" % (ATT_COUNT, len(keep)))
+    if len(keep) + len(b.get("files") or []) > ATT_JOB_MAX:
+        raise ApiError(400, "첨부는 작업당 최대 %d개까지입니다 (지금 %d개)" % (ATT_JOB_MAX, len(keep)))
     added = save_attachments(proj, jid, b.get("files"), keep)
     n = int(j.get("followups") or 0) + 1
     rq = fpath(proj, "request", jid)
@@ -4781,8 +4790,8 @@ async function loadDetail(force){
       const rv=lastRev?verdictOf(f[lastRev.id]):'APPROVE';
       act='<div class="card approve"><h3>최종 승인이 필요합니다</h3><div class="sub">'+(rv==='APPROVE'?'검토를 통과한 결과물입니다.':'검토 단계의 수정요청이 남은 상태입니다. 해당 탭에서 내용을 확인하세요.')+(d.repo&&d.repo.release?'':d.repo?(d.repo.mode==='branch'?' 승인하면 작업 브랜치를 GitHub에 푸시합니다(PR은 직접 병합).':' 승인하면 '+esc(d.repo.base)+'에 병합해 GitHub에 푸시합니다. 푸시되면 GitHub Actions 빌드가 시작됩니다.')+' \'변경 내용\' 탭에서 diff를 먼저 확인하세요.':' 승인하면 outbox에 approved 파일로 저장됩니다.')+'</div>'
         +(d.repo&&d.repo.release?pvRow(d):'<div class="row"><button class="pri" id="ap">최종 승인</button></div>')+'<hr style="border:0;border-top:1px solid var(--line);margin:12px 0">'
-        +'<textarea id="fb" placeholder="수정이 필요하면 요청 내용을 적어주세요"></textarea>'
-        +'<div class="row" style="margin-top:8px"><select id="st" style="width:auto">'+opts+'</select><button id="rj">반려하고 다시 작업</button></div></div>';
+        +'<textarea id="fb" placeholder="수정이 필요하면 요청 내용을 적어주세요 (스크린샷은 Ctrl+V로 붙여넣기)"></textarea><div class="attl" id="fbnew"></div>'
+        +'<div class="row" style="margin-top:8px"><select id="st" style="width:auto">'+opts+'</select><button id="rj">반려하고 다시 작업</button><label class="attb">파일 첨부<input type="file" id="fbf" multiple hidden></label></div></div>';
     }else if(j.status==='running'||j.status==='queued'){
       act='<div class="row" style="margin:10px 0"><button class="dng" id="cn">작업 중단</button><button id="cne">중단하고 요청 수정</button></div>';
     }else if((j.status==='failed'||j.status==='cancelled'||j.status==='reverted')&&EDIT===j.id){
@@ -4824,7 +4833,7 @@ async function loadDetail(force){
           +'<div class="row" style="margin-top:8px"><button class="pri" id="fugo">이어서 작업 시작</button><label class="attb">파일 첨부<input type="file" id="fuf" multiple hidden></label><button id="funo">취소</button></div></div>'
         :'<div class="row" style="margin:8px 0"><button id="fu">이어서 수정 요청</button>'+(j.followups?'<span style="font-size:12px;color:var(--mute)">추가 요청 '+j.followups+'회</span>':'')+'</div>';
     }
-    $('#act').innerHTML=act;bindJob(j);
+    keepDrafts(j.id);$('#act').innerHTML=act;bindJob(j);restoreDrafts(j.id);
   }
   const tdef=(f.approved!=null&&d.repo?[['approved','승인본']]:[]).concat(f.diff!=null?[['diff','변경 내용']]:[]).concat([['final','최종본']]).concat(d.stages.slice().reverse().map(s=>[s.id,s.name+(s.kind==='review'?' (검토)':'')+(s.enabled?'':' ·꺼짐')])).concat([['request','요청'],['log','진행 기록 ('+j.events.length+')']]);
   const tabsH='<div class="tabs">'+tdef.map(t=>'<button class="tab'+(tab===t[0]?' on':'')+(f[t[0]]!=null||t[0]==='log'?'':' none')+'" data-t="'+esc(t[0])+'">'+esc(t[1])+'</button>').join('')+'</div>';
@@ -4844,24 +4853,22 @@ function bindJob(j){
   const run=async(fn,msg)=>{if(busy)return;busy=true;try{await fn();toast(msg);last.act=null;await tick(true)}catch(e){toast(e.message)}busy=false};
   const url=base()+'/jobs/'+j.id;
   if(q('#ap'))q('#ap').onclick=()=>{if(confirm('이 결과물을 최종 승인할까요?'))run(()=>post(url+'/approve'),'승인되었습니다')};
-  if(q('#rj'))q('#rj').onclick=()=>{const fb=q('#fb').value.trim();if(!fb){toast('수정 요청 내용을 적어주세요');return}run(()=>post(url+'/restart',{feedback:fb,start:q('#st').value}),'다시 작업을 시작합니다')};
+  bindNew(j.id,'fb','fb','fbf');
+  if(q('#rj'))q('#rj').onclick=async()=>{const fb=q('#fb').value.trim();if(!fb){toast('수정 요청 내용을 적어주세요');return}
+    let files=[];try{files=await newFiles(j.id,'fb')}catch(e){toast('파일을 읽지 못했습니다');return}
+    run(async()=>{await post(url+'/restart',{feedback:fb,start:q('#st').value,files});clearDraft(j.id,'fb');dropNew(j.id,'fb')},'다시 작업을 시작합니다')};
   if(q('#rt'))q('#rt').onclick=()=>run(()=>post(url+'/restart',{start:q('#st').value}),'다시 시작합니다');
   if(q('#cn'))q('#cn').onclick=()=>{if(confirm('작업을 중단할까요?'))run(()=>post(url+'/cancel'),'중단 요청')};
-  if(q('#fu'))q('#fu').onclick=()=>{FOLLOW=j.id;FUNEW=[];last={};tick(false)};
-  if(q('#funo'))q('#funo').onclick=()=>{FOLLOW=null;last={};tick(false)};
-  const fuAdd=fs=>{for(const f of fs){if(f.size>10*1024*1024){toast(f.name+': 10MB를 넘습니다');continue}
-    FUNEW.push({file:f,name:f.name&&f.name!=='image.png'?f.name:'screenshot-'+new Date().toTimeString().slice(0,8).replace(/:/g,'')+'.png'})}
-    q('#funew').innerHTML=FUNEW.map((a,i)=>'<span class="attc">➕ <b>'+esc(a.name)+'</b><span style="color:var(--mute)">'+fmtB(a.file.size)+'</span><button data-fr="'+i+'">×</button></span>').join('');
-    q('#funew').querySelectorAll('[data-fr]').forEach(b=>b.onclick=()=>{FUNEW.splice(+b.dataset.fr,1);fuAdd([])})};
-  if(q('#fuf'))q('#fuf').onchange=e=>{fuAdd(e.target.files);e.target.value=''};
-  if(q('#futx')){q('#futx').addEventListener('paste',e=>{const fs=[...(e.clipboardData||{}).items||[]].filter(x=>x.kind==='file').map(x=>x.getAsFile()).filter(Boolean);if(fs.length){e.preventDefault();fuAdd(fs)}});q('#futx').focus()}
+  if(q('#fu'))q('#fu').onclick=()=>{FOLLOW=j.id;last={};tick(false)};
+  if(q('#funo'))q('#funo').onclick=()=>{FOLLOW=null;clearDraft(j.id,'futx');dropNew(j.id,'fu');last={};tick(false)};
+  bindNew(j.id,'fu','futx','fuf');if(q('#futx'))q('#futx').focus();
   if(q('#fugo'))q('#fugo').onclick=async e=>{const t=q('#futx').value.trim();if(!t){toast('추가 요청 내용을 입력하세요');return}
     e.target.disabled=true;
-    try{const files=await Promise.all(FUNEW.map(async a=>({name:a.name,data:await b64(a.file)})));
-      await post(url+'/followup',{request:t,files});FOLLOW=null;toast('이어서 작업을 시작합니다');last={};await loadList();tick(false)}
+    try{const files=await newFiles(j.id,'fu');
+      await post(url+'/followup',{request:t,files});FOLLOW=null;clearDraft(j.id,'futx');dropNew(j.id,'fu');toast('이어서 작업을 시작합니다');last={};await loadList();tick(false)}
     catch(err){toast(err.message);e.target.disabled=false}};
   if(q('#ed'))q('#ed').onclick=()=>{EDIT=j.id;EDNEW=[];EDDROP=[];last={};tick(false)};
-  if(q('#edno'))q('#edno').onclick=()=>{EDIT=null;last={};tick(false)};
+  if(q('#edno'))q('#edno').onclick=()=>{EDIT=null;clearDraft(j.id,'edtx');last={};tick(false)};
   if(q('#cne'))q('#cne').onclick=async()=>{try{await post(url+'/cancel');EDIT=j.id;EDNEW=[];EDDROP=[];toast('중단했습니다. 요청을 고쳐 다시 시작하세요');last={};tick(false)}catch(e){toast(e.message)}};
   if(q('#edatt'))q('#edatt').querySelectorAll('[data-drop]').forEach(b=>b.onclick=()=>{EDDROP.push(b.dataset.drop);b.closest('.attc').remove()});
   if(q('#edf'))q('#edf').onchange=e=>{for(const f of e.target.files){if(f.size>10*1024*1024){toast(f.name+': 10MB를 넘습니다');continue}EDNEW.push(f)}e.target.value='';
@@ -4869,14 +4876,14 @@ function bindJob(j){
   if(q('#edgo'))q('#edgo').onclick=async e=>{const t=q('#edtx').value.trim();if(!t){toast('요청 내용을 입력하세요');return}
     e.target.disabled=true;
     try{const files=await Promise.all(EDNEW.map(async f=>({name:f.name,data:await b64(f)})));
-      await post(url+'/edit',{request:t,remove:EDDROP,files});EDIT=null;toast('수정한 요청으로 다시 시작합니다');last={};await loadList();tick(false)}
+      await post(url+'/edit',{request:t,remove:EDDROP,files});EDIT=null;clearDraft(j.id,'edtx');toast('수정한 요청으로 다시 시작합니다');last={};await loadList();tick(false)}
     catch(err){toast(err.message);e.target.disabled=false}};
   if(q('#pv'))q('#pv').onclick=()=>run(()=>post(url+'/preview',{}),'테스트 서버에 올리는 중 - 1~3분 뒤 확인하세요');
   if(q('#pvdn'))q('#pvdn').onclick=()=>{if(confirm('테스트 서버에 올려 둔 이 작업의 변경을 내릴까요?\n(작업 결과는 그대로 남아 다시 올리거나 승인할 수 있습니다)'))run(()=>post(url+'/takedown',{}),'내렸습니다 - 1~3분 뒤 테스트 서버가 이전 상태로 돌아갑니다')};
   if(q('#rvt'))q('#rvt').onclick=()=>{if(confirm('이 작업의 코드 변경을 테스트 서버에서 되돌릴까요?\n(운영 서버에는 영향 없음, 1~3분 안에 테스트 서버가 이전 상태로 배포됩니다)'))run(()=>post(url+'/revert',{}),'되돌렸습니다 - 1~3분 안에 테스트 서버에 반영됩니다')};
   if(q('#rel'))q('#rel').onclick=()=>{if(confirm('테스트 서버에서 확인을 마쳤나요?\n운영에 반영하면 1~3분 안에 실서버에 배포됩니다.'))run(()=>post(base()+'/repo/release',{job:j.id}),'운영 반영 완료 - 1~3분 안에 실서버에 배포됩니다')};
   if(q('#jdel'))q('#jdel').onclick=async()=>{if(!confirm('이 작업을 삭제할까요?\n요청·중간 결과·최종본·로그가 모두 지워지고 되돌릴 수 없습니다.'+(j.status==='approved'?'\n(이미 GitHub에 반영된 코드는 그대로 남습니다)':'')))return;try{await post(url+'/delete');toast('삭제했습니다');sel=null;last={};$('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>';await loadList()}catch(e){toast(e.message)}};
-  if(q('#qago'))q('#qago').onclick=()=>{const a=q('#qa').value.trim();if(!a){toast('답변을 적어주세요');return}run(()=>post(url+'/restart',{feedback:a,start:j.step}),'답변을 반영해 이어서 진행합니다')};
+  if(q('#qago'))q('#qago').onclick=()=>{const a=q('#qa').value.trim();if(!a){toast('답변을 적어주세요');return}run(async()=>{await post(url+'/restart',{feedback:a,start:j.step});clearDraft(j.id,'qa')},'답변을 반영해 이어서 진행합니다')};
 }
 function selectJob(id){
   sel=id;tab=null;tabPinned=false;last={list:last.list};
@@ -4887,6 +4894,26 @@ function selectJob(id){
 $('#jclean').onclick=async()=>{const d=prompt('승인 완료·실패·중단된 작업을 삭제합니다.\n며칠 지난 작업만 지울까요? (0 = 전부)','7');if(d===null)return;const n=parseInt(d);if(isNaN(n)||n<0){toast('숫자를 입력하세요');return}try{const r=await post(base()+'/jobs/delete-many',{older_days:n});toast(r.deleted+'개 작업을 삭제했습니다');if(sel&&!(await api(base()+'/jobs')).jobs.some(x=>x.id===sel)){sel=null;$('#main').innerHTML='<div class="empty">왼쪽에서 작업을 선택하거나 새 요청을 시작하세요.</div>'}last={};await loadList()}catch(e){toast(e.message)}};
 $('#jobs').onclick=e=>{const j=e.target.closest('.job');if(j)selectJob(j.dataset.id)};
 let ATT=[],EDIT=null,EDNEW=[],EDDROP=[],FOLLOW=null,FUNEW=[];
+// 작성 중인 글·첨부는 화면이 다시 그려지거나 탭·작업을 옮겨도 유지한다 (작업별로 보관)
+const DRAFT={},NEWF={},DRAFT_IDS=['fb','qa','futx','edtx'];
+function keepDrafts(jid){for(const id of DRAFT_IDS){const e=$('#'+id);if(e)DRAFT[jid+'#'+id]=e.value}}
+function restoreDrafts(jid){for(const id of DRAFT_IDS){const e=$('#'+id);if(!e)continue;const k=jid+'#'+id;
+  if(DRAFT[k]!=null)e.value=DRAFT[k];e.addEventListener('input',()=>{DRAFT[k]=e.value;try{localStorage.setItem('hd:'+k,e.value)}catch(_){}});
+  if(DRAFT[k]==null){try{const v=localStorage.getItem('hd:'+k);if(v){e.value=v;DRAFT[k]=v}}catch(_){}}}
+  for(const w of ['fb','fu'])if($('#'+w+'new'))drawNew(jid,w)}
+function clearDraft(jid,id){delete DRAFT[jid+'#'+id];try{localStorage.removeItem('hd:'+jid+'#'+id)}catch(_){}}
+function newList(jid,w){return NEWF[jid+'#'+w]||(NEWF[jid+'#'+w]=[])}
+function addNew(jid,w,fs){const L=newList(jid,w);for(const f of fs){if(f.size>10*1024*1024){toast(f.name+': 10MB를 넘습니다');continue}
+  if(L.length>=10){toast('첨부는 최대 10개까지입니다');break}
+  L.push({file:f,name:f.name&&f.name!=='image.png'?f.name:'screenshot-'+new Date().toTimeString().slice(0,8).replace(/:/g,'')+'.png',url:f.type&&f.type.startsWith('image/')?URL.createObjectURL(f):''})}drawNew(jid,w)}
+function drawNew(jid,w){const box=$('#'+w+'new');if(!box)return;const L=newList(jid,w);
+  box.innerHTML=L.map((a,i)=>'<span class="attc">'+(a.url?'<img src="'+a.url+'" alt="">':'📄')+'<b title="'+esc(a.name)+'">'+esc(a.name)+'</b><span style="color:var(--mute)">'+fmtB(a.file.size)+'</span><button data-nr="'+i+'" title="빼기">×</button></span>').join('');
+  box.querySelectorAll('[data-nr]').forEach(b=>b.onclick=()=>{const a=L.splice(+b.dataset.nr,1)[0];if(a&&a.url)URL.revokeObjectURL(a.url);drawNew(jid,w)})}
+function bindNew(jid,w,tx,fi){const t=$('#'+tx),f=$('#'+fi);
+  if(f)f.onchange=e=>{addNew(jid,w,e.target.files);e.target.value=''};
+  if(t)t.addEventListener('paste',e=>{const fs=[...(e.clipboardData||{}).items||[]].filter(x=>x.kind==='file').map(x=>x.getAsFile()).filter(Boolean);if(fs.length){e.preventDefault();addNew(jid,w,fs)}})}
+async function newFiles(jid,w){return Promise.all(newList(jid,w).map(async a=>({name:a.name,data:await b64(a.file)})))}
+function dropNew(jid,w){newList(jid,w).forEach(a=>a.url&&URL.revokeObjectURL(a.url));delete NEWF[jid+'#'+w]}
 const fmtB=n=>n>1048576?(n/1048576).toFixed(1)+'MB':Math.ceil(n/1024)+'KB';
 function addFiles(list){
   for(const f of list){

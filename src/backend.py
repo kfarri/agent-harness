@@ -2503,6 +2503,7 @@ ATT_EXT = {"png", "jpg", "jpeg", "gif", "webp", "pdf", "txt", "md", "csv", "json
            "js", "ts", "vue", "py", "sql", "xml", "har"}
 ATT_IMG = {"png", "jpg", "jpeg", "gif", "webp"}
 ATT_MAX, ATT_TOTAL, ATT_COUNT = 10 * 1024 * 1024, 20 * 1024 * 1024, 10
+ATT_JOB_MAX = 30   # 수정 요청·이어서 요청으로 쌓이는 작업당 전체 첨부 수
 
 
 def att_dir(proj, jid):
@@ -2600,6 +2601,14 @@ def job_restart(proj, j, b):
         raise ApiError(400, "시작 단계가 올바르지 않습니다")
     fb = (b.get("feedback") or "").strip()[:5000]
     first = act[0]["id"] if act else ""
+    added = []
+    if b.get("files"):
+        keep = [x["name"] for x in att_list(proj, j["id"])]
+        if len(keep) + len(b["files"]) > ATT_JOB_MAX:
+            raise ApiError(400, "첨부는 작업당 최대 %d개까지입니다 (지금 %d개)" % (ATT_JOB_MAX, len(keep)))
+        added = save_attachments(proj, j["id"], b["files"], keep)
+        if added:
+            fb = (fb + "\n\n(이번 수정 요청에 첨부한 파일: %s)" % ", ".join(x["name"] for x in added)).strip()
     if fb:   # 수정 요청·답변도 요청 탭에 차례대로 남긴다
         answer = bool(j.get("needs_input"))
         n = int(j.get("revisions") or 0) + (0 if answer else 1)
@@ -2671,8 +2680,8 @@ def job_followup(proj, j, b):
         raise ApiError(400, "요청이 너무 깁니다")
     jid = j["id"]
     keep = [x["name"] for x in att_list(proj, jid)]
-    if len(keep) + len(b.get("files") or []) > ATT_COUNT:
-        raise ApiError(400, "첨부는 최대 %d개까지입니다 (지금 %d개)" % (ATT_COUNT, len(keep)))
+    if len(keep) + len(b.get("files") or []) > ATT_JOB_MAX:
+        raise ApiError(400, "첨부는 작업당 최대 %d개까지입니다 (지금 %d개)" % (ATT_JOB_MAX, len(keep)))
     added = save_attachments(proj, jid, b.get("files"), keep)
     n = int(j.get("followups") or 0) + 1
     rq = fpath(proj, "request", jid)
