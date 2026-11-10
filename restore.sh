@@ -10,7 +10,7 @@ tar tzf "$B" >/dev/null || { echo "백업 파일이 손상됐습니다: $B"; exi
 
 echo "[1/7] 필요한 프로그램 설치..."
 apt-get update -qq
-apt-get install -y -qq git python3 curl ca-certificates openssh-client cifs-utils >/dev/null
+apt-get install -y -qq git python3 curl ca-certificates openssh-client cifs-utils mariadb-client >/dev/null
 nv=$(node -v 2>/dev/null | sed 's/^v//; s/\..*//' || echo 0)
 if [ "${nv:-0}" -lt 20 ]; then
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
