@@ -623,6 +623,7 @@ def create_agent_in(proj, name, desc, perms, model="", existing=""):
 
 
 def validate_stages(proj, raw):
+    rids = {r["id"] for r in repos_of(proj)}
     if not isinstance(raw, list) or not 1 <= len(raw) <= 10:
         raise ApiError(400, "단계는 1~10개여야 합니다")
     out, ids = [], []
@@ -654,7 +655,9 @@ def validate_stages(proj, raw):
                     "inputs": [x for x in (s.get("inputs") or []) if x in ids and x != target],
                     "instruction": str(s.get("instruction") or "").strip()[:3000],
                     "enabled": bool(s.get("enabled", True)), "max_turns": mt,
-                    "polish": bool(s.get("polish")) and kind == "review"})
+                    "polish": bool(s.get("polish")) and kind == "review",
+                    "only_repos": [] if s.get("polish") and kind == "review"
+                    else [x for x in (s.get("only_repos") or []) if x in rids]})
         ids.append(sid)
     en = [s for s in out if s["enabled"]]
     if not en or en[0]["kind"] != "work":
@@ -1415,6 +1418,18 @@ def r_changed(proj, r):
     return bool(G(proj, r, "status", "--porcelain").strip())
 
 
+def job_touched(proj, rids):
+    """작업 브랜치에서 지정 저장소 중 하나라도 기준 브랜치와 달라졌는지(커밋된 변경 + 아직 안 한 변경)."""
+    for r in repos_of(proj):
+        if r["id"] not in rids:
+            continue
+        if r_changed(proj, r):
+            return True
+        if G(proj, r, "diff", "--quiet", "origin/%s...HEAD" % rbase(r), check=False).returncode == 1:
+            return True
+    return False
+
+
 def repo_after_work(job, proj, stages, st):
     """작업 단계가 끝나면: 바뀐 저장소만 빌드 확인(실패 시 오류를 돌려줘 자동 수정) → 커밋 → diff 저장."""
     jid = job["id"]
@@ -2029,6 +2044,11 @@ def pipeline(job, start):
         while i < len(stages):
             st = stages[i]
             who = agent_name(proj, st["agent"])
+            if st.get("only_repos") and repo_on(proj) and not job_touched(proj, st["only_repos"]):
+                event(job, "system", "%s: %s 저장소에 바뀐 내용이 없어 건너뜀" % (
+                    st["name"], ", ".join(r.get("name", r["id"]) for r in repos_of(proj) if r["id"] in st["only_repos"])), "ok")
+                i += 1
+                continue
             if st["kind"] == "work":
                 run_step(job, proj, st, prompt_work(proj, stages, st, jid, pending.pop(st["id"], "")))
                 q = read_question(proj, st, jid)
@@ -2288,7 +2308,9 @@ def project_detail(proj):
             "max_rounds": proj.get("max_rounds", 1), "root": proj["root"],
             "stage_mode": proj.get("stage_mode", "fixed"), "use_sources": proj.get("use_sources", "prefer"),
             "sources": len(src_list(proj)), "repo": {"on": True, "release": repo_release(proj), "branch": repo_base(proj),
-                                                   "test_url": repo_test_url(proj)} if repo_on(proj) else None,
+                                                   "test_url": repo_test_url(proj),
+                                                   "list": [{"id": r["id"], "name": r.get("name", r["id"])}
+                                                            for r in repos_of(proj)]} if repo_on(proj) else None,
             "agents": [agent_info(proj, a) for a in proj["agents"]], "stages": proj["stages"],
             "schedules": proj.get("schedules", []), "summary": psummary(proj)}
 

@@ -623,6 +623,7 @@ def create_agent_in(proj, name, desc, perms, model="", existing=""):
 
 
 def validate_stages(proj, raw):
+    rids = {r["id"] for r in repos_of(proj)}
     if not isinstance(raw, list) or not 1 <= len(raw) <= 10:
         raise ApiError(400, "단계는 1~10개여야 합니다")
     out, ids = [], []
@@ -654,7 +655,9 @@ def validate_stages(proj, raw):
                     "inputs": [x for x in (s.get("inputs") or []) if x in ids and x != target],
                     "instruction": str(s.get("instruction") or "").strip()[:3000],
                     "enabled": bool(s.get("enabled", True)), "max_turns": mt,
-                    "polish": bool(s.get("polish")) and kind == "review"})
+                    "polish": bool(s.get("polish")) and kind == "review",
+                    "only_repos": [] if s.get("polish") and kind == "review"
+                    else [x for x in (s.get("only_repos") or []) if x in rids]})
         ids.append(sid)
     en = [s for s in out if s["enabled"]]
     if not en or en[0]["kind"] != "work":
@@ -1415,6 +1418,18 @@ def r_changed(proj, r):
     return bool(G(proj, r, "status", "--porcelain").strip())
 
 
+def job_touched(proj, rids):
+    """작업 브랜치에서 지정 저장소 중 하나라도 기준 브랜치와 달라졌는지(커밋된 변경 + 아직 안 한 변경)."""
+    for r in repos_of(proj):
+        if r["id"] not in rids:
+            continue
+        if r_changed(proj, r):
+            return True
+        if G(proj, r, "diff", "--quiet", "origin/%s...HEAD" % rbase(r), check=False).returncode == 1:
+            return True
+    return False
+
+
 def repo_after_work(job, proj, stages, st):
     """작업 단계가 끝나면: 바뀐 저장소만 빌드 확인(실패 시 오류를 돌려줘 자동 수정) → 커밋 → diff 저장."""
     jid = job["id"]
@@ -2029,6 +2044,11 @@ def pipeline(job, start):
         while i < len(stages):
             st = stages[i]
             who = agent_name(proj, st["agent"])
+            if st.get("only_repos") and repo_on(proj) and not job_touched(proj, st["only_repos"]):
+                event(job, "system", "%s: %s 저장소에 바뀐 내용이 없어 건너뜀" % (
+                    st["name"], ", ".join(r.get("name", r["id"]) for r in repos_of(proj) if r["id"] in st["only_repos"])), "ok")
+                i += 1
+                continue
             if st["kind"] == "work":
                 run_step(job, proj, st, prompt_work(proj, stages, st, jid, pending.pop(st["id"], "")))
                 q = read_question(proj, st, jid)
@@ -2288,7 +2308,9 @@ def project_detail(proj):
             "max_rounds": proj.get("max_rounds", 1), "root": proj["root"],
             "stage_mode": proj.get("stage_mode", "fixed"), "use_sources": proj.get("use_sources", "prefer"),
             "sources": len(src_list(proj)), "repo": {"on": True, "release": repo_release(proj), "branch": repo_base(proj),
-                                                   "test_url": repo_test_url(proj)} if repo_on(proj) else None,
+                                                   "test_url": repo_test_url(proj),
+                                                   "list": [{"id": r["id"], "name": r.get("name", r["id"])}
+                                                            for r in repos_of(proj)]} if repo_on(proj) else None,
             "agents": [agent_info(proj, a) for a in proj["agents"]], "stages": proj["stages"],
             "schedules": proj.get("schedules", []), "summary": psummary(proj)}
 
@@ -4858,12 +4880,13 @@ async function loadStages(){
   L.addEventListener('change',e=>{
     const c=e.target.closest('.sc');if(!c)return;const i=+c.dataset.i,f=e.target.dataset.f;if(!f)return;const s=ES[i];
     if(f==='enabled'||f==='polish')s[f]=e.target.checked;
+    else if(f==='only'){const v=e.target.dataset.v;s.only_repos=(s.only_repos||[]).filter(x=>x!==v);if(e.target.checked)s.only_repos.push(v)}
     else if(f==='inputs'){const v=e.target.dataset.v;s.inputs=s.inputs.filter(x=>x!==v);if(e.target.checked)s.inputs.push(v)}
     else if(f==='kind'){s.kind=e.target.value;if(s.kind==='review'&&!s.target&&i>0)s.target=ES[i-1].id;if(s.kind==='work'){s.target='';s.polish=false}}
     else if(f==='name'){s.name=e.target.value}
     else if(f==='max_turns'){s.max_turns=parseInt(e.target.value)||0;return}
     else s[f]=e.target.value;
-    if(['enabled','kind','name','target'].includes(f))renderStages();
+    if(['enabled','kind','name','target','polish'].includes(f))renderStages();
   });
   L.addEventListener('click',e=>{
     const b=e.target.closest('button[data-a]');if(!b)return;const i=+b.closest('.sc').dataset.i,a=b.dataset.a;
@@ -4888,6 +4911,7 @@ async function loadStages(){
 }
 function showPlan(note){$('#pprev').innerHTML=(note?'<div class="vd">'+esc(note)+'</div>':'')+planHtml(planCur);$('#papply').hidden=false}
 function renderStages(){
+  const RL=(pj.repo&&pj.repo.list)||[];
   const ao=sel_=>pj.agents.map(a=>'<option value="'+esc(a.id)+'"'+(a.id===sel_?' selected':'')+'>'+esc(a.name)+'</option>').join('');
   $('#stlist').innerHTML=ES.map((s,i)=>{
     const prev=ES.slice(0,i);
@@ -4903,6 +4927,9 @@ function renderStages(){
       +(prev.length?'<div class="vd">함께 읽을 이전 단계 결과 (요청 파일은 항상 포함)</div><div class="row" style="margin-bottom:8px">'+prev.filter(p=>p.id!==s.target).map(p=>'<label class="inl"><input type="checkbox" data-f="inputs" data-v="'+esc(p.id)+'"'+(s.inputs.includes(p.id)?' checked':'')+'> '+esc(p.name)+'</label>').join('')+'</div>':'')
       +'<label class="lb">지시<textarea data-f="instruction" rows="3" style="min-height:64px">'+esc(s.instruction)+'</textarea></label>'
       +(s.kind==='review'?'<label class="chk"><input type="checkbox" data-f="polish"'+(s.polish?' checked':'')+'><span>승인 시 다듬은 최종본 작성<small>켜면 이 검토 단계가 최종본(final)을 만듭니다. 끄면 마지막 작업 단계의 결과가 최종본이 됩니다</small></span></label>':'')
+      +(RL.length>1&&!(s.kind==='review'&&s.polish)?'<div class="vd" style="margin-top:6px">실행 조건 (토큰 절약)</div><div class="row" style="margin-bottom:4px">'
+        +RL.map(r=>'<label class="inl"><input type="checkbox" data-f="only" data-v="'+esc(r.id)+'"'+((s.only_repos||[]).includes(r.id)?' checked':'')+'> '+esc(r.name)+' 저장소가 바뀐 작업에서만</label>').join('')
+        +'</div><div class="vd">아무것도 체크하지 않으면 항상 실행합니다. 체크하면 앞 단계까지 그 저장소에 바뀐 내용이 없을 때 이 단계를 건너뜁니다.</div>':'')
       +'</div></div>';
   }).join('');
 }
